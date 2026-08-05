@@ -1,81 +1,81 @@
-# Cockpit Architecture Design
+# Cockpit 总体架构设计
 
-- Status: Approved
-- Date: 2026-08-05
-- Initial platform: macOS
-- Long-term clients: Apple platforms
-- Primary constraint: native performance
+- 状态：已批准
+- 日期：2026-08-05
+- 首发平台：macOS
+- 终态客户端：Apple 平台
+- 首要约束：原生性能
 
-## 1. Product Definition
+## 1. 产品定义
 
-Cockpit is a native agent development environment. It provides projects, conversations, code editing, terminals, file tools, search, and Git workflows. Agent orchestration remains inside external CLI programs such as Codex and Claude Code.
+Cockpit 是一个原生 Agent 开发环境，提供项目、对话、代码编辑、终端、文件工具、搜索和 Git 工作流。Agent 编排继续由 Codex、Claude Code 等外部 CLI 程序负责。
 
-The initial product runs on macOS. The Mac remains the authority for projects, worktrees, files, Git repositories, language servers, terminal processes, and conversation state. Other Apple devices connect as remote clients.
+首个版本运行在 macOS 上。Mac 是项目、worktree、文件、Git 仓库、语言服务器、终端进程和对话状态的权威端。其他 Apple 设备作为远程客户端连接 Mac。
 
-### Goals
+### 目标
 
-- Use Swift and native macOS UI for the application shell.
-- Keep UI input, terminal rendering, file navigation, and workspace switching responsive under sustained CLI output.
-- Reach VS Code-class editing through an isolated Monaco runtime.
-- Use Ghostty's terminal core and Metal renderer through a pinned thin fork.
-- Preserve live terminal sessions across Cockpit.app, CockpitHost, and CockpitTerminalSupervisor restarts.
-- Make every product API remote-capable from the first implementation phase.
-- Keep Project, Conversation, and Environment identities stable and explicit.
-- Scope all file, search, Git, editor, and terminal operations to an immutable EnvironmentID.
+- 使用 Swift 和 macOS 原生 UI 构建应用外壳。
+- 在 CLI 持续输出时，保持 UI 输入、终端渲染、文件导航和工作环境切换流畅响应。
+- 通过隔离的 Monaco 运行时实现对标 VS Code 的编辑能力。
+- 通过固定版本的轻量 fork 使用 Ghostty 终端核心和 Metal 渲染器。
+- 在 Cockpit.app、CockpitHost 和 CockpitTerminalSupervisor 重启期间保留所有活动终端会话。
+- 从首个实现阶段开始，确保每个产品 API 都具备远程调用能力。
+- 保持 Project、Conversation 和 Environment 身份稳定且明确。
+- 所有文件、搜索、Git、编辑器和终端操作都绑定到不可变的 EnvironmentID。
 
-### Non-goals for the first Developer Preview
+### 首个开发者预览版不包含
 
-- Built-in agent orchestration.
-- A plugin marketplace.
-- CRDT multi-writer editing.
-- An internet Relay service.
-- Container or virtual-machine isolation.
-- Non-Apple clients.
-- A web application shell.
+- 内置 Agent 编排。
+- 插件市场。
+- CRDT 多写入端编辑。
+- 互联网 Relay 服务。
+- 容器或虚拟机隔离。
+- 非 Apple 平台客户端。
+- Web 应用外壳。
 
-## 2. Product Layout
+## 2. 产品布局
 
-### Left sidebar
+### 左侧栏
 
-The left sidebar owns the product hierarchy:
+左侧栏承载产品的项目层级：
 
 ```text
-Project A
-├── Conversation A1
-└── Conversation A2 · worktree: feature/a
+项目 A
+├── 对话 A1
+└── 对话 A2 · worktree: feature/a
 
-Project B
-├── Conversation B1
-└── Conversation B2 · worktree: fix/b
+项目 B
+├── 对话 B1
+└── 对话 B2 · worktree: fix/b
 ```
 
-- Project maps to a physical folder selected by the user.
-- Project contains multiple Conversations.
-- Conversation displays whether it uses the project directory directly or a Git worktree.
-- Selecting a Conversation changes the entire active work context.
+- Project 映射到用户选择的一个物理文件夹。
+- 一个 Project 包含多个 Conversation。
+- Conversation 展示自身是直接使用项目目录，还是使用一个 Git worktree。
+- 选择 Conversation 会切换整个活动工作环境。
 
-### Center workspace
+### 中央工作区
 
-The center is the core work area and uses native tabs.
+中央区域是核心工作区，使用原生页签。
 
-- A tab can display a file editor, Agent CLI terminal, ordinary shell, diff editor, or new-tab chooser.
-- Native tab state is separate from document and terminal lifetimes.
-- Closing a tab detaches a view; it does not terminate a TerminalSession.
+- 页签可展示文件编辑器、Agent CLI 终端、普通 Shell、Diff 编辑器或新建页签选择器。
+- 原生页签状态与文档、终端的生命周期相互独立。
+- 关闭页签只会断开视图，不会终止 TerminalSession。
 
-### Right tool sidebar
+### 右侧工具栏
 
-The right sidebar follows the selected Conversation's EnvironmentID.
+右侧栏跟随当前选中 Conversation 的 EnvironmentID。
 
-- File tree.
-- File search.
-- Source search.
-- Source control status and local changes.
-- Diff and commit UI.
-- Git Toolbox quick operations.
+- 文件树。
+- 文件搜索。
+- 源代码搜索。
+- 源代码管理状态和本地变更。
+- Diff 和提交界面。
+- Git Toolbox 快捷操作。
 
-No right-sidebar provider reads the Project root directly. Every provider resolves its root from the active EnvironmentID.
+右侧栏的 Provider 不直接读取 Project 根目录。每个 Provider 都从当前活动 EnvironmentID 解析自身根目录。
 
-## 3. Core Data Model
+## 3. 核心数据模型
 
 ### Project
 
@@ -87,7 +87,7 @@ canonicalRootIdentity
 createdAt
 ```
 
-A Project represents one user-selected physical folder.
+一个 Project 表示用户选择的一个物理文件夹。
 
 ### Conversation
 
@@ -102,11 +102,11 @@ tabRecords
 archivedAt
 ```
 
-A Conversation is the product-level work context shown in the left sidebar. It is not a PTY and is not a UI tab.
+Conversation 是左侧栏展示的产品级工作上下文。它既不是 PTY，也不是 UI 页签。
 
 ### Environment
 
-An Environment is immutable after Conversation creation.
+Conversation 创建完成后，其 Environment 不再变化。
 
 ```text
 EnvironmentID
@@ -117,12 +117,12 @@ gitCommonDirectory
 worktreeBranch
 ```
 
-- A Direct Environment resolves to the Project root.
-- A Worktree Environment resolves to one Git worktree root.
-- Multiple Direct Environments can share the same physical root.
-- WorkspaceKernel resources are deduplicated by canonical physical root while product state remains keyed by EnvironmentID.
+- Direct Environment 解析到 Project 根目录。
+- Worktree Environment 解析到一个 Git worktree 根目录。
+- 多个 Direct Environment 可以共享同一个物理根目录。
+- WorkspaceKernel 资源按照规范化物理根目录去重，产品状态继续以 EnvironmentID 为键。
 
-Changing a Conversation from Direct to Worktree creates a new Conversation. Existing terminal, document, and Git history never changes environment identity.
+把 Conversation 从 Direct 改为 Worktree 时，将创建一个新 Conversation。已有终端、文档和 Git 历史的 Environment 身份不会发生变化。
 
 ### TerminalSession
 
@@ -139,21 +139,21 @@ protocolVersion
 latestSequence
 ```
 
-Agent CLI and ordinary shell sessions use the same model.
+Agent CLI 和普通 Shell 会话使用同一套模型。
 
 ### DocumentSession
 
-Document identity is:
+文档身份由以下组合确定：
 
 ```text
 EnvironmentID + RelativePath
 ```
 
-The same relative path in two worktrees produces two distinct DocumentSessions.
+两个 worktree 中相同的相对路径会产生两个不同的 DocumentSession。
 
 ### TabRecord
 
-TabRecord contains only presentation references:
+TabRecord 只保存界面展示引用：
 
 ```text
 TabID
@@ -162,23 +162,23 @@ resourceID
 position
 ```
 
-Closing a TabRecord never terminates a PTY. Termination requires an explicit TerminalSession command.
+关闭 TabRecord 永远不会终止 PTY。终止 PTY 必须发送明确的 TerminalSession 命令。
 
 ### ClientViewState
 
-ClientViewState is device-specific:
+ClientViewState 是按设备分别保存的界面状态：
 
-- Selected tab.
-- Sidebar widths.
-- Expanded nodes.
-- Scroll positions.
-- Focus and local selection.
+- 当前选中的页签。
+- 侧栏宽度。
+- 已展开节点。
+- 滚动位置。
+- 焦点和本地选区。
 
-It is not shared domain state.
+它不属于跨设备共享的领域状态。
 
-## 4. Active Context
+## 4. 活动上下文
 
-Selecting a Conversation creates a new client generation and subscribes to one immutable ActiveContext:
+选择 Conversation 会创建新的客户端 generation，并订阅一个不可变的 ActiveContext：
 
 ```text
 ActiveContext
@@ -189,128 +189,128 @@ ActiveContext
 └── generation
 ```
 
-CockpitHost returns a revisioned bootstrap snapshot for tabs, documents, terminals, file tree, and Git state. The client atomically displays the snapshot, then applies deltas whose revision is greater than the bootstrap revision.
+CockpitHost 返回一个带 revision 的启动快照，其中包含页签、文档、终端、文件树和 Git 状态。客户端以原子方式显示该快照，随后只应用 revision 大于启动快照的增量。
 
-Every asynchronous result carries EnvironmentID, generation, resource ID, and local revision. Results from an old generation are discarded.
+每个异步结果都携带 EnvironmentID、generation、resource ID 和本地 revision。来自旧 generation 的结果直接丢弃。
 
-## 5. Process Architecture
+## 5. 进程架构
 
-Cockpit defines four app-owned executable roles. CockpitPTYKeeper has one process instance per live TerminalSession. WKWebView also creates system-managed WebContent and GPU helper processes.
+Cockpit 定义四种应用自有的可执行进程角色。每个活动 TerminalSession 都有一个独立 CockpitPTYKeeper 进程实例。WKWebView 还会创建由系统管理的 WebContent 和 GPU 辅助进程。
 
 ### Cockpit.app
 
-Responsibilities:
+职责：
 
-- AppKit window and split-view shell.
-- Native project, conversation, tab, and tool UI.
-- One Monaco WKWebView runtime per window.
-- Ghostty Metal NSView surfaces.
-- CockpitClientCore and ClientViewState.
-- Local user input and command routing.
+- AppKit 窗口和分栏外壳。
+- 原生项目、对话、页签和工具界面。
+- 每个窗口一个 Monaco WKWebView 运行时。
+- Ghostty Metal NSView 渲染表面。
+- CockpitClientCore 和 ClientViewState。
+- 本地用户输入和命令路由。
 
-Cockpit.app does not own filesystem, Git, PTY, or durable document state.
+Cockpit.app 不拥有文件系统、Git、PTY 或持久化文档状态。
 
 ### CockpitHost
 
-Responsibilities:
+职责：
 
-- Project, Conversation, and Environment authority.
-- WorkspaceKernel pool.
-- File service, FSEvents reconciliation, file index, and search.
-- Git model and serialized Git operations.
-- DocumentStore, recovery journal, and external-change conflicts.
-- LSP process lifecycle and request routing.
-- workspace.sqlite.
-- Local control endpoint.
-- Network.framework remote gateway.
-- Device, project, and capability authorization.
-- Conversation-to-TerminalSession product metadata.
+- Project、Conversation 和 Environment 的权威状态。
+- WorkspaceKernel 池。
+- 文件服务、FSEvents 对账、文件索引和搜索。
+- Git 模型和串行化 Git 操作。
+- DocumentStore、恢复日志和外部变更冲突处理。
+- LSP 进程生命周期和请求路由。
+- workspace.sqlite。
+- 本地控制端点。
+- 基于 Network.framework 的远程网关。
+- 设备、项目和能力授权。
+- Conversation 到 TerminalSession 的产品元数据。
 
-CockpitHost does not own live PTYs.
+CockpitHost 不拥有活动 PTY。
 
 ### CockpitTerminalSupervisor
 
-CockpitTerminalSupervisor is an independent per-user LaunchAgent with `KeepAlive` enabled.
+CockpitTerminalSupervisor 是独立的当前用户级 LaunchAgent，并启用 `KeepAlive`。
 
-Responsibilities:
+职责：
 
-- TerminalSession registry.
-- Two-phase TerminalSession creation transactions.
-- PTYKeeper spawning, discovery, authentication, and reconciliation.
-- Single-use local attach tickets.
-- Terminal input-lease coordination.
-- Final terminal archive serving.
-- terminal.sqlite.
+- TerminalSession 注册表。
+- TerminalSession 两阶段创建事务。
+- PTYKeeper 启动、发现、认证和恢复对账。
+- 单次使用的本地连接票据。
+- 终端输入租约协调。
+- 最终终端归档服务。
+- terminal.sqlite。
 
-CockpitTerminalSupervisor never owns a PTY master, never parses VT output, and never proxies the live local terminal data path. It does not expose a network listener and does not implement files, Git, search, or LSP.
+CockpitTerminalSupervisor 永远不持有 PTY master，不解析 VT 输出，也不代理本地活动终端的数据热路径。它不开放网络监听，也不实现文件、Git、搜索或 LSP。
 
 ### CockpitPTYKeeper
 
-CockpitTerminalSupervisor spawns one CockpitPTYKeeper for each committed live TerminalSession. Every Keeper starts in a separate Unix session and process group with `POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT`; only explicitly declared bootstrap descriptors cross the spawn boundary.
+CockpitTerminalSupervisor 为每个已提交且处于活动状态的 TerminalSession 启动一个 CockpitPTYKeeper。每个 Keeper 使用 `POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT` 进入独立的 Unix session 和进程组；只有明确声明的引导文件描述符可以跨越 spawn 边界。
 
-Responsibilities:
+职责：
 
-- Exclusive ownership of one PTY master.
-- Agent CLI or shell process-group lifecycle.
-- Structured LaunchSpec execution after a committed start command.
-- Ghostty VT parsing and authoritative screen state.
-- Scrollback chunks, snapshots, and terminal frame deltas.
-- Continuous PTY draining independent of attached clients.
-- Per-client backpressure, ordered input, deduplication, and lease enforcement.
-- One authenticated Unix Domain Socket endpoint.
-- Final screen and scrollback checkpointing when the CLI exits.
+- 独占一个 PTY master。
+- 管理 Agent CLI 或 Shell 进程组的生命周期。
+- 收到已提交的启动命令后执行结构化 LaunchSpec。
+- Ghostty VT 解析和权威屏幕状态。
+- scrollback 分块、快照和终端帧增量。
+- 不依赖已连接客户端，持续排空 PTY 输出。
+- 按客户端处理背压、有序输入、去重和租约强制执行。
+- 一个经过认证的 Unix Domain Socket 端点。
+- CLI 退出时保存最终屏幕和 scrollback 检查点。
 
-CockpitPTYKeeper never listens on the network and never writes terminal.sqlite. A Supervisor exit reparents live Keepers to launchd/PID 1; their separate process groups keep them outside launchd's same-process-group cleanup boundary.
+CockpitPTYKeeper 永远不监听网络，也不写入 terminal.sqlite。Supervisor 退出后，活动 Keeper 会被重新托管到 launchd/PID 1；由于 Keeper 位于独立进程组，launchd 针对原进程组的清理不会影响它们。
 
-## 6. Process Communication
+## 6. 进程通信
 
-### Local control plane
+### 本地控制面
 
-NSXPCConnection carries lifecycle and low-frequency control messages between Cockpit.app, CockpitHost, and CockpitTerminalSupervisor:
+NSXPCConnection 在 Cockpit.app、CockpitHost 和 CockpitTerminalSupervisor 之间传输生命周期及低频控制消息：
 
-- Create, list, archive, and delete product records.
-- Create, list, attach, terminate, and reconcile TerminalSessions.
-- Acquire and release input leases.
-- Register subscriptions.
-- Report service capabilities and protocol versions.
+- 创建、列出、归档和删除产品记录。
+- 创建、列出、连接、终止和对账 TerminalSession。
+- 获取和释放输入租约。
+- 注册订阅。
+- 上报服务能力和协议版本。
 
-XPC endpoints validate peer identity before accepting commands. Phase 0 enforces the effective user boundary for ad-hoc development builds; Phase 6 adds the release Team ID and designated-requirement checks.
+XPC 端点接受命令前会校验对端身份。Phase 0 对临时签名的开发构建强制执行有效用户身份边界；Phase 6 增加正式 Team ID 和 designated requirement 校验。
 
-### Local data plane
+### 本地数据面
 
-Unix Domain Sockets carry framed, multiplexed streams:
+Unix Domain Socket 传输带帧结构的多路复用数据流：
 
-- Terminal input and screen frames.
-- Document edit transactions and acknowledgements.
-- File-tree patches.
-- Search, diff, and scrollback batches.
-- LSP request and response payloads.
+- 终端输入和屏幕帧。
+- 文档编辑事务及确认。
+- 文件树增量。
+- 搜索、Diff 和 scrollback 批次。
+- LSP 请求和响应载荷。
 
-The local terminal hot path bypasses CockpitHost and CockpitTerminalSupervisor after authorization:
+完成授权后，本地终端热路径绕过 CockpitHost 和 CockpitTerminalSupervisor：
 
 ```text
 Cockpit.app <-> CockpitPTYKeeper <-> PTY <-> Agent CLI
 ```
 
-CockpitHost authorizes the Environment and asks CockpitTerminalSupervisor for a single-use attach ticket. The Supervisor registers that ticket with the target Keeper, then returns the endpoint descriptor to Cockpit.app. Cockpit.app presents the ticket when opening the direct terminal socket.
+CockpitHost 负责 Environment 授权，并向 CockpitTerminalSupervisor 请求单次使用的 attach ticket。Supervisor 向目标 Keeper 注册该票据，然后把端点描述符返回给 Cockpit.app。Cockpit.app 打开直连终端 socket 时提交该票据。
 
-An established App-to-Keeper stream remains usable while CockpitTerminalSupervisor restarts. New attach, terminate, and lease-transfer commands resume after launchd relaunches and reconciles the Supervisor.
+CockpitTerminalSupervisor 重启期间，已经建立的 App-to-Keeper 数据流继续工作。launchd 重新启动并完成 Supervisor 对账后，新的连接、终止和租约转移命令恢复工作。
 
-### Remote data path
+### 远程数据路径
 
 ```text
-Remote Apple Client
+远程 Apple 客户端
     <-> Network.framework TLS 1.3
     <-> CockpitHost
-    <-> local authenticated terminal stream
+    <-> 本地认证终端数据流
     <-> CockpitPTYKeeper
 ```
 
-CockpitTerminalSupervisor and CockpitPTYKeeper remain unreachable from the network.
+CockpitTerminalSupervisor 和 CockpitPTYKeeper 均无法从网络直接访问。
 
 ## 7. CockpitProtocol
 
-CockpitProtocol uses a fixed binary frame header and typed payloads.
+CockpitProtocol 使用固定的二进制帧头和类型化载荷。
 
 ```text
 magic
@@ -328,28 +328,28 @@ payloadType
 payloadLength
 ```
 
-Payload policy:
+载荷策略：
 
-- SwiftProtobuf for control messages and structured data.
-- Packed binary terminal cell deltas.
-- Negotiated compression for snapshots, scrollback, search, and large diffs.
-- No compression for keyboard input, edit acknowledgement, or small control messages.
+- 控制消息和结构化数据使用 SwiftProtobuf。
+- 终端单元格增量使用紧凑二进制格式。
+- 快照、scrollback、搜索结果和大型 Diff 使用协商压缩。
+- 键盘输入、编辑确认和小型控制消息不压缩。
 
-Channels have independent sequencing and flow control:
+各 Channel 独立维护顺序和流量控制：
 
-- Control: reliable and ordered, highest priority.
-- Document: reliable, ordered, version-acknowledged.
-- TerminalInput: reliable and ordered.
-- TerminalFrame: ordered and coalescible; a gap triggers snapshot recovery.
-- Bulk: cancellable and paged.
+- Control：可靠、有序，最高优先级。
+- Document：可靠、有序，并带版本确认。
+- TerminalInput：可靠且有序。
+- TerminalFrame：有序且可合并；序列缺口会触发快照恢复。
+- Bulk：可取消、可分页。
 
-Mutating commands carry request IDs so retries remain idempotent.
+变更类命令携带 request ID，保证重试具有幂等性。
 
-## 8. Remote-Ready Boundaries
+## 8. 远程就绪边界
 
-CockpitClientCore is a pure Swift package shared by the macOS app and future Apple clients.
+CockpitClientCore 是 macOS App 与未来 Apple 客户端共享的纯 Swift Package。
 
-It depends on no AppKit, WKWebView, NSXPCConnection, NWConnection, or local filesystem API.
+它不依赖 AppKit、WKWebView、NSXPCConnection、NWConnection 或本地文件系统 API。
 
 ```swift
 public protocol CockpitTransport: Sendable {
@@ -360,222 +360,222 @@ public protocol CockpitTransport: Sendable {
 }
 ```
 
-Transport implementations:
+Transport 实现：
 
-- LocalTransport: XPC control and local socket data.
-- RemoteDirectTransport: Network.framework and TLS 1.3 for LAN or VPN.
-- RelayTransport: future reliable byte-stream adapter.
+- LocalTransport：XPC 控制面和本地 socket 数据面。
+- RemoteDirectTransport：通过 Network.framework 和 TLS 1.3 在局域网或 VPN 内直连。
+- RelayTransport：未来的可靠字节流适配器。
 
-CockpitHostCore accepts command, query, and subscription values and does not inspect the transport type.
+CockpitHostCore 接收命令、查询和订阅值，不检查具体 Transport 类型。
 
-Remote rules:
+远程规则：
 
-- Remote listening is disabled by default.
-- Pairing starts on the Mac.
-- Each device has its own key, allowlist entry, and grants.
-- Protocol identity does not bind to an IP address.
-- Requests use stable IDs and relative paths.
-- The Host validates Environment authorization and canonical path containment.
-- One DocumentSession has one write lease.
-- One TerminalSession has one input lease.
-- Other connected devices remain read-only until control transfers.
-- Offline editing is not supported.
+- 默认关闭远程监听。
+- 配对流程从 Mac 发起。
+- 每台设备都有独立密钥、允许列表记录和授权集合。
+- 协议身份不绑定 IP 地址。
+- 请求使用稳定 ID 和相对路径。
+- Host 校验 Environment 授权和规范化路径包含关系。
+- 一个 DocumentSession 只有一个写入租约。
+- 一个 TerminalSession 只有一个输入租约。
+- 控制权转移前，其他已连接设备保持只读。
+- 不支持离线编辑。
 
-Remote terminal permission is equivalent to the macOS user's interactive shell permission. Project-scoped file APIs cannot constrain shell commands. Container or virtual-machine isolation is a separate product boundary.
+远程终端权限等同于 macOS 用户的交互式 Shell 权限。项目范围内的文件 API 无法限制 Shell 命令。容器或虚拟机隔离属于独立的产品安全边界。
 
-## 9. Terminal Architecture
+## 9. 终端架构
 
-### Output path
+### 输出路径
 
 ```text
 CLI stdout/stderr
 -> PTY master
--> PTYKeeper read loop
--> Ghostty VT core
--> authoritative cell grid and scrollback
--> snapshot/delta encoder
--> local or proxied channel
--> Ghostty Metal renderer
+-> PTYKeeper 读取循环
+-> Ghostty VT 核心
+-> 权威单元格网格和 scrollback
+-> 快照/增量编码器
+-> 本地或代理 Channel
+-> Ghostty Metal 渲染器
 ```
 
-Each CockpitPTYKeeper drains its PTY independently of renderer speed. When one client falls behind, the Keeper coalesces that client's intermediate screen frames while preserving the latest terminal state. It never blocks PTY reading on client rendering or archive I/O.
+每个 CockpitPTYKeeper 都独立于渲染速度持续排空自己的 PTY。当某个客户端消费过慢时，Keeper 只合并该客户端的中间屏幕帧，同时保留最新终端状态。客户端渲染或归档 I/O 永远不会阻塞 PTY 读取。
 
-Sequence gaps trigger a full screen snapshot. Scrollback uses paged chunks.
+sequence 出现缺口时触发完整屏幕快照。scrollback 使用分页分块。
 
-### Input path
+### 输入路径
 
 ```text
-keyboard / paste / resize
--> input lease validation
--> ordered TerminalInput channel
+键盘 / 粘贴 / 调整尺寸
+-> 输入租约校验
+-> 有序 TerminalInput Channel
 -> PTY
 ```
 
-Input frames use a monotonically increasing sequence per lease. The Keeper acknowledges accepted input and deduplicates retries after a stream reconnect. One TerminalSession has one input lease and any number of read-only viewers.
+每个输入租约中的输入帧都使用单调递增 sequence。Keeper 对已接收输入进行确认，并对数据流重连后的重试进行去重。一个 TerminalSession 只有一个输入租约，同时允许任意数量的只读查看端。
 
-### Session creation transaction
+### 会话创建事务
 
-The externally visible lifecycle is:
+对外可见的生命周期：
 
 ```text
 Preparing -> Committed -> Running
                            |-> Exited
                            |-> Terminated
-                           `-> Interrupted
+                           └-> Interrupted
 ```
 
-Attachment is independent state. Closing a tab, quitting Cockpit.app, or disconnecting a remote client detaches a viewer without changing a Running session.
+连接状态是独立状态。关闭页签、退出 Cockpit.app 或断开远程客户端，只会移除一个查看端，不会改变 Running 会话。
 
-Creation uses a durable two-phase transaction:
+创建过程使用持久化的两阶段事务：
 
-1. The Supervisor allocates TerminalSessionID and WorkerInstanceID, writes Preparing plus the structured LaunchSpec to terminal.sqlite, and commits.
-2. The Supervisor passes bootstrap material and the derived session secret through an inherited private descriptor, then spawns a detached Keeper. The Keeper does not create a PTY or CLI yet.
-3. The Keeper binds its UDS endpoint and returns Ready.
-4. The Supervisor durably records Committed, then sends Start.
-5. The Keeper creates the PTY and CLI, returns process identities, and the Supervisor records Running.
+1. Supervisor 分配 TerminalSessionID 和 WorkerInstanceID，把 Preparing 状态及结构化 LaunchSpec 写入 terminal.sqlite 并提交。
+2. Supervisor 通过继承的私有文件描述符传递引导材料和派生会话密钥，然后启动一个独立 Keeper。此时 Keeper 不创建 PTY 或 CLI。
+3. Keeper 绑定自己的 UDS 端点并返回 Ready。
+4. Supervisor 持久化 Committed 状态，然后发送 Start。
+5. Keeper 创建 PTY 和 CLI，返回进程身份，Supervisor 随后记录 Running。
 
-If the Supervisor exits before Committed, the Keeper never starts the CLI and exits when its 30-second bootstrap deadline expires. If the Supervisor exits after Committed, its replacement completes or reconciles the start. Therefore every started CLI has a durable committed TerminalSession record.
+如果 Supervisor 在 Committed 之前退出，Keeper 永远不会启动 CLI，并在 30 秒引导期限结束时退出。如果 Supervisor 在 Committed 之后退出，替代它的新 Supervisor 会完成启动或执行恢复对账。因此，每个已启动 CLI 都对应一条持久化的 committed TerminalSession 记录。
 
-### Attach and recovery
+### 连接与恢复
 
-- The UDS runtime directory is `/private/tmp/cockpit.<uid>/terminal`, owned by the current user with mode `0700`; each socket uses mode `0600`.
-- Keeper endpoints verify the effective user with `getpeereid` and authenticate the protocol handshake.
-- An installation master key lives in Keychain. Session secrets are derived from the master key, TerminalSessionID, and WorkerInstanceID, then passed to the Keeper through the bootstrap descriptor rather than argv or environment variables. If Keychain is unavailable, reconciliation waits without terminating a live Keeper.
-- Attach tickets are single-use and bind TerminalSessionID, client identity, capabilities, and expiry.
-- A reconnect supplies the last acknowledged output sequence. The Keeper resumes retained deltas or sends a fresh authoritative VT snapshot when the delta range is unavailable.
-- On launch, the Supervisor matches terminal.sqlite records with authenticated runtime descriptors using TerminalSessionID and WorkerInstanceID. A committed live Keeper is adopted; a record with no Keeper becomes Interrupted; an uncommitted Keeper is never adopted.
-- A live Agent CLI has no idle timeout.
+- UDS 运行目录是 `/private/tmp/cockpit.<uid>/terminal`，归当前用户所有，权限为 `0700`；每个 socket 的权限为 `0600`。
+- Keeper 端点使用 `getpeereid` 校验有效用户，并对协议握手进行认证。
+- 安装主密钥保存在 Keychain 中。会话密钥通过主密钥、TerminalSessionID 和 WorkerInstanceID 派生，再经引导文件描述符传递给 Keeper，不进入 argv 或环境变量。Keychain 不可访问时，对账操作等待恢复，不会终止活动 Keeper。
+- attach ticket 只能使用一次，并绑定 TerminalSessionID、客户端身份、能力集合和过期时间。
+- 重连时提交最后确认的输出 sequence。对应增量仍保留时，Keeper 从下一条增量继续发送；增量范围已淘汰时，Keeper 发送新的权威 VT 完整快照。
+- 启动时，Supervisor 使用 TerminalSessionID 和 WorkerInstanceID，将 terminal.sqlite 记录与已认证的运行时描述符进行匹配。已提交的活动 Keeper 会被接管；找不到 Keeper 的记录转为 Interrupted；未提交 Keeper 永远不会被接管。
+- 活动 Agent CLI 不设置空闲超时。
 
-When a CLI exits, its Keeper writes the final VT snapshot and immutable scrollback chunks outside the PTY read loop, reports the exit status, and exits. CockpitTerminalSupervisor serves this completed session as a read-only archive without creating another PTY.
+CLI 退出时，Keeper 在 PTY 读取循环之外写入最终 VT 快照和不可变 scrollback 分块，上报退出状态，然后退出。CockpitTerminalSupervisor 以只读归档形式提供该已结束会话，不再创建 PTY。
 
-### Failure boundary
+### 故障边界
 
-- Cockpit.app exit: TerminalSession remains live.
-- Cockpit.app crash: TerminalSession remains live.
-- CockpitHost restart: TerminalSession remains live.
-- CockpitTerminalSupervisor restart: all Keepers, PTYs, Agent CLIs, and established local terminal streams remain live.
-- CockpitPTYKeeper crash: only that Keeper's TerminalSession becomes Interrupted.
-- User logout or macOS restart: all live PTYs end.
+- Cockpit.app 退出：TerminalSession 保持活动。
+- Cockpit.app 崩溃：TerminalSession 保持活动。
+- CockpitHost 重启：TerminalSession 保持活动。
+- CockpitTerminalSupervisor 重启：所有 Keeper、PTY、Agent CLI 和已经建立的本地终端数据流保持活动。
+- CockpitPTYKeeper 崩溃：只有该 Keeper 对应的 TerminalSession 转为 Interrupted。
+- 用户退出登录或 macOS 重启：所有活动 PTY 结束。
 
-## 10. Editor Architecture
+## 10. 编辑器架构
 
-EditorRuntime is the only web technology region.
+EditorRuntime 是唯一使用 Web 技术的区域。
 
-- One WKWebView and Monaco runtime per Cockpit window.
-- Multiple Monaco text models share the runtime.
-- Native tabs switch the active model.
-- No WKWebView per file.
-- No React, Electron, local HTTP server, browser router, or web implementation of sidebars.
-- Editor assets load from the signed app bundle.
+- 每个 Cockpit 窗口使用一个 WKWebView 和 Monaco 运行时。
+- 多个 Monaco text model 共享该运行时。
+- 原生页签负责切换活动 model。
+- 不为每个文件创建独立 WKWebView。
+- 不使用 React、Electron、本地 HTTP Server、浏览器路由或 Web 版侧栏。
+- 编辑器资源从签名后的 App Bundle 加载。
 
-Monaco is the low-latency editing replica. CockpitHost's DocumentActor is the durable recovery authority.
+Monaco 是低延迟编辑副本。CockpitHost 的 DocumentActor 是持久恢复的权威端。
 
 ```text
-Monaco edit transaction
--> asynchronous ordered edit message
--> DocumentActor applies version
--> recovery journal append
+Monaco 编辑事务
+-> 异步有序编辑消息
+-> DocumentActor 应用版本
+-> 追加恢复日志
 -> LSP didChange
 -> acknowledgement(version)
 ```
 
-Save performs a flush barrier, waits for the Host to receive the current version, atomically replaces the disk file, and returns the new disk fingerprint.
+保存操作先执行 flush barrier，等待 Host 收到当前版本，再以原子方式替换磁盘文件，最后返回新的磁盘指纹。
 
-External modification behavior:
+外部修改处理：
 
-- Clean document: reload from disk.
-- Dirty document: enter conflict state and block silent overwrite.
+- 干净文档：从磁盘重新加载。
+- 脏文档：进入冲突状态，禁止静默覆盖。
 
-Crash recovery guarantees only Host-acknowledged document versions.
+崩溃恢复只保证保留 Host 已确认的文档版本。
 
-## 11. Workspace, Search, Git, and LSP
+## 11. 工作区、搜索、Git 与 LSP
 
-### File tree
+### 文件树
 
-- Lazy directory loading.
-- Stable relative paths.
-- FSEvents as invalidation input, not final truth.
-- Targeted filesystem reconciliation after events.
-- Tree patches instead of full reloads.
+- 延迟加载目录。
+- 使用稳定相对路径。
+- FSEvents 只作为失效信号，不作为最终事实来源。
+- 收到事件后执行针对性的文件系统对账。
+- 使用树增量，不执行整树重新加载。
 
-### Search
+### 搜索
 
-- Resident incremental path index for file search.
-- ripgrep JSON streaming for content search.
-- Query ID on every batch.
-- New query cancels the previous process.
+- 使用常驻增量路径索引实现文件搜索。
+- 使用 ripgrep JSON 流实现内容搜索。
+- 每批结果都携带 Query ID。
+- 新查询会取消上一个搜索进程。
 
 ### Git
 
-- Repository state is scoped to EnvironmentID.
-- Physical repository services are deduplicated when roots are identical.
-- `git status --porcelain=v2 -z` supplies status data.
-- Diff content is computed lazily.
-- Each repository has one mutation queue.
-- Mutations include stage, unstage, discard, commit, branch, pull, push, merge, and rebase actions.
-- After a failed mutation, Cockpit reports exact stderr and reloads repository state.
+- 仓库状态绑定 EnvironmentID。
+- 根目录相同时，物理仓库服务进行去重。
+- 使用 `git status --porcelain=v2 -z` 获取状态数据。
+- 按需计算 Diff 内容。
+- 每个仓库只有一个变更操作队列。
+- 变更操作包括 stage、unstage、discard、commit、branch、pull、push、merge 和 rebase。
+- 变更操作失败后，Cockpit 展示准确 stderr，并重新加载仓库状态。
 
 ### LSP
 
-- Language servers run under CockpitHost.
-- Processes are keyed by Environment and deduplicated only when the physical workspace identity matches.
-- DocumentActor is the only text-sync source sent to LSP.
-- Monaco provider requests are bridged through CockpitClientCore.
+- 语言服务器运行在 CockpitHost 下。
+- 进程以 Environment 为键，只有物理工作区身份相同时才去重。
+- DocumentActor 是发送给 LSP 的唯一文本同步来源。
+- Monaco Provider 请求通过 CockpitClientCore 桥接。
 
-## 12. Persistence and Resource Lifecycle
+## 12. 持久化与资源生命周期
 
-### Storage ownership
+### 存储所有权
 
-- CockpitHost exclusively writes workspace.sqlite.
-- CockpitTerminalSupervisor exclusively writes terminal.sqlite.
-- Each CockpitPTYKeeper exclusively writes its own runtime descriptor, immutable scrollback chunks, and final VT snapshot.
-- Processes never share mutable database ownership.
-- Startup reconciliation happens through IPC.
+- 只有 CockpitHost 可以写入 workspace.sqlite。
+- 只有 CockpitTerminalSupervisor 可以写入 terminal.sqlite。
+- 每个 CockpitPTYKeeper 只能写入自己的运行时描述符、不可变 scrollback 分块和最终 VT 快照。
+- 不同进程永远不共享可变数据库的写入所有权。
+- 启动恢复通过 IPC 完成对账。
 
-### EnvironmentKernel states
+### EnvironmentKernel 状态
 
 ```text
 Cold -> Active -> Background -> Evicted
 ```
 
-- Cold: metadata only.
-- Active: at least one attached client.
-- Background: no client, but a live terminal or dirty document remains.
-- Evicted: reference count is zero and state has been checkpointed.
+- Cold：仅保留元数据。
+- Active：至少有一个已连接客户端。
+- Background：没有客户端，但仍有活动终端或脏文档。
+- Evicted：引用计数为零，且状态已经保存检查点。
 
-Resource rules:
+资源规则：
 
-- PTY and VT remain while TerminalSession is running.
-- A live Agent CLI has no idle timeout.
-- Closing a terminal tab or quitting Cockpit.app only detaches the client.
-- A completed session is served from its final read-only snapshot and scrollback archive.
-- Dirty DocumentSession remains until saved or discarded.
-- LSP runs while an editor requires it.
-- Search process exists only for a live query.
-- Watcher and Git models are shared by canonical root and evicted with WorkspaceKernel.
+- TerminalSession 处于 Running 时保留 PTY 和 VT。
+- 活动 Agent CLI 不设置空闲超时。
+- 关闭终端页签或退出 Cockpit.app 只会断开客户端。
+- 已结束会话通过最终只读快照和 scrollback 归档提供访问。
+- 脏 DocumentSession 保留到保存或丢弃为止。
+- 编辑器需要 LSP 时，语言服务器保持运行。
+- 搜索进程只在查询活动期间存在。
+- Watcher 和 Git 模型按规范化根目录共享，并随 WorkspaceKernel 一同逐出。
 
-## 13. Recovery Semantics
+## 13. 恢复语义
 
-| Event | Preserved | Recovery |
+| 事件 | 保留内容 | 恢复方式 |
 |---|---|---|
-| Cockpit.app exits or crashes | Host, Supervisor, Keepers, PTYs, CLIs, durable document versions | Reattach to each Keeper and load snapshot plus delta |
-| WKWebView crashes | Native UI, services, acknowledged document versions | Recreate Monaco runtime and hydrate models |
-| Local stream disconnects | Host and terminal authority | Resume from sequence or replace with snapshot |
-| External file change | Disk version and dirty buffer | Reload clean file or enter conflict state |
-| CockpitHost crashes | Supervisor, Keepers, and live PTYs | Restart Host and reconcile TerminalSession IDs |
-| CockpitTerminalSupervisor crashes | Keepers, PTYs, CLIs, and established local streams | launchd restarts Supervisor; reconcile committed WorkerInstanceIDs |
-| One CockpitPTYKeeper crashes | Every other session plus final archives | Mark only the affected TerminalSession Interrupted |
-| Remote client disconnects | All Mac-side state | Expire input leases and resynchronize on reconnect |
-| User logout or macOS restart | Workspace and final terminal archives | Mark previously live TerminalSessions Interrupted |
+| Cockpit.app 退出或崩溃 | Host、Supervisor、Keeper、PTY、CLI、持久化文档版本 | 重新连接各 Keeper，并加载快照与增量 |
+| WKWebView 崩溃 | 原生 UI、服务、已确认文档版本 | 重建 Monaco 运行时并恢复 model |
+| 本地数据流断开 | Host 和终端权威状态 | 从 sequence 继续，或用快照替换 |
+| 外部文件变更 | 磁盘版本和脏缓冲区 | 干净文件重新加载；脏文件进入冲突状态 |
+| CockpitHost 崩溃 | Supervisor、Keeper 和活动 PTY | 重启 Host 并对账 TerminalSession ID |
+| CockpitTerminalSupervisor 崩溃 | Keeper、PTY、CLI 和已建立的本地数据流 | launchd 重启 Supervisor，并对账已提交 WorkerInstanceID |
+| 一个 CockpitPTYKeeper 崩溃 | 其他全部会话及最终归档 | 仅将受影响 TerminalSession 标记为 Interrupted |
+| 远程客户端断开 | Mac 端全部状态 | 释放输入租约，并在重连后重新同步 |
+| 用户退出登录或 macOS 重启 | 工作区和最终终端归档 | 将此前活动的 TerminalSession 标记为 Interrupted |
 
-Archive and deletion rules:
+归档和删除规则：
 
-- Archive hides Conversation but preserves state.
-- Delete Conversation first resolves live sessions.
-- Delete Conversation never deletes a worktree implicitly.
-- Worktree removal is an independent operation that checks local changes.
+- Archive 隐藏 Conversation，但保留状态。
+- 删除 Conversation 前先处理所有活动会话。
+- 删除 Conversation 永远不会隐式删除 worktree。
+- 删除 worktree 是独立操作，执行前检查本地变更。
 
-## 14. Repository and Module Layout
+## 14. 仓库与模块布局
 
 ```text
 Cockpit/
@@ -607,38 +607,38 @@ Cockpit/
 └── docs/
 ```
 
-Dependency rules:
+依赖规则：
 
-- CockpitTypes imports no product subsystem.
-- CockpitProtocol depends only on CockpitTypes and SwiftProtobuf.
-- CockpitClientCore imports no UI framework.
-- CockpitHostCore imports no transport implementation.
-- CockpitWorkspace and CockpitPersistence implement HostCore interfaces.
-- CockpitLocalTransport owns NSXPCConnection and Unix Domain Socket adapters.
-- CockpitRemoteTransport owns Network.framework and TLS adapters.
-- Composition-root executable targets contain no business logic.
+- CockpitTypes 不导入任何产品子系统。
+- CockpitProtocol 只依赖 CockpitTypes 和 SwiftProtobuf。
+- CockpitClientCore 不导入 UI 框架。
+- CockpitHostCore 不导入具体 Transport 实现。
+- CockpitWorkspace 和 CockpitPersistence 实现 CockpitHostCore 接口。
+- CockpitLocalTransport 负责 NSXPCConnection 和 Unix Domain Socket 适配器。
+- CockpitRemoteTransport 负责 Network.framework 和 TLS 适配器。
+- 作为 Composition Root 的可执行 Target 不包含业务逻辑。
 
-## 15. Pinned Foundation Dependencies
+## 15. 固定的基础依赖
 
-Versions verified on 2026-08-05:
+以下版本已于 2026-08-05 验证：
 
-| Component | Version | Source |
+| 组件 | 版本 | 来源 |
 |---|---:|---|
-| Xcode | 26.6 | local `xcodebuild -version` |
-| Swift | 6.3.3 | local `swift --version` |
-| Swift tools version | 6.2 | package manifest baseline |
+| Xcode | 26.6 | 本机 `xcodebuild -version` |
+| Swift | 6.3.3 | 本机 `swift --version` |
+| Swift tools version | 6.2 | Package Manifest 基线 |
 | SwiftProtobuf | 1.38.1 | https://github.com/apple/swift-protobuf/releases/tag/1.38.1 |
 | Monaco Editor | 0.55.1 | https://github.com/microsoft/monaco-editor/releases/tag/v0.55.1 |
 | esbuild | 0.28.1 | https://github.com/evanw/esbuild/releases/tag/v0.28.1 |
-| Ghostty upstream base | v1.3.1 / `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | https://github.com/ghostty-org/ghostty/releases/tag/v1.3.1 |
-| Zig for Ghostty 1.3.x | 0.15.2 | https://ghostty.org/docs/install/build |
-| Node | 25.9.0 | local `node --version` |
-| pnpm | 9.15.9 | local `pnpm --version` |
+| Ghostty 上游基础版本 | v1.3.1 / `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | https://github.com/ghostty-org/ghostty/releases/tag/v1.3.1 |
+| Ghostty 1.3.x 使用的 Zig | 0.15.2 | https://ghostty.org/docs/install/build |
+| Node | 25.9.0 | 本机 `node --version` |
+| pnpm | 9.15.9 | 本机 `pnpm --version` |
 | XcodeGen | 2.46.0 | https://github.com/yonaskolb/XcodeGen/releases/tag/2.46.0 |
 
-Ghostty's official build documentation binds Ghostty 1.3.x to Zig 0.15.2. Cockpit therefore pins Zig 0.15.2 even though Zig 0.16.0 exists.
+Ghostty 官方构建文档明确绑定 Ghostty 1.3.x 与 Zig 0.15.2。因此，即使 Zig 0.16.0 已存在，Cockpit 仍固定使用 Zig 0.15.2。
 
-Phase 0 development identifiers:
+Phase 0 开发标识：
 
 ```text
 dev.cockpit.Cockpit
@@ -649,54 +649,54 @@ dev.cockpit.host
 dev.cockpit.terminal
 ```
 
-The release Team ID and public bundle identifiers are distribution settings and do not alter protocol or domain identities.
+正式发布使用的 Team ID 和公开 Bundle Identifier 属于分发配置，不会改变协议身份或领域身份。
 
-## 16. Delivery Order
+## 16. 交付顺序
 
-### Phase 0: engineering foundation
+### Phase 0：工程基础
 
-- Xcode and SwiftPM structure.
-- Stable value types and versioned protocol.
-- CockpitClientCore and CockpitHostCore handshakes.
-- Four executable composition roots, including the per-session PTYKeeper boundary.
-- Local control and frame transport foundations.
-- Monaco and Ghostty pinned build inputs.
-- Remote transport conformance harness.
+- Xcode 和 SwiftPM 结构。
+- 稳定值类型和版本化协议。
+- CockpitClientCore 与 CockpitHostCore 握手。
+- 四个 Composition Root 可执行 Target，其中包含每会话 PTYKeeper 边界。
+- 本地控制面和帧传输基础。
+- 固定版本的 Monaco 与 Ghostty 构建输入。
+- 远程 Transport 一致性测试框架。
 
-### Phase 1: local direct conversation vertical slice
+### Phase 1：本地 Direct Conversation 垂直切片
 
-- Add Project.
-- Create Direct Conversation.
-- File tree.
-- Basic Monaco open and save.
-- TerminalSupervisor plus per-session PTYKeeper shell and Agent CLI launch.
-- App exit, Supervisor crash, and state recovery.
+- 添加 Project。
+- 创建 Direct Conversation。
+- 文件树。
+- Monaco 基础打开和保存。
+- TerminalSupervisor 与每会话 PTYKeeper 启动 Shell 和 Agent CLI。
+- App 退出、Supervisor 崩溃和状态恢复。
 
-### Phase 2: environment isolation
+### Phase 2：工作环境隔离
 
-- Multiple projects and conversations.
-- Direct and Worktree environments.
-- Atomic ActiveContext switching.
-- Cross-environment isolation tests.
+- 多 Project 和多 Conversation。
+- Direct 与 Worktree Environment。
+- ActiveContext 原子切换。
+- 跨 Environment 隔离测试。
 
-### Phase 3: developer tools
+### Phase 3：开发工具
 
-- File and content search.
-- Git status, diff, stage, commit, and Toolbox operations.
-- First Developer Preview.
+- 文件和内容搜索。
+- Git 状态、Diff、stage、commit 和 Toolbox 操作。
+- 首个开发者预览版。
 
-### Phase 4: editor intelligence
+### Phase 4：编辑器智能能力
 
-- LSP features, semantic tokens, rename, formatting, code actions, and diff editor.
+- LSP 能力、语义 Token、重命名、格式化、Code Action 和 Diff 编辑器。
 
-### Phase 5: remote direct control
+### Phase 5：远程直连控制
 
-- TLS pairing, device grants, input leases, reconnection, and a second Apple-device client.
+- TLS 配对、设备授权、输入租约、重连和第二个 Apple 设备客户端。
 
-### Phase 6: productization
+### Phase 6：产品化
 
-- Hardened Runtime, signing, notarization, service upgrades, migration, recovery, security verification, and performance diagnostics.
+- Hardened Runtime、签名、公证、服务升级、迁移、恢复、安全验证和性能诊断。
 
-## 17. Phase Completion Rule
+## 17. Phase 完成规则
 
-A phase completes only when its end-to-end macOS user flow, Swift unit tests, protocol fixtures, and process integration tests all pass. A collection of isolated modules is not a completed phase.
+只有端到端 macOS 用户流程、Swift 单元测试、协议 Fixture 和进程集成测试全部通过，Phase 才算完成。一组彼此孤立的模块不构成完成的 Phase。
