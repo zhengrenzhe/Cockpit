@@ -9,11 +9,6 @@ func optionalValue(after flag: String, in arguments: [String]) -> String? {
     return arguments[index + 1]
 }
 
-func setOwnerOnlyDirectoryMode(_ path: String) throws {
-    let result = path.withCString { chmod($0, S_IRWXU) }
-    guard result == 0 else { throw CocoaError(.fileWriteNoPermission) }
-}
-
 let arguments = CommandLine.arguments
 let previousSIGCHLDHandler = signal(SIGCHLD, SIG_IGN)
 guard unsafeBitCast(previousSIGCHLDHandler, to: Int.self) != -1 else {
@@ -27,11 +22,7 @@ let keeperExecutable = optionalValue(after: "--keeper-executable", in: arguments
 let runtimeDirectory = optionalValue(after: "--runtime-directory", in: arguments)
     ?? "/private/tmp/cockpit.\(geteuid())/terminal"
 
-try FileManager.default.createDirectory(
-    atPath: runtimeDirectory,
-    withIntermediateDirectories: true
-)
-try setOwnerOnlyDirectoryMode(runtimeDirectory)
+try SecureRuntimeDirectory.prepare(at: runtimeDirectory)
 
 let launcher = KeeperProcessLauncher(executablePath: keeperExecutable)
 let exported = TerminalSupervisorXPCExport(

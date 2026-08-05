@@ -60,6 +60,13 @@ public struct KeeperProcessLauncher: Sendable {
             writeDescriptor = duplicated
         }
 
+        guard fcntl(writeDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            let code = errno
+            Darwin.close(readDescriptor)
+            Darwin.close(writeDescriptor)
+            throw KeeperLaunchFailure(operation: "fcntl(F_SETNOSIGPIPE)", code: code)
+        }
+
         let readHandle = FileHandle(
             fileDescriptor: readDescriptor,
             closeOnDealloc: true
@@ -138,22 +145,22 @@ public struct KeeperProcessLauncher: Sendable {
             }
         }
 
-        try readHandle.close()
-
         guard result == 0 else {
+            try? readHandle.close()
             try? writeHandle.close()
             throw KeeperLaunchFailure(operation: "posix_spawn", code: result)
         }
 
         do {
+            try readHandle.close()
             try writeHandle.write(contentsOf: payload)
             try writeHandle.close()
         } catch {
-            let killResult = Darwin.kill(processID, SIGKILL)
-            guard killResult == 0 || errno == ESRCH else {
-                throw KeeperLaunchFailure(operation: "kill", code: errno)
-            }
-            throw error
+            let launchError = error
+            try? readHandle.close()
+            try? writeHandle.close()
+            try terminateAndReap(processID)
+            throw launchError
         }
 
         return KeeperLaunchReceipt(
@@ -163,4 +170,37 @@ public struct KeeperProcessLauncher: Sendable {
             runtimeDescriptorPath: bootstrap.runtimeDescriptorPath
         )
     }
+}
+
+private func terminateAndReap(_ processID: pid_t) throws {
+    let killResult = Darwin.kill(processID, SIGKILL)
+    guard killResult == 0 || errno == ESRCH else {
+        throw KeeperLaunchFailure(operation: "kill", code: errno)
+    }
+
+    var status: Int32 = 0
+    let maximumAttempts = 100
+
+    for attempt in 0..<maximumAttempts {
+        let waitResult = waitpid(processID, &status, WNOHANG)
+        if waitResult == processID {
+            return
+        }
+        if waitResult < 0 {
+            let code = errno
+            if code == ECHILD {
+                return
+            }
+            if code != EINTR {
+                throw KeeperLaunchFailure(operation: "waitpid", code: code)
+            }
+        }
+
+        if attempt + 1 < maximumAttempts {
+            var delay = timespec(tv_sec: 0, tv_nsec: 10_000_000)
+            _ = nanosleep(&delay, nil)
+        }
+    }
+
+    throw KeeperLaunchFailure(operation: "waitpid", code: ETIMEDOUT)
 }
