@@ -1,0 +1,732 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		00F2CE09C916763801CA9F85 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 521FA9CA3D31F33E20B0CC22 /* main.swift */; };
+		212557A2ACC955D30965D047 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
+		5504EF2E91B30EAA53DE6A0E /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */; };
+		60026EC79653E301CEE5491E /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
+		69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3A65312477EAD5232A52B0 /* main.swift */; };
+		6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */ = {isa = PBXBuildFile; productRef = 805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */; };
+		80169161B195865C65678342 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 75A939B292A29F0EA7497870 /* CockpitLocalTransport */; };
+		995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BFB39C38A17E2083706555 /* AppDelegate.swift */; };
+		B984303D116E24D3B243414B /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = D51DF015FEF9086662DEC115 /* CockpitTerminalCore */; };
+		BD4D067AEA4D8DD58643509F /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D380A6D5A0B758FBC879A0 /* main.swift */; };
+		DE1A356D6AFAC3DA1F075DCB /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 98B021792EC132C38CE754AF /* CockpitLocalTransport */; };
+		E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */; };
+		FF4336728B6B261A41D126A2 /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 80E0EDA5DF236D4B796E1DC4 /* CockpitHostCore */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		55E70D4F4B2B4557C1003EFD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2D2748F318F36C27786CFB3C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C6AC280B43B6369148D0714A;
+			remoteInfo = CockpitHost;
+		};
+		842C31CEE7004F6A604E6086 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2D2748F318F36C27786CFB3C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 01A05A8A2A71E7DC1ED4F685;
+			remoteInfo = CockpitPTYKeeper;
+		};
+		EB2DEBC00943400C63CD749E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2D2748F318F36C27786CFB3C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E9BB0F9BEE57C9948B137941;
+			remoteInfo = CockpitTerminalSupervisor;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		24F4C7CED2AF894E38FA8B60 /* phase-0 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "phase-0"; path = .; sourceTree = SOURCE_ROOT; };
+		2C3A65312477EAD5232A52B0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		434FD56C66EABF9EB68397FE /* CockpitHost */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitHost; sourceTree = BUILT_PRODUCTS_DIR; };
+		48D380A6D5A0B758FBC879A0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		521FA9CA3D31F33E20B0CC22 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		70F73173468B21D2CA4D246A /* Cockpit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cockpit.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A0BFB39C38A17E2083706555 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		C1FB833EEF9FB302DB53867C /* CockpitTerminalSupervisor */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitTerminalSupervisor; sourceTree = BUILT_PRODUCTS_DIR; };
+		C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceStatusViewModel.swift; sourceTree = "<group>"; };
+		C5C87AF4E75B23201A214E82 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		E7CC18242186F71956E15599 /* CockpitPTYKeeper */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitPTYKeeper; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		19C62675F31436DA9D65E793 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FF4336728B6B261A41D126A2 /* CockpitHostCore in Frameworks */,
+				80169161B195865C65678342 /* CockpitLocalTransport in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		2ECBB436F3015BCD84E0D59A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B984303D116E24D3B243414B /* CockpitTerminalCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D1C978041566B0F8E0E6904B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */,
+				60026EC79653E301CEE5491E /* CockpitLocalTransport in Frameworks */,
+				212557A2ACC955D30965D047 /* CockpitTypes in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D63CB57C70F26ADB566C9E00 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5504EF2E91B30EAA53DE6A0E /* CockpitTerminalCore in Frameworks */,
+				DE1A356D6AFAC3DA1F075DCB /* CockpitLocalTransport in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0028AB5E5FA1BF5A5FCAF626 /* Build */ = {
+			isa = PBXGroup;
+			children = (
+				C5C87AF4E75B23201A214E82 /* Base.xcconfig */,
+			);
+			name = Build;
+			path = Config/Build;
+			sourceTree = "<group>";
+		};
+		17AE0B84631936BB32DF470B /* CockpitApp */ = {
+			isa = PBXGroup;
+			children = (
+				A0BFB39C38A17E2083706555 /* AppDelegate.swift */,
+				C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */,
+			);
+			name = CockpitApp;
+			path = Applications/CockpitApp;
+			sourceTree = "<group>";
+		};
+		457080120E476759F1EC65C5 /* CockpitPTYKeeper */ = {
+			isa = PBXGroup;
+			children = (
+				2C3A65312477EAD5232A52B0 /* main.swift */,
+			);
+			name = CockpitPTYKeeper;
+			path = Applications/CockpitPTYKeeper;
+			sourceTree = "<group>";
+		};
+		74779E6081372CCA11FC07A2 = {
+			isa = PBXGroup;
+			children = (
+				0028AB5E5FA1BF5A5FCAF626 /* Build */,
+				17AE0B84631936BB32DF470B /* CockpitApp */,
+				F11B1C8D8C04FE8D85937769 /* CockpitHost */,
+				457080120E476759F1EC65C5 /* CockpitPTYKeeper */,
+				DB534674FC3ED4B84218F3D7 /* CockpitTerminalSupervisor */,
+				D313BC9B79196468316EC60E /* Packages */,
+				DEFE04B8F8911E7471915F68 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D313BC9B79196468316EC60E /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				24F4C7CED2AF894E38FA8B60 /* phase-0 */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		DB534674FC3ED4B84218F3D7 /* CockpitTerminalSupervisor */ = {
+			isa = PBXGroup;
+			children = (
+				521FA9CA3D31F33E20B0CC22 /* main.swift */,
+			);
+			name = CockpitTerminalSupervisor;
+			path = Applications/CockpitTerminalSupervisor;
+			sourceTree = "<group>";
+		};
+		DEFE04B8F8911E7471915F68 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				70F73173468B21D2CA4D246A /* Cockpit.app */,
+				434FD56C66EABF9EB68397FE /* CockpitHost */,
+				E7CC18242186F71956E15599 /* CockpitPTYKeeper */,
+				C1FB833EEF9FB302DB53867C /* CockpitTerminalSupervisor */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F11B1C8D8C04FE8D85937769 /* CockpitHost */ = {
+			isa = PBXGroup;
+			children = (
+				48D380A6D5A0B758FBC879A0 /* main.swift */,
+			);
+			name = CockpitHost;
+			path = Applications/CockpitHost;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		01A05A8A2A71E7DC1ED4F685 /* CockpitPTYKeeper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C74A575F39CBD0D64D757B08 /* Build configuration list for PBXNativeTarget "CockpitPTYKeeper" */;
+			buildPhases = (
+				4FBDD5A3D14417D80CF1A73D /* Sources */,
+				2ECBB436F3015BCD84E0D59A /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CockpitPTYKeeper;
+			packageProductDependencies = (
+				D51DF015FEF9086662DEC115 /* CockpitTerminalCore */,
+			);
+			productName = CockpitPTYKeeper;
+			productReference = E7CC18242186F71956E15599 /* CockpitPTYKeeper */;
+			productType = "com.apple.product-type.tool";
+		};
+		6F4E0A2E524FD8724D264DEC /* Cockpit */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DDD9035969FB44F62AE4FFCE /* Build configuration list for PBXNativeTarget "Cockpit" */;
+			buildPhases = (
+				1CF695282F179492BC025448 /* Sources */,
+				D1C978041566B0F8E0E6904B /* Frameworks */,
+				250EBF7F377C541A365098D0 /* Embed LaunchAgents */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				37D489506B32FD268CD763BD /* PBXTargetDependency */,
+				1A6AED248B6BAF65AE58B92D /* PBXTargetDependency */,
+				931DAF49251E968FB5E67212 /* PBXTargetDependency */,
+			);
+			name = Cockpit;
+			packageProductDependencies = (
+				805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */,
+				29A3733E9D6777F50A36E911 /* CockpitLocalTransport */,
+				301696E7B6689F1F7F644EA6 /* CockpitTypes */,
+			);
+			productName = Cockpit;
+			productReference = 70F73173468B21D2CA4D246A /* Cockpit.app */;
+			productType = "com.apple.product-type.application";
+		};
+		C6AC280B43B6369148D0714A /* CockpitHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 35EA5494B5A0B28315E47E75 /* Build configuration list for PBXNativeTarget "CockpitHost" */;
+			buildPhases = (
+				008EF8E32D7B469DF9E262D7 /* Sources */,
+				19C62675F31436DA9D65E793 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CockpitHost;
+			packageProductDependencies = (
+				80E0EDA5DF236D4B796E1DC4 /* CockpitHostCore */,
+				75A939B292A29F0EA7497870 /* CockpitLocalTransport */,
+			);
+			productName = CockpitHost;
+			productReference = 434FD56C66EABF9EB68397FE /* CockpitHost */;
+			productType = "com.apple.product-type.tool";
+		};
+		E9BB0F9BEE57C9948B137941 /* CockpitTerminalSupervisor */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 388FFD9A9F4E640068DAA84A /* Build configuration list for PBXNativeTarget "CockpitTerminalSupervisor" */;
+			buildPhases = (
+				93BCF13BB7DB68CA2B3DC524 /* Sources */,
+				D63CB57C70F26ADB566C9E00 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CockpitTerminalSupervisor;
+			packageProductDependencies = (
+				93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */,
+				98B021792EC132C38CE754AF /* CockpitLocalTransport */,
+			);
+			productName = CockpitTerminalSupervisor;
+			productReference = C1FB833EEF9FB302DB53867C /* CockpitTerminalSupervisor */;
+			productType = "com.apple.product-type.tool";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		2D2748F318F36C27786CFB3C /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					01A05A8A2A71E7DC1ED4F685 = {
+						ProvisioningStyle = Manual;
+					};
+					6F4E0A2E524FD8724D264DEC = {
+						ProvisioningStyle = Manual;
+					};
+					C6AC280B43B6369148D0714A = {
+						ProvisioningStyle = Manual;
+					};
+					E9BB0F9BEE57C9948B137941 = {
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = 3BB36F6332650791EAA0D8F4 /* Build configuration list for PBXProject "Cockpit" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 74779E6081372CCA11FC07A2;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				6CB0F0E155E5746AA87F939A /* XCLocalSwiftPackageReference "." */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = DEFE04B8F8911E7471915F68 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				C6AC280B43B6369148D0714A /* CockpitHost */,
+				E9BB0F9BEE57C9948B137941 /* CockpitTerminalSupervisor */,
+				01A05A8A2A71E7DC1ED4F685 /* CockpitPTYKeeper */,
+				6F4E0A2E524FD8724D264DEC /* Cockpit */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		250EBF7F377C541A365098D0 /* Embed LaunchAgents */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/CockpitHost",
+				"$(BUILT_PRODUCTS_DIR)/CockpitTerminalSupervisor",
+				"$(BUILT_PRODUCTS_DIR)/CockpitPTYKeeper",
+				"$(SRCROOT)/Config/LaunchAgents/dev.cockpit.host.plist",
+				"$(SRCROOT)/Config/LaunchAgents/dev.cockpit.terminal.plist",
+			);
+			name = "Embed LaunchAgents";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitHost",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitTerminalSupervisor",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitPTYKeeper",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.host.plist",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.terminal.plist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nresources=\"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources\"\nagents=\"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchAgents\"\nmkdir -p \"$resources\" \"$agents\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitHost\" \"$resources/CockpitHost\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor\" \"$resources/CockpitTerminalSupervisor\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitPTYKeeper\" \"$resources/CockpitPTYKeeper\"\ncp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist\" \"$agents/\"\ncp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist\" \"$agents/\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost \"$resources/CockpitHost\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor \"$resources/CockpitTerminalSupervisor\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper \"$resources/CockpitPTYKeeper\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		008EF8E32D7B469DF9E262D7 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BD4D067AEA4D8DD58643509F /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1CF695282F179492BC025448 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */,
+				E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4FBDD5A3D14417D80CF1A73D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		93BCF13BB7DB68CA2B3DC524 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				00F2CE09C916763801CA9F85 /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1A6AED248B6BAF65AE58B92D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E9BB0F9BEE57C9948B137941 /* CockpitTerminalSupervisor */;
+			targetProxy = EB2DEBC00943400C63CD749E /* PBXContainerItemProxy */;
+		};
+		37D489506B32FD268CD763BD /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C6AC280B43B6369148D0714A /* CockpitHost */;
+			targetProxy = 55E70D4F4B2B4557C1003EFD /* PBXContainerItemProxy */;
+		};
+		931DAF49251E968FB5E67212 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 01A05A8A2A71E7DC1ED4F685 /* CockpitPTYKeeper */;
+			targetProxy = 842C31CEE7004F6A604E6086 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		3C16C4ACCFB6B5BD1FC389A2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C5C87AF4E75B23201A214E82 /* Base.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		47DB310704E2D425146DA8BB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitTerminalSupervisor";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitTerminalSupervisor;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		A9205D3733D0AC78C023D53D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitPTYKeeper";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitPTYKeeper;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		B59712E133A0ED40F700879D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitPTYKeeper";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitPTYKeeper;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		B6EE1B65701E6DC8FD0B6650 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				EXTRACT_APP_INTENTS_METADATA = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Cockpit;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		BB9EA88B7C1A2BFF702DD820 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitHost";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitHost;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		C31BAC33F5C8184D20B7F0F0 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				COMBINE_HIDPI_IMAGES = YES;
+				EXTRACT_APP_INTENTS_METADATA = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Cockpit;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		C7EC548FCA33A78008B4B47D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitTerminalSupervisor";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitTerminalSupervisor;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		D3290AA71EEF2DDBDFCA65BA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C5C87AF4E75B23201A214E82 /* Base.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		F8900FA1865222AEFDD463AB /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitHost";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitHost;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		35EA5494B5A0B28315E47E75 /* Build configuration list for PBXNativeTarget "CockpitHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F8900FA1865222AEFDD463AB /* Debug */,
+				BB9EA88B7C1A2BFF702DD820 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		388FFD9A9F4E640068DAA84A /* Build configuration list for PBXNativeTarget "CockpitTerminalSupervisor" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				47DB310704E2D425146DA8BB /* Debug */,
+				C7EC548FCA33A78008B4B47D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		3BB36F6332650791EAA0D8F4 /* Build configuration list for PBXProject "Cockpit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D3290AA71EEF2DDBDFCA65BA /* Debug */,
+				3C16C4ACCFB6B5BD1FC389A2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C74A575F39CBD0D64D757B08 /* Build configuration list for PBXNativeTarget "CockpitPTYKeeper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B59712E133A0ED40F700879D /* Debug */,
+				A9205D3733D0AC78C023D53D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		DDD9035969FB44F62AE4FFCE /* Build configuration list for PBXNativeTarget "Cockpit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B6EE1B65701E6DC8FD0B6650 /* Debug */,
+				C31BAC33F5C8184D20B7F0F0 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		6CB0F0E155E5746AA87F939A /* XCLocalSwiftPackageReference "." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = .;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		29A3733E9D6777F50A36E911 /* CockpitLocalTransport */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitLocalTransport;
+		};
+		301696E7B6689F1F7F644EA6 /* CockpitTypes */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitTypes;
+		};
+		75A939B292A29F0EA7497870 /* CockpitLocalTransport */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitLocalTransport;
+		};
+		805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitClientCore;
+		};
+		80E0EDA5DF236D4B796E1DC4 /* CockpitHostCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitHostCore;
+		};
+		93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitTerminalCore;
+		};
+		98B021792EC132C38CE754AF /* CockpitLocalTransport */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitLocalTransport;
+		};
+		D51DF015FEF9086662DEC115 /* CockpitTerminalCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitTerminalCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 2D2748F318F36C27786CFB3C /* Project object */;
+}

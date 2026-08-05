@@ -1,0 +1,119 @@
+name: Cockpit
+options:
+  bundleIdPrefix: dev.cockpit
+  deploymentTarget:
+    macOS: "15.0"
+configs:
+  Debug: debug
+  Release: release
+packages:
+  CockpitKit:
+    path: .
+settings:
+  base:
+    PRODUCT_NAME: $(TARGET_NAME)
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+configFiles:
+  Debug: Config/Build/Base.xcconfig
+  Release: Config/Build/Base.xcconfig
+targets:
+  CockpitHost:
+    type: tool
+    platform: macOS
+    sources: [Applications/CockpitHost]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitHost
+        OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitHost
+    dependencies:
+      - package: CockpitKit
+        product: CockpitHostCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
+  CockpitTerminalSupervisor:
+    type: tool
+    platform: macOS
+    sources: [Applications/CockpitTerminalSupervisor]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitTerminalSupervisor
+        OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitTerminalSupervisor
+    dependencies:
+      - package: CockpitKit
+        product: CockpitTerminalCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
+  CockpitPTYKeeper:
+    type: tool
+    platform: macOS
+    sources: [Applications/CockpitPTYKeeper]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitPTYKeeper
+        OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitPTYKeeper
+    dependencies:
+      - package: CockpitKit
+        product: CockpitTerminalCore
+  Cockpit:
+    type: application
+    platform: macOS
+    sources: [Applications/CockpitApp]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.Cockpit
+        GENERATE_INFOPLIST_FILE: YES
+        EXTRACT_APP_INTENTS_METADATA: NO
+        INFOPLIST_KEY_CFBundleDisplayName: Cockpit
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+    dependencies:
+      - package: CockpitKit
+        product: CockpitClientCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
+      - package: CockpitKit
+        product: CockpitTypes
+      - target: CockpitHost
+        embed: false
+      - target: CockpitTerminalSupervisor
+        embed: false
+      - target: CockpitPTYKeeper
+        embed: false
+    postBuildScripts:
+      - name: Embed LaunchAgents
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/CockpitHost
+          - $(BUILT_PRODUCTS_DIR)/CockpitTerminalSupervisor
+          - $(BUILT_PRODUCTS_DIR)/CockpitPTYKeeper
+          - $(SRCROOT)/Config/LaunchAgents/dev.cockpit.host.plist
+          - $(SRCROOT)/Config/LaunchAgents/dev.cockpit.terminal.plist
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitHost
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitTerminalSupervisor
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitPTYKeeper
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.host.plist
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.terminal.plist
+        script: |
+          set -euo pipefail
+          resources="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources"
+          agents="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchAgents"
+          mkdir -p "$resources" "$agents"
+          cp "$BUILT_PRODUCTS_DIR/CockpitHost" "$resources/CockpitHost"
+          cp "$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor" "$resources/CockpitTerminalSupervisor"
+          cp "$BUILT_PRODUCTS_DIR/CockpitPTYKeeper" "$resources/CockpitPTYKeeper"
+          cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist" "$agents/"
+          cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist" "$agents/"
+          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost "$resources/CockpitHost"
+          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor "$resources/CockpitTerminalSupervisor"
+          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper "$resources/CockpitPTYKeeper"
+schemes:
+  Cockpit:
+    build:
+      targets:
+        Cockpit: all
+        CockpitHost: all
+        CockpitTerminalSupervisor: all
+        CockpitPTYKeeper: all
+    run:
+      config: Debug
