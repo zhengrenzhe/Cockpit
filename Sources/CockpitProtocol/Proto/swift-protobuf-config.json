@@ -1,0 +1,9 @@
+{
+  "invocations": [
+    {
+      "protoFiles": ["cockpit.proto"],
+      "visibility": "public",
+      "fileNaming": "dropPath"
+    }
+  ]
+}
