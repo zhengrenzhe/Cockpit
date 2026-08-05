@@ -11,6 +11,8 @@ public enum FrameCodecError: Error, Equatable {
 
 public struct FrameHeader: Equatable, Sendable {
     public static let magic: UInt32 = 0x434B5054
+    /// The `UInt16` frame-format version, independent of handshake version 1.0.
+    /// Its big-endian wire representation is `00 01`.
     public static let version: UInt16 = 1
     public static let encodedLength = 32
     public static let maximumPayloadLength: UInt32 = 16 * 1_024 * 1_024
