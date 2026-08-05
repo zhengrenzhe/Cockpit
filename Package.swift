@@ -12,6 +12,10 @@ let package = Package(
         .library(name: "CockpitHostCore", targets: ["CockpitHostCore"]),
         .library(name: "CockpitTerminalCore", targets: ["CockpitTerminalCore"]),
         .library(name: "CockpitLocalTransport", targets: ["CockpitLocalTransport"]),
+        .executable(name: "CockpitHost", targets: ["CockpitHost"]),
+        .executable(name: "CockpitTerminalSupervisor", targets: ["CockpitTerminalSupervisor"]),
+        .executable(name: "CockpitPTYKeeper", targets: ["CockpitPTYKeeper"]),
+        .executable(name: "CockpitProbe", targets: ["CockpitProbe"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.38.1"),
@@ -68,6 +72,31 @@ let package = Package(
                 "CockpitTerminalCore",
                 "CockpitTypes",
             ]
+        ),
+        .executableTarget(
+            name: "CockpitHost",
+            dependencies: ["CockpitHostCore", "CockpitLocalTransport"],
+            path: "Applications/CockpitHost"
+        ),
+        .executableTarget(
+            name: "CockpitTerminalSupervisor",
+            dependencies: ["CockpitTerminalCore", "CockpitLocalTransport"],
+            path: "Applications/CockpitTerminalSupervisor"
+        ),
+        .executableTarget(
+            name: "CockpitPTYKeeper",
+            dependencies: ["CockpitTerminalCore"],
+            path: "Applications/CockpitPTYKeeper"
+        ),
+        .executableTarget(
+            name: "CockpitProbe",
+            dependencies: [
+                "CockpitClientCore",
+                "CockpitLocalTransport",
+                "CockpitTerminalCore",
+                "CockpitTypes",
+            ],
+            path: "Applications/CockpitProbe"
         ),
     ],
     swiftLanguageModes: [.v6]
