@@ -316,6 +316,7 @@
 /* Begin PBXShellScriptBuildPhase section */
 		250EBF7F377C541A365098D0 /* Embed LaunchAgents */ = {
 			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = (
 			);
@@ -340,7 +341,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nresources=\"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources\"\nagents=\"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchAgents\"\nmkdir -p \"$resources\" \"$agents\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitHost\" \"$resources/CockpitHost\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor\" \"$resources/CockpitTerminalSupervisor\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitPTYKeeper\" \"$resources/CockpitPTYKeeper\"\ncp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist\" \"$agents/\"\ncp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist\" \"$agents/\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost \"$resources/CockpitHost\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor \"$resources/CockpitTerminalSupervisor\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper \"$resources/CockpitPTYKeeper\"\n";
+			shellScript = "set -euo pipefail\ntest -n \"$WRAPPER_NAME\"\ntest \"$CONTENTS_FOLDER_PATH\" = \"$WRAPPER_NAME/Contents\"\ncase \"$TARGET_BUILD_DIR\" in\n  /*) ;;\n  *) exit 1 ;;\nesac\ntarget_build_dir=$(/bin/realpath \"$TARGET_BUILD_DIR\")\ntest \"$target_build_dir\" != \"/\"\ncontents=$(/bin/realpath \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH\")\ntest \"$contents\" = \"$target_build_dir/$WRAPPER_NAME/Contents\"\nresources=\"$contents/Resources\"\nagents=\"$contents/Library/LaunchAgents\"\ntest ! -L \"$resources\"\ntest ! -L \"$contents/Library\"\ntest ! -L \"$agents\"\nmkdir -p \"$resources\" \"$agents\"\nresources=$(/bin/realpath \"$resources\")\nagents=$(/bin/realpath \"$agents\")\ntest \"$resources\" = \"$contents/Resources\"\ntest \"$agents\" = \"$contents/Library/LaunchAgents\"\n/usr/bin/find \"$agents\" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +\ncp \"$BUILT_PRODUCTS_DIR/CockpitHost\" \"$resources/CockpitHost\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor\" \"$resources/CockpitTerminalSupervisor\"\ncp \"$BUILT_PRODUCTS_DIR/CockpitPTYKeeper\" \"$resources/CockpitPTYKeeper\"\ncp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist\" \"$agents/\"\ncp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist\" \"$agents/\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost \"$resources/CockpitHost\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor \"$resources/CockpitTerminalSupervisor\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper \"$resources/CockpitPTYKeeper\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -501,7 +502,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
-				EXTRACT_APP_INTENTS_METADATA = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Cockpit;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -509,6 +509,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LM_FORCE_LINK_GENERATION = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
 				SDKROOT = macosx;
 			};
@@ -533,7 +534,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
-				EXTRACT_APP_INTENTS_METADATA = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Cockpit;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
@@ -541,6 +541,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LM_FORCE_LINK_GENERATION = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
 				SDKROOT = macosx;
 			};

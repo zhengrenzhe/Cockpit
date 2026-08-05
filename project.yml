@@ -64,7 +64,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.Cockpit
         GENERATE_INFOPLIST_FILE: YES
-        EXTRACT_APP_INTENTS_METADATA: NO
+        LM_FORCE_LINK_GENERATION: YES
         INFOPLIST_KEY_CFBundleDisplayName: Cockpit
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
     dependencies:
@@ -82,6 +82,7 @@ targets:
         embed: false
     postBuildScripts:
       - name: Embed LaunchAgents
+        basedOnDependencyAnalysis: false
         inputFiles:
           - $(BUILT_PRODUCTS_DIR)/CockpitHost
           - $(BUILT_PRODUCTS_DIR)/CockpitTerminalSupervisor
@@ -96,9 +97,27 @@ targets:
           - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.terminal.plist
         script: |
           set -euo pipefail
-          resources="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources"
-          agents="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Library/LaunchAgents"
+          test -n "$WRAPPER_NAME"
+          test "$CONTENTS_FOLDER_PATH" = "$WRAPPER_NAME/Contents"
+          case "$TARGET_BUILD_DIR" in
+            /*) ;;
+            *) exit 1 ;;
+          esac
+          target_build_dir=$(/bin/realpath "$TARGET_BUILD_DIR")
+          test "$target_build_dir" != "/"
+          contents=$(/bin/realpath "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH")
+          test "$contents" = "$target_build_dir/$WRAPPER_NAME/Contents"
+          resources="$contents/Resources"
+          agents="$contents/Library/LaunchAgents"
+          test ! -L "$resources"
+          test ! -L "$contents/Library"
+          test ! -L "$agents"
           mkdir -p "$resources" "$agents"
+          resources=$(/bin/realpath "$resources")
+          agents=$(/bin/realpath "$agents")
+          test "$resources" = "$contents/Resources"
+          test "$agents" = "$contents/Library/LaunchAgents"
+          /usr/bin/find "$agents" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +
           cp "$BUILT_PRODUCTS_DIR/CockpitHost" "$resources/CockpitHost"
           cp "$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor" "$resources/CockpitTerminalSupervisor"
           cp "$BUILT_PRODUCTS_DIR/CockpitPTYKeeper" "$resources/CockpitPTYKeeper"
