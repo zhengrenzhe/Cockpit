@@ -8,6 +8,7 @@ public enum RemoteTransportError: Error, Equatable, Sendable {
     case invalidPort(UInt16)
     case alreadyConnecting
     case alreadyConnected
+    case exchangeInProgress
     case connectionFailed
 }
 
@@ -16,6 +17,7 @@ public actor RemoteDirectTransport: CockpitTransport {
         case disconnected
         case connecting(NWConnectionByteStream, UInt64)
         case connected(NWConnectionByteStream)
+        case exchanging(NWConnectionByteStream, UInt64)
     }
 
     private let host: NWEndpoint.Host
@@ -47,7 +49,7 @@ public actor RemoteDirectTransport: CockpitTransport {
     public func connect() async throws {
         switch state {
         case .connecting: throw RemoteTransportError.alreadyConnecting
-        case .connected: throw RemoteTransportError.alreadyConnected
+        case .connected, .exchanging: throw RemoteTransportError.alreadyConnected
         case .disconnected: break
         }
         let parameters = NWParameters(tls: TLSOptionsFactory.client(pinnedCertificateDER: pinnedCertificateDER))
@@ -73,14 +75,38 @@ public actor RemoteDirectTransport: CockpitTransport {
     }
 
     public func exchangeHandshake(_ request: Data) async throws -> Data {
-        guard case .connected(let stream) = state else { throw RemoteTransportError.notConnected }
-        try await stream.sendLengthPrefixed(request)
-        return try await stream.receiveLengthPrefixed()
+        let stream: NWConnectionByteStream
+        switch state {
+        case .connected(let currentStream):
+            stream = currentStream
+        case .exchanging:
+            throw RemoteTransportError.exchangeInProgress
+        case .disconnected, .connecting:
+            throw RemoteTransportError.notConnected
+        }
+        generation &+= 1
+        let attempt = generation
+        state = .exchanging(stream, attempt)
+        do {
+            try await stream.sendLengthPrefixed(request)
+            let response = try await stream.receiveLengthPrefixed()
+            guard case .exchanging(_, let activeAttempt) = state, activeAttempt == attempt else {
+                throw RemoteTransportError.connectionFailed
+            }
+            state = .connected(stream)
+            return response
+        } catch {
+            await stream.cancel()
+            if case .exchanging(_, let activeAttempt) = state, activeAttempt == attempt {
+                state = .disconnected
+            }
+            throw error
+        }
     }
 
     public func disconnect() async {
         switch state {
-        case .connecting(let stream, _), .connected(let stream):
+        case .connecting(let stream, _), .connected(let stream), .exchanging(let stream, _):
             await stream.cancel()
         case .disconnected:
             break

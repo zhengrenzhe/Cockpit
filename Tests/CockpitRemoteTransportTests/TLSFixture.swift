@@ -28,6 +28,9 @@ struct TLSFixture {
             let item = (imported as? [[String: Any]])?.first,
             let identityValue = item[kSecImportItemIdentity as String]
         else { throw TLSFixtureError.missingIdentity }
+        guard CFGetTypeID(identityValue as CFTypeRef) == SecIdentityGetTypeID() else {
+            throw TLSFixtureError.missingIdentity
+        }
         let identity = identityValue as! SecIdentity
         var certificate: SecCertificate?
         guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate else {

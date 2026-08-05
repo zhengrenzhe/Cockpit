@@ -4,27 +4,39 @@ import Security
 
 public enum NetworkByteStreamError: Error, Equatable, Sendable {
     case closed
+    case notReady
+    case sendInProgress
+    case receiveInProgress
     case invalidLength(UInt32)
     case invalidMaximumLength(Int)
 }
 
-private actor CompletionBox<Value: Sendable> {
+private final class CompletionBox<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
     private var continuation: CheckedContinuation<Value, any Error>?
     private var result: Result<Value, any Error>?
 
     func install(_ continuation: CheckedContinuation<Value, any Error>) {
-        if let result {
-            continuation.resume(with: result)
-        } else {
+        lock.lock()
+        let result = self.result
+        if result == nil {
             self.continuation = continuation
         }
+        lock.unlock()
+        result.map { continuation.resume(with: $0) }
     }
 
     func resolve(_ result: Result<Value, any Error>) {
-        guard self.result == nil else { return }
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
         self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
         continuation?.resume(with: result)
-        continuation = nil
     }
 }
 
@@ -34,7 +46,13 @@ public actor NWConnectionByteStream {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "dev.cockpit.remote.connection")
     private var started = false
+    private var ready = false
     private var cancelled = false
+    private var startCompletion: CompletionBox<Void>?
+    private var sendCompletion: CompletionBox<Void>?
+    private var receiveCompletion: CompletionBox<Data>?
+    private var sending = false
+    private var receiving = false
 
     public init(connection: NWConnection) {
         self.connection = connection
@@ -44,28 +62,39 @@ public actor NWConnectionByteStream {
         guard !started, !cancelled else { throw NetworkByteStreamError.closed }
         started = true
         let completion = CompletionBox<Void>()
+        startCompletion = completion
         connection.stateUpdateHandler = { [weak connection] state in
             switch state {
             case .ready:
                 connection?.stateUpdateHandler = nil
-                Task { await completion.resolve(.success(())) }
+                completion.resolve(.success(()))
             case .failed(let error):
                 connection?.stateUpdateHandler = nil
-                Task { await completion.resolve(.failure(error)) }
+                completion.resolve(.failure(error))
             case .waiting(let error):
                 connection?.stateUpdateHandler = nil
                 connection?.cancel()
-                Task { await completion.resolve(.failure(error)) }
+                completion.resolve(.failure(error))
             case .cancelled:
                 connection?.stateUpdateHandler = nil
-                Task { await completion.resolve(.failure(NetworkByteStreamError.closed)) }
+                completion.resolve(.failure(NetworkByteStreamError.closed))
             default: break
             }
         }
+        defer {
+            if startCompletion === completion {
+                startCompletion = nil
+            }
+        }
         try await awaitCompletion(completion) { self.connection.start(queue: self.queue) }
+        guard !cancelled else { throw NetworkByteStreamError.closed }
+        ready = true
     }
 
     public func sendLengthPrefixed(_ data: Data) async throws {
+        guard !cancelled else { throw NetworkByteStreamError.closed }
+        guard ready else { throw NetworkByteStreamError.notReady }
+        guard !sending else { throw NetworkByteStreamError.sendInProgress }
         guard data.count <= Self.maximumMessageLength else {
             throw NetworkByteStreamError.invalidLength(UInt32(Self.maximumMessageLength + 1))
         }
@@ -75,9 +104,17 @@ public actor NWConnectionByteStream {
         packet.append(data)
         let immutablePacket = packet
         let completion = CompletionBox<Void>()
+        sending = true
+        sendCompletion = completion
+        defer {
+            if sendCompletion === completion {
+                sendCompletion = nil
+                sending = false
+            }
+        }
         try await awaitCompletion(completion) {
             self.connection.send(content: immutablePacket, completion: .contentProcessed { error in
-                Task { await completion.resolve(error.map(Result.failure) ?? .success(())) }
+                completion.resolve(error.map(Result.failure) ?? .success(()))
             })
         }
     }
@@ -86,6 +123,11 @@ public actor NWConnectionByteStream {
         guard maximumLength >= 0, maximumLength <= Self.maximumMessageLength else {
             throw NetworkByteStreamError.invalidMaximumLength(maximumLength)
         }
+        guard !cancelled else { throw NetworkByteStreamError.closed }
+        guard ready else { throw NetworkByteStreamError.notReady }
+        guard !receiving else { throw NetworkByteStreamError.receiveInProgress }
+        receiving = true
+        defer { receiving = false }
         let lengthData = try await receiveExactly(4)
         let length = lengthData.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         guard length <= UInt32(maximumLength) else { throw NetworkByteStreamError.invalidLength(length) }
@@ -94,7 +136,12 @@ public actor NWConnectionByteStream {
 
     public func cancel() {
         cancelled = true
+        ready = false
         connection.cancel()
+        let error = NetworkByteStreamError.closed
+        startCompletion?.resolve(.failure(error))
+        sendCompletion?.resolve(.failure(error))
+        receiveCompletion?.resolve(.failure(error))
     }
 
     public func negotiatedTLSVersion() -> tls_protocol_version_t? {
@@ -109,17 +156,23 @@ public actor NWConnectionByteStream {
         result.reserveCapacity(count)
         while result.count < count {
             let completion = CompletionBox<Data>()
+            receiveCompletion = completion
+            defer {
+                if receiveCompletion === completion {
+                    receiveCompletion = nil
+                }
+            }
             let remaining = count - result.count
             let chunk = try await awaitCompletion(completion) {
                 self.connection.receive(minimumIncompleteLength: 1, maximumLength: remaining) { data, _, complete, error in
                     if let error {
-                        Task { await completion.resolve(.failure(error)) }
+                        completion.resolve(.failure(error))
                     } else if let data, !data.isEmpty {
-                        Task { await completion.resolve(.success(data)) }
+                        completion.resolve(.success(data))
                     } else if complete {
-                        Task { await completion.resolve(.failure(NetworkByteStreamError.closed)) }
+                        completion.resolve(.failure(NetworkByteStreamError.closed))
                     } else {
-                        Task { await completion.resolve(.failure(NetworkByteStreamError.closed)) }
+                        completion.resolve(.failure(NetworkByteStreamError.closed))
                     }
                 }
             }
@@ -134,12 +187,12 @@ public actor NWConnectionByteStream {
     ) async throws -> Value {
         try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
-                Task { await completion.install(continuation) }
+                completion.install(continuation)
                 begin()
             }
         }, onCancel: {
             connection.cancel()
-            Task { await completion.resolve(.failure(CancellationError())) }
+            completion.resolve(.failure(CancellationError()))
         })
     }
 }
