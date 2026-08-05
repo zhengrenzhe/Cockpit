@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "CockpitHostCore", targets: ["CockpitHostCore"]),
         .library(name: "CockpitTerminalCore", targets: ["CockpitTerminalCore"]),
         .library(name: "CockpitLocalTransport", targets: ["CockpitLocalTransport"]),
+        .library(name: "CockpitRemoteTransport", targets: ["CockpitRemoteTransport"]),
         .executable(name: "CockpitHost", targets: ["CockpitHost"]),
         .executable(name: "CockpitTerminalSupervisor", targets: ["CockpitTerminalSupervisor"]),
         .executable(name: "CockpitPTYKeeper", targets: ["CockpitPTYKeeper"]),
@@ -51,6 +52,10 @@ let package = Package(
                 "CockpitTerminalCore",
             ]
         ),
+        .target(
+            name: "CockpitRemoteTransport",
+            dependencies: ["CockpitClientCore", "CockpitProtocol"]
+        ),
         .testTarget(
             name: "CockpitClientCoreTests",
             dependencies: ["CockpitClientCore", "CockpitTypes", "CockpitProtocol"]
@@ -70,6 +75,15 @@ let package = Package(
                 "CockpitHostCore",
                 "CockpitProtocol",
                 "CockpitTerminalCore",
+                "CockpitTypes",
+            ]
+        ),
+        .testTarget(
+            name: "CockpitRemoteTransportTests",
+            dependencies: [
+                "CockpitRemoteTransport",
+                "CockpitHostCore",
+                "CockpitProtocol",
                 "CockpitTypes",
             ]
         ),
