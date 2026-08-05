@@ -11,6 +11,7 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   symlink,
   unlink,
   writeFile,
@@ -70,15 +71,15 @@ async function snapshotBundle() {
   return snapshotDirectory(outputPath);
 }
 
-function hookPath(hookDirectory, execution, suffix) {
+function hookPath(hookDirectory, execution, suffix, hookName = testHookName) {
   return join(
     hookDirectory,
-    `${execution.child.pid}.${testHookName}.${suffix}`,
+    `${execution.child.pid}.${hookName}.${suffix}`,
   );
 }
 
-async function waitForHook(hookDirectory, execution) {
-  const readyPath = hookPath(hookDirectory, execution, 'ready');
+async function waitForHook(hookDirectory, execution, hookName = testHookName) {
+  const readyPath = hookPath(hookDirectory, execution, 'ready', hookName);
   const deadline = Date.now() + 3_000;
   while (Date.now() < deadline) {
     try {
@@ -96,9 +97,12 @@ async function waitForHook(hookDirectory, execution) {
   assert.fail(`timed out waiting for deterministic build hook: ${execution.stderr}`);
 }
 
-async function releaseHook(hookDirectory, execution) {
+async function releaseHook(hookDirectory, execution, hookName = testHookName) {
   if (execution.child.exitCode === null) {
-    await writeFile(hookPath(hookDirectory, execution, 'continue'), 'continue\n');
+    await writeFile(
+      hookPath(hookDirectory, execution, 'continue', hookName),
+      'continue\n',
+    );
   }
 }
 
@@ -124,7 +128,23 @@ async function detachAndRemoveTestPath(path) {
     `.test-cleanup-${basename(path)}-${randomUUID()}`,
   );
   await rename(path, detached);
-  await rm(detached, { recursive: true, force: true });
+  const entries = await readdir(detached);
+  for (const entry of entries) {
+    const child = join(detached, entry);
+    const childStats = await lstat(child);
+    assert.equal(childStats.isDirectory(), false, `unexpected test cleanup directory: ${child}`);
+    await unlink(child);
+  }
+  await rmdir(detached);
+}
+
+async function pathSnapshot(path) {
+  try {
+    return await snapshotDirectory(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { missing: true };
+    throw error;
+  }
 }
 
 async function expectRejectedBuild(message) {
@@ -140,6 +160,14 @@ function buildTestEnv(hookDirectory) {
     COCKPIT_BUILD_TEST_HOOK_DIR: hookDirectory,
     COCKPIT_BUILD_TEST_PAUSE: testHookName,
   };
+}
+
+async function privateArtifactNames() {
+  return (await readdir(distPath)).filter((entry) => (
+    entry.startsWith('.MonacoRuntime.bundle.staging-')
+    || entry.startsWith('.MonacoRuntime.bundle.retired-')
+    || entry.startsWith('.MonacoRuntime.bundle.quarantine-')
+  ));
 }
 
 test('package pins the exact runtime toolchain', async () => {
@@ -363,13 +391,167 @@ test('a pre-publication failure preserves the published bundle and removes stagi
     COCKPIT_BUILD_TEST_FAIL: 'before-publish',
   });
   const result = await execution.completion;
-  const privateArtifacts = (await readdir(distPath)).filter((entry) => (
-    entry.startsWith('.MonacoRuntime.bundle.staging-')
-    || entry.startsWith('.MonacoRuntime.bundle.retired-')
-  ));
+  const privateArtifacts = await privateArtifactNames();
 
   assert.notEqual(result.code, 0, 'the injected build failure must reject');
   assert.match(result.stderr, /injected build failure before publish/i);
   assert.deepEqual(await snapshotBundle(), before);
   assert.deepEqual(privateArtifacts, []);
+});
+
+test('a reused live PID with a different start identity does not retain an artifact', async () => {
+  const ownerToken = `${process.pid}-${randomUUID()}`;
+  const artifactName = `.MonacoRuntime.bundle.staging-${ownerToken}`;
+  const artifact = join(distPath, artifactName);
+  const ownerManifest = `${artifact}.owner.json`;
+
+  await mkdir(artifact);
+  await writeFile(join(artifact, 'index.html'), 'stale-owned-artifact\n');
+  const stats = await lstat(artifact);
+  await writeFile(ownerManifest, JSON.stringify({
+    version: 1,
+    kind: 'staging',
+    pid: process.pid,
+    processStartIdentity: 'definitely-not-the-current-process-start',
+    ownerToken,
+    artifactName,
+    device: String(stats.dev),
+    inode: String(stats.ino),
+  }));
+
+  try {
+    await runBuild();
+    await assert.rejects(access(artifact), { code: 'ENOENT' });
+    await assert.rejects(access(ownerManifest), { code: 'ENOENT' });
+  } finally {
+    await detachAndRemoveTestPath(artifact);
+    try {
+      await unlink(ownerManifest);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+});
+
+test('private cleanup revalidates ownership after an external directory replacement', async () => {
+  const hookDirectory = await mkdtemp(join(tmpdir(), 'cockpit-runtime-private-hook-'));
+  const externalRoot = await mkdtemp(join(tmpdir(), 'cockpit-runtime-private-external-'));
+  const sentinel = join(externalRoot, 'sentinel.txt');
+  await writeFile(sentinel, 'private-cleanup-external-sentinel\n');
+  const externalBefore = await snapshotDirectory(externalRoot);
+  const execution = spawnBuild({
+    NODE_ENV: 'test',
+    COCKPIT_BUILD_TEST_FAIL: 'before-publish',
+    COCKPIT_BUILD_TEST_HOOK_DIR: hookDirectory,
+    COCKPIT_BUILD_TEST_PAUSE: 'before-private-delete',
+  });
+  const privateHookName = `${execution.child.pid}.before-private-delete`;
+  const ready = join(hookDirectory, `${privateHookName}.ready`);
+  const proceed = join(hookDirectory, `${privateHookName}.continue`);
+  let privateArtifact;
+  let originalBackup;
+  let externalMoved = false;
+
+  try {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      try {
+        await access(ready);
+        break;
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+      if (execution.child.exitCode !== null) {
+        const result = await execution.completion;
+        assert.fail(`build exited before private cleanup hook: ${result.stderr || result.stdout}`);
+      }
+      await delay(10);
+    }
+    await access(ready);
+    privateArtifact = join(
+      distPath,
+      (await readdir(distPath)).find((entry) => (
+        entry.startsWith(`.MonacoRuntime.bundle.staging-${execution.child.pid}-`)
+        && !entry.endsWith('.owner.json')
+      )),
+    );
+    originalBackup = `${privateArtifact}.test-original`;
+    await rename(privateArtifact, originalBackup);
+    await rename(externalRoot, privateArtifact);
+    externalMoved = true;
+    await writeFile(proceed, 'continue\n');
+    const result = await execution.completion;
+
+    assert.notEqual(result.code, 0);
+    assert.deepEqual(await pathSnapshot(privateArtifact), externalBefore);
+  } finally {
+    if (execution.child.exitCode === null) {
+      await writeFile(proceed, 'continue\n');
+      execution.child.kill('SIGTERM');
+    }
+    await execution.completion;
+    if (externalMoved) {
+      try {
+        await rename(privateArtifact, externalRoot);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+    if (originalBackup) await detachAndRemoveTestPath(originalBackup);
+    if (privateArtifact) {
+      try {
+        await unlink(`${privateArtifact}.owner.json`);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+    await rm(hookDirectory, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+  }
+});
+
+test('a real esbuild resolution failure preserves publication and cleans private artifacts', async () => {
+  const before = await snapshotBundle();
+  const execution = spawnBuild({
+    NODE_ENV: 'test',
+    COCKPIT_BUILD_TEST_ESBUILD_ENTRY: 'src/does-not-exist.ts',
+  });
+  const result = await execution.completion;
+
+  assert.notEqual(result.code, 0, 'esbuild must reject the missing entry point');
+  assert.match(result.stderr, /Could not resolve.*does-not-exist\.ts/s);
+  assert.deepEqual(await snapshotBundle(), before);
+  assert.deepEqual(await privateArtifactNames(), []);
+});
+
+test('a SIGKILL after public detach is recovered by the next build', async () => {
+  const before = await snapshotBundle();
+  const hookName = 'after-public-detach';
+  const hookDirectory = await mkdtemp(join(tmpdir(), 'cockpit-runtime-sigkill-'));
+  const execution = spawnBuild({
+    NODE_ENV: 'test',
+    COCKPIT_BUILD_TEST_HOOK_DIR: hookDirectory,
+    COCKPIT_BUILD_TEST_PAUSE: hookName,
+  });
+
+  try {
+    await waitForHook(hookDirectory, execution, hookName);
+    assert.equal(execution.child.kill('SIGKILL'), true);
+    const killed = await execution.completion;
+    assert.equal(killed.signal, 'SIGKILL');
+    await runBuild();
+
+    assert.deepEqual(await snapshotBundle(), before);
+    assert.deepEqual(await privateArtifactNames(), []);
+  } finally {
+    if (execution.child.exitCode === null) execution.child.kill('SIGKILL');
+    await execution.completion;
+    try {
+      await access(outputPath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      await runBuild();
+    }
+    await rm(hookDirectory, { recursive: true, force: true });
+  }
 });
