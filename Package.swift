@@ -8,6 +8,9 @@ let package = Package(
     products: [
         .library(name: "CockpitTypes", targets: ["CockpitTypes"]),
         .library(name: "CockpitProtocol", targets: ["CockpitProtocol"]),
+        .library(name: "CockpitClientCore", targets: ["CockpitClientCore"]),
+        .library(name: "CockpitHostCore", targets: ["CockpitHostCore"]),
+        .library(name: "CockpitTerminalCore", targets: ["CockpitTerminalCore"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.38.1"),
@@ -31,6 +34,21 @@ let package = Package(
         .testTarget(
             name: "CockpitProtocolTests",
             dependencies: ["CockpitProtocol"]
+        ),
+        .target(name: "CockpitClientCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
+        .target(name: "CockpitHostCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
+        .target(name: "CockpitTerminalCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
+        .testTarget(
+            name: "CockpitClientCoreTests",
+            dependencies: ["CockpitClientCore", "CockpitTypes", "CockpitProtocol"]
+        ),
+        .testTarget(
+            name: "CockpitHostCoreTests",
+            dependencies: ["CockpitHostCore", "CockpitTypes", "CockpitProtocol"]
+        ),
+        .testTarget(
+            name: "CockpitTerminalCoreTests",
+            dependencies: ["CockpitTerminalCore", "CockpitTypes", "CockpitProtocol"]
         ),
     ],
     swiftLanguageModes: [.v6]
