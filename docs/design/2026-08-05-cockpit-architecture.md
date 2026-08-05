@@ -310,23 +310,19 @@ CockpitTerminalSupervisor 和 CockpitPTYKeeper 均无法从网络直接访问。
 
 ## 7. CockpitProtocol
 
-CockpitProtocol 使用固定的二进制帧头和类型化载荷。
+CockpitProtocol 使用固定的 32 字节二进制传输头和类型化载荷。
 
 ```text
-magic
-protocolVersion
-featureSet
-flags
-deviceID
-connectionID
-requestID
-environmentID
-channelID
-sequence
-acknowledgement
-payloadType
-payloadLength
+magic             UInt32
+protocolVersion   UInt16
+flags             UInt16
+channelID         UInt32
+sequence          UInt64
+acknowledgement   UInt64
+payloadLength     UInt32
 ```
+
+channelID 只在一条连接内有效，不是 UUID 领域身份。featureSet、deviceID、connectionID、requestID、environmentID 和 payloadType 位于握手消息或 SwiftProtobuf 控制载荷中，不占用固定传输头。
 
 载荷策略：
 
@@ -620,20 +616,20 @@ Cockpit/
 
 ## 15. 固定的基础依赖
 
-以下版本已于 2026-08-05 验证：
+以下版本已于 2026-08-05 验证，并固定为当日最新正式稳定版；Beta 和 RC 不进入工程基线：
 
 | 组件 | 版本 | 来源 |
 |---|---:|---|
-| Xcode | 26.6 | 本机 `xcodebuild -version` |
-| Swift | 6.3.3 | 本机 `swift --version` |
-| Swift tools version | 6.2 | Package Manifest 基线 |
+| Xcode | 26.6 (17F113) | https://developer.apple.com/news/releases/?id=06252026a |
+| Swift | 6.3.3 | https://forums.swift.org/t/announcing-swift-6-3-3/87888 |
+| Swift tools version | 6.3 | 本机 `swift package init` 生成的 Package Manifest |
 | SwiftProtobuf | 1.38.1 | https://github.com/apple/swift-protobuf/releases/tag/1.38.1 |
-| Monaco Editor | 0.55.1 | https://github.com/microsoft/monaco-editor/releases/tag/v0.55.1 |
+| Monaco Editor | 0.56.0 | https://github.com/microsoft/monaco-editor/releases/tag/v0.56.0 |
 | esbuild | 0.28.1 | https://github.com/evanw/esbuild/releases/tag/v0.28.1 |
 | Ghostty 上游基础版本 | v1.3.1 / `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | https://github.com/ghostty-org/ghostty/releases/tag/v1.3.1 |
 | Ghostty 1.3.x 使用的 Zig | 0.15.2 | https://ghostty.org/docs/install/build |
-| Node | 25.9.0 | 本机 `node --version` |
-| pnpm | 9.15.9 | 本机 `pnpm --version` |
+| Node | 26.6.0 | https://nodejs.org/dist/index.json |
+| pnpm | 11.20.0 | https://github.com/pnpm/pnpm/releases/tag/v11.20.0 |
 | XcodeGen | 2.46.0 | https://github.com/yonaskolb/XcodeGen/releases/tag/2.46.0 |
 
 Ghostty 官方构建文档明确绑定 Ghostty 1.3.x 与 Zig 0.15.2。因此，即使 Zig 0.16.0 已存在，Cockpit 仍固定使用 Zig 0.15.2。

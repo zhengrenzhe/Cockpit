@@ -1,6 +1,6 @@
 # Cockpit Terminal Session Resilience Design
 
-- Status: Written-spec review requested
+- Status: Approved
 - Date: 2026-08-05
 - Scope: macOS local terminal lifecycle, crash isolation, and remote-ready attachment
 - Priority: stability first, then native terminal throughput and latency
@@ -228,4 +228,4 @@ Explicit session termination targets the complete terminal process group so Agen
 
 ## 14. Implementation Boundary
 
-This specification authorizes a rewritten implementation plan, not implementation. The next plan must replace every CockpitTerminalService composition-root, bundle identifier, LaunchAgent fixture, process integration test, and direct data path with the approved CockpitTerminalSupervisor plus per-session CockpitPTYKeeper model.
+This specification is mapped into `docs/superpowers/plans/2026-08-05-cockpit-phase-0-implementation.md`. That plan replaces the former shared service boundary with CockpitTerminalSupervisor plus one CockpitPTYKeeper per session. This specification and its plan do not themselves claim that the Phase 0 or Phase 1 implementation exists.
