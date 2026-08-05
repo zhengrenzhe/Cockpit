@@ -24,18 +24,20 @@ public actor RemoteDirectTransport: CockpitTransport {
     private let port: NWEndpoint.Port
     private let pinnedCertificateDER: Data
     private let beforeStart: @Sendable () async -> Void
+    private let beforeDisconnect: @Sendable () async -> Void
     private var state: State = .disconnected
     private var generation: UInt64 = 0
 
     public init(host: String, port: UInt16, pinnedCertificateDER: Data) throws {
-        try self.init(host: host, port: port, pinnedCertificateDER: pinnedCertificateDER, beforeStart: {})
+        try self.init(host: host, port: port, pinnedCertificateDER: pinnedCertificateDER, beforeStart: {}, beforeDisconnect: {})
     }
 
     init(
         host: String,
         port: UInt16,
         pinnedCertificateDER: Data,
-        beforeStart: @escaping @Sendable () async -> Void
+        beforeStart: @escaping @Sendable () async -> Void = {},
+        beforeDisconnect: @escaping @Sendable () async -> Void = {}
     ) throws {
         guard port != 0, let resolvedPort = NWEndpoint.Port(rawValue: port) else {
             throw RemoteTransportError.invalidPort(port)
@@ -44,6 +46,7 @@ public actor RemoteDirectTransport: CockpitTransport {
         self.port = resolvedPort
         self.pinnedCertificateDER = pinnedCertificateDER
         self.beforeStart = beforeStart
+        self.beforeDisconnect = beforeDisconnect
     }
 
     public func connect() async throws {
@@ -105,13 +108,18 @@ public actor RemoteDirectTransport: CockpitTransport {
     }
 
     public func disconnect() async {
+        let stream: NWConnectionByteStream?
         switch state {
-        case .connecting(let stream, _), .connected(let stream), .exchanging(let stream, _):
-            await stream.cancel()
+        case .connecting(let ownedStream, _), .connected(let ownedStream), .exchanging(let ownedStream, _):
+            self.state = .disconnected
+            self.generation &+= 1
+            stream = ownedStream
         case .disconnected:
-            break
+            stream = nil
         }
-        state = .disconnected
+        guard let stream else { return }
+        await beforeDisconnect()
+        await stream.cancel()
     }
 
     public func negotiatedTLSVersion() async -> tls_protocol_version_t? {

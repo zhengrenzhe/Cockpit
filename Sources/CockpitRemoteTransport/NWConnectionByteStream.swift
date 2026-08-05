@@ -135,6 +135,11 @@ public actor NWConnectionByteStream {
     }
 
     public func cancel() {
+        close()
+    }
+
+    private func close() {
+        guard !cancelled else { return }
         cancelled = true
         ready = false
         connection.cancel()
@@ -185,14 +190,27 @@ public actor NWConnectionByteStream {
         _ completion: CompletionBox<Value>,
         begin: @escaping @Sendable () -> Void
     ) async throws -> Value {
-        try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                completion.install(continuation)
-                begin()
+        do {
+            let value = try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    completion.install(continuation)
+                    begin()
+                }
+            }, onCancel: {
+                completion.resolve(.failure(CancellationError()))
+                connection.cancel()
+            })
+            try Task.checkCancellation()
+            return value
+        } catch {
+            if Task.isCancelled {
+                close()
+                throw CancellationError()
             }
-        }, onCancel: {
-            connection.cancel()
-            completion.resolve(.failure(CancellationError()))
-        })
+            if error is CancellationError {
+                close()
+            }
+            throw error
+        }
     }
 }

@@ -134,6 +134,39 @@ private func withTimeout<T: Sendable>(
     await transport.disconnect()
 }
 
+@Test func staleDisconnectCannotCancelNewConnection() async throws {
+    let fixture = try TLSFixture.load()
+    let server = try RemoteHandshakeLoopbackServer(identity: fixture.identity, behavior: .holdFirstRequest)
+    try await withTimeout { try await server.start() }
+    defer { server.stop() }
+    let port = try #require(server.port)
+    let disconnectGate = DisconnectGate()
+    let transport = try RemoteDirectTransport(
+        host: "127.0.0.1",
+        port: port.rawValue,
+        pinnedCertificateDER: SecCertificateCopyData(fixture.certificate) as Data,
+        beforeDisconnect: { await disconnectGate.wait() }
+    )
+    let request = try HandshakeCodec.encode(.cockpit(deviceID: DeviceID(), features: [.workspaceControl, .remoteDirect]))
+
+    try await withTimeout { try await transport.connect() }
+    let firstExchange = Task { try? await withTimeout { try await transport.exchangeHandshake(request) } }
+    try await withTimeout { await server.waitUntilFirstRequestIsHeld() }
+    let staleDisconnect = Task { await transport.disconnect() }
+    try await withTimeout { await disconnectGate.waitUntilBlocked() }
+    try await withTimeout { await server.releaseFirstRequest() }
+    _ = try await withTimeout { await firstExchange.value }
+
+    try await withTimeout { try await transport.connect() }
+    try await withTimeout { await disconnectGate.release() }
+    try await withTimeout { await staleDisconnect.value }
+    let response = try await withTimeout { try await transport.exchangeHandshake(request) }
+    #expect(try HandshakeCodec.decodeResponse(response).serviceKind == "host")
+    try await withTimeout { await transport.disconnect() }
+    server.stop()
+    try await withTimeout { try await server.waitUntilIdle() }
+}
+
 @Test func remoteTransportAllowsOnlyOneConcurrentConnectionAttempt() async throws {
     let fixture = try TLSFixture.load()
     let server = try RemoteHandshakeLoopbackServer(identity: fixture.identity)
@@ -232,6 +265,7 @@ private func withTimeout<T: Sendable>(
         Issue.record("A stalled peer returned a handshake response")
     } catch is TestTimeoutError {
     } catch {
+        Issue.record("A stalled handshake produced an unexpected error: \(error)")
     }
     #expect(Date().timeIntervalSince(startedAt) < 1)
 
@@ -240,6 +274,7 @@ private func withTimeout<T: Sendable>(
     try await withTimeout { try await server.waitUntilIdle() }
     #expect(server.activeConnectionCount == 0)
     #expect(server.activeHandlerCount == 0)
+    #expect(server.exitedHandlerCount > 0)
 }
 
 @Test func byteStreamRejectsInvalidMaximumLengthBeforeReceive() async {
@@ -285,6 +320,74 @@ private func withTimeout<T: Sendable>(
     }
 }
 
+@Test func byteStreamTaskCancellationClosesStartSendAndReceive() async throws {
+    let preCancelledStart = NWConnectionByteStream(connection: NWConnection(host: "127.0.0.1", port: 1, using: .tcp))
+    let startTask = Task { try await preCancelledStart.start() }
+    startTask.cancel()
+    do {
+        try await withTimeout { try await startTask.value }
+        Issue.record("A pre-cancelled start succeeded")
+    } catch is CancellationError {
+    } catch {
+        Issue.record("Pre-cancelled start returned unexpected error: \(error)")
+    }
+    try await withTimeout { await assertStreamClosed(preCancelledStart) }
+
+    let fixture = try TLSFixture.load()
+    let server = try RemoteHandshakeLoopbackServer(identity: fixture.identity, behavior: .stallFirstRequest)
+    try await withTimeout { try await server.start() }
+    defer { server.stop() }
+    let port = try #require(server.port)
+    let parameters = NWParameters(tls: TLSOptionsFactory.client(pinnedCertificateDER: SecCertificateCopyData(fixture.certificate) as Data))
+
+    let sendStream = NWConnectionByteStream(connection: NWConnection(host: "127.0.0.1", port: port, using: parameters))
+    try await withTimeout { try await sendStream.start() }
+    let sendTask = Task { try await sendStream.sendLengthPrefixed(Data([1])) }
+    sendTask.cancel()
+    do {
+        try await withTimeout { try await sendTask.value }
+        Issue.record("A pre-cancelled send succeeded")
+    } catch is CancellationError {
+    } catch {
+        Issue.record("Pre-cancelled send returned unexpected error: \(error)")
+    }
+    try await withTimeout { await assertStreamClosed(sendStream) }
+
+    let receiveStream = NWConnectionByteStream(connection: NWConnection(host: "127.0.0.1", port: port, using: parameters))
+    try await withTimeout { try await receiveStream.start() }
+    let receiveTask = Task { try await receiveStream.receiveLengthPrefixed() }
+    receiveTask.cancel()
+    do {
+        _ = try await withTimeout { try await receiveTask.value }
+        Issue.record("A pre-cancelled receive succeeded")
+    } catch is CancellationError {
+    } catch {
+        Issue.record("Pre-cancelled receive returned unexpected error: \(error)")
+    }
+    try await withTimeout { await assertStreamClosed(receiveStream) }
+    server.stop()
+    try await withTimeout { try await server.waitUntilIdle() }
+}
+
+private func assertStreamClosed(_ stream: NWConnectionByteStream) async {
+    do {
+        try await stream.sendLengthPrefixed(Data())
+        Issue.record("A cancelled byte stream accepted a send")
+    } catch let error as NetworkByteStreamError {
+        #expect(error == .closed)
+    } catch {
+        Issue.record("Cancelled byte stream send returned unexpected error: \(error)")
+    }
+    do {
+        _ = try await stream.receiveLengthPrefixed()
+        Issue.record("A cancelled byte stream accepted a receive")
+    } catch let error as NetworkByteStreamError {
+        #expect(error == .closed)
+    } catch {
+        Issue.record("Cancelled byte stream receive returned unexpected error: \(error)")
+    }
+}
+
 private func connectionResult(_ transport: RemoteDirectTransport) async -> RemoteTransportError? {
     do {
         try await withTimeout { try await transport.connect() }
@@ -325,11 +428,38 @@ private actor FirstAttemptGate {
     }
 }
 
+private actor DisconnectGate {
+    private var blocked = false
+    private var released = false
+    private var blockedWaiter: CheckedContinuation<Void, Never>?
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        blocked = true
+        blockedWaiter?.resume()
+        blockedWaiter = nil
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilBlocked() async {
+        guard !blocked else { return }
+        await withCheckedContinuation { blockedWaiter = $0 }
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
 private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
     enum Behavior: Sendable {
         case normal
         case dropFirstConnection
         case stallFirstRequest
+        case holdFirstRequest
     }
 
     private let listener: NWListener
@@ -340,12 +470,17 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
     private var connectionCount = 0
     private var firstRequestStalled = false
     private var stalledWaiter: CheckedContinuation<Void, Never>?
-    private var connections: [ObjectIdentifier: NWConnection] = [:]
-    private var handlers: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var firstRequestHeld = false
+    private var firstRequestReleased = false
+    private var heldWaiter: CheckedContinuation<Void, Never>?
+    private var heldReleaseWaiter: CheckedContinuation<Void, Never>?
+    private var records: [ObjectIdentifier: HandlerRecord] = [:]
+    private var handlerExitCount = 0
 
     var port: NWEndpoint.Port? { listener.port }
-    var activeConnectionCount: Int { withLock { connections.count } }
-    var activeHandlerCount: Int { withLock { handlers.count } }
+    var activeConnectionCount: Int { withLock { records.count } }
+    var activeHandlerCount: Int { withLock { records.count } }
+    var exitedHandlerCount: Int { withLock { handlerExitCount } }
 
     init(identity: SecIdentity, behavior: Behavior = .normal) throws {
         let parameters = NWParameters(tls: try TLSOptionsFactory.server(identity: identity))
@@ -388,19 +523,23 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
     }
 
     func stop() {
-        let pending: ([NWConnection], [Task<Void, Never>]) = withLock {
-            guard !stopped else { return ([], []) }
+        let pending: [HandlerRecord] = withLock {
+            guard !stopped else { return [] }
             stopped = true
-            let pending = (Array(connections.values), Array(handlers.values))
-            connections.removeAll()
-            handlers.removeAll()
+            let pending = Array(records.values)
             stalledWaiter?.resume()
             stalledWaiter = nil
+            heldWaiter?.resume()
+            heldWaiter = nil
+            firstRequestReleased = true
+            heldReleaseWaiter?.resume()
+            heldReleaseWaiter = nil
             return pending
         }
         listener.cancel()
-        pending.0.forEach { $0.cancel() }
-        pending.1.forEach { $0.cancel() }
+        pending.forEach { $0.connection.cancel() }
+        pending.compactMap(\.task).forEach { $0.cancel() }
+        pending.forEach { record in Task { await record.startGate.open() } }
     }
 
     func waitUntilFirstRequestIsStalled() async {
@@ -415,6 +554,28 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
         }
     }
 
+    func waitUntilFirstRequestIsHeld() async {
+        if withLock({ firstRequestHeld }) { return }
+        await withCheckedContinuation { continuation in
+            let resume = withLock { () -> Bool in
+                if firstRequestHeld { return true }
+                heldWaiter = continuation
+                return false
+            }
+            if resume { continuation.resume() }
+        }
+    }
+
+    func releaseFirstRequest() async {
+        let waiter = withLock { () -> CheckedContinuation<Void, Never>? in
+            firstRequestReleased = true
+            let waiter = heldReleaseWaiter
+            heldReleaseWaiter = nil
+            return waiter
+        }
+        waiter?.resume()
+    }
+
     func waitUntilIdle() async throws {
         for _ in 0 ..< 50 {
             if activeConnectionCount == 0, activeHandlerCount == 0 { return }
@@ -425,9 +586,10 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
 
     private func add(_ connection: NWConnection) {
         let identifier = ObjectIdentifier(connection)
+        let record = HandlerRecord(connection: connection)
         let shouldCancel = withLock { () -> Bool in
             if stopped { return true }
-            connections[identifier] = connection
+            records[identifier] = record
             return false
         }
         guard !shouldCancel else {
@@ -435,23 +597,28 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
             return
         }
         let task = Task { [weak self] in
+            await record.startGate.wait()
             guard let self else { return }
+            defer { self.remove(identifier, record: record) }
+            guard !Task.isCancelled else { return }
             await self.handle(connection)
-            self.remove(identifier)
         }
-        withLock {
-            if connections[identifier] != nil {
-                handlers[identifier] = task
-            } else {
-                task.cancel()
-            }
+        let cancelTask = withLock { () -> Bool in
+            record.task = task
+            return stopped
         }
+        if cancelTask {
+            connection.cancel()
+            task.cancel()
+        }
+        Task { await record.startGate.open() }
     }
 
-    private func remove(_ identifier: ObjectIdentifier) {
+    private func remove(_ identifier: ObjectIdentifier, record: HandlerRecord) {
         withLock {
-            connections.removeValue(forKey: identifier)
-            handlers.removeValue(forKey: identifier)
+            guard records[identifier] === record else { return }
+            records.removeValue(forKey: identifier)
+            handlerExitCount += 1
         }
     }
 
@@ -477,6 +644,23 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
                 try await Task.sleep(for: .seconds(60))
                 return
             }
+            let shouldHold = withLock { () -> Bool in
+                guard behavior == .holdFirstRequest, !firstRequestHeld else { return false }
+                firstRequestHeld = true
+                heldWaiter?.resume()
+                heldWaiter = nil
+                return true
+            }
+            if shouldHold {
+                await withCheckedContinuation { continuation in
+                    let resume = withLock { () -> Bool in
+                        if stopped || firstRequestReleased { return true }
+                        heldReleaseWaiter = continuation
+                        return false
+                    }
+                    if resume { continuation.resume() }
+                }
+            }
             let request = try HandshakeCodec.decodeRequest(requestData)
             let response = try HostHandshakeHandler().handle(request)
             try await stream.sendLengthPrefixed(HandshakeCodec.encode(response))
@@ -488,6 +672,33 @@ private final class RemoteHandshakeLoopbackServer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return operation()
+    }
+}
+
+private final class HandlerRecord: @unchecked Sendable {
+    let connection: NWConnection
+    let startGate = HandlerStartGate()
+    var task: Task<Void, Never>?
+
+    init(connection: NWConnection) {
+        self.connection = connection
+    }
+}
+
+private actor HandlerStartGate {
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !opened else { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func open() {
+        guard !opened else { return }
+        opened = true
+        waiter?.resume()
+        waiter = nil
     }
 }
 
