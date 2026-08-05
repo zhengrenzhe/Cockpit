@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  access,
   lstat,
   mkdir,
   mkdtemp,
@@ -15,29 +16,47 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 
 const runtimeRoot = new URL('../', import.meta.url);
 const output = new URL('dist/MonacoRuntime.bundle/', runtimeRoot);
 const runtimePath = fileURLToPath(runtimeRoot);
 const distPath = fileURLToPath(new URL('dist', runtimeRoot));
 const outputPath = fileURLToPath(new URL('dist/MonacoRuntime.bundle', runtimeRoot));
-const runFile = promisify(execFile);
 const expectedFiles = ['editor.css', 'editor.js', 'editor.js.map', 'index.html'];
+const testHookName = 'before-public-detach';
 
-async function runBuild() {
-  await runFile(process.execPath, ['build.mjs'], {
+function spawnBuild(extraEnv = {}) {
+  const child = spawn(process.execPath, ['build.mjs'], {
     cwd: runtimePath,
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const completion = new Promise((resolve) => {
+    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+  return { child, completion, get stderr() { return stderr; } };
 }
 
-async function snapshotBundle() {
-  const files = (await readdir(outputPath)).sort();
+async function runBuild(extraEnv = {}) {
+  const execution = spawnBuild(extraEnv);
+  const result = await execution.completion;
+  assert.equal(result.code, 0, result.stderr || result.stdout);
+  return result;
+}
+
+async function snapshotDirectory(path) {
+  const files = (await readdir(path)).sort();
   const entries = await Promise.all(files.map(async (file) => {
-    const contents = await readFile(join(outputPath, file));
+    const contents = await readFile(join(path, file));
     return {
       file,
       bytes: contents.length,
@@ -47,17 +66,80 @@ async function snapshotBundle() {
   return { files, entries };
 }
 
-async function expectRejectedBuild(message) {
-  await assert.rejects(runBuild, /symbolic link/i, message);
+async function snapshotBundle() {
+  return snapshotDirectory(outputPath);
 }
 
-async function removeTestReplacement(path) {
-  const metadata = await lstat(path);
-  if (metadata.isSymbolicLink()) {
+function hookPath(hookDirectory, execution, suffix) {
+  return join(
+    hookDirectory,
+    `${execution.child.pid}.${testHookName}.${suffix}`,
+  );
+}
+
+async function waitForHook(hookDirectory, execution) {
+  const readyPath = hookPath(hookDirectory, execution, 'ready');
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    try {
+      await access(readyPath);
+      return;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (execution.child.exitCode !== null) {
+      const result = await execution.completion;
+      assert.fail(`build exited before test hook: ${result.stderr || result.stdout}`);
+    }
+    await delay(10);
+  }
+  assert.fail(`timed out waiting for deterministic build hook: ${execution.stderr}`);
+}
+
+async function releaseHook(hookDirectory, execution) {
+  if (execution.child.exitCode === null) {
+    await writeFile(hookPath(hookDirectory, execution, 'continue'), 'continue\n');
+  }
+}
+
+async function stopBuild(execution) {
+  if (execution.child.exitCode === null) execution.child.kill('SIGTERM');
+  await execution.completion;
+}
+
+async function detachAndRemoveTestPath(path) {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  if (stats.isSymbolicLink()) {
     await unlink(path);
     return;
   }
-  await rm(path, { recursive: true, force: true });
+  const detached = join(
+    dirname(path),
+    `.test-cleanup-${basename(path)}-${randomUUID()}`,
+  );
+  await rename(path, detached);
+  await rm(detached, { recursive: true, force: true });
+}
+
+async function expectRejectedBuild(message) {
+  const execution = spawnBuild();
+  const result = await execution.completion;
+  assert.notEqual(result.code, 0, message);
+  assert.match(result.stderr, /symbolic link/i);
+}
+
+function buildTestEnv(hookDirectory) {
+  return {
+    NODE_ENV: 'test',
+    COCKPIT_BUILD_TEST_HOOK_DIR: hookDirectory,
+    COCKPIT_BUILD_TEST_PAUSE: testHookName,
+  };
 }
 
 test('package pins the exact runtime toolchain', async () => {
@@ -99,10 +181,59 @@ test('build emits a self-contained local editor bundle', async () => {
   assert.ok(sourceMap.sources.every((sourcePath) => !sourcePath.startsWith('file:')));
   assert.doesNotMatch(JSON.stringify(sourceMap), new RegExp(runtimePath));
   assert.match(source, /editor\/contrib\/find\/browser\/findController/);
-  assert.match(source, /monaco\.editor\.getModel\(modelURI\)/);
-  assert.match(source, /model\.setValue\(text\)/);
-  assert.match(source, /model\.getLanguageId\(\) !== language/);
-  assert.match(source, /monaco\.editor\.setModelLanguage\(model, language\)/);
+});
+
+test('openText reuses a URI model and synchronizes text and language', async () => {
+  let protocolModule;
+  try {
+    protocolModule = await import(new URL('../src/protocol.mjs', import.meta.url));
+  } catch (error) {
+    assert.fail(`testable protocol module is unavailable: ${error?.code ?? error}`);
+  }
+
+  const models = new Map();
+  let createCount = 0;
+  const languageChanges = [];
+  const monaco = {
+    Uri: {
+      parse(value) { return { value }; },
+    },
+    editor: {
+      getModel(uri) { return models.get(uri.value) ?? null; },
+      createModel(text, language, uri) {
+        createCount += 1;
+        const model = {
+          text,
+          language,
+          getValue() { return this.text; },
+          setValue(value) { this.text = value; },
+          getLanguageId() { return this.language; },
+        };
+        models.set(uri.value, model);
+        return model;
+      },
+      setModelLanguage(model, language) {
+        languageChanges.push({ model, language });
+        model.language = language;
+      },
+    },
+  };
+  const editor = {
+    model: null,
+    setModel(model) { this.model = model; },
+  };
+  const protocol = protocolModule.createEditorProtocol(monaco, editor);
+
+  protocol.openText('file:///same.txt', 'first', 'plaintext');
+  const firstModel = editor.model;
+  protocol.openText('file:///same.txt', 'second', 'typescript');
+
+  assert.equal(protocol.version, 1);
+  assert.equal(createCount, 1);
+  assert.strictEqual(editor.model, firstModel);
+  assert.equal(firstModel.text, 'second');
+  assert.equal(firstModel.language, 'typescript');
+  assert.deepEqual(languageChanges, [{ model: firstModel, language: 'typescript' }]);
 });
 
 test('two clean builds have identical files, sizes, and SHA-256 digests', async () => {
@@ -130,7 +261,7 @@ test('build rejects a dist symbolic link without changing external bytes', async
     await expectRejectedBuild('build must reject a symbolic-link dist directory');
     assert.deepEqual(await readFile(sentinel), sentinelContents);
   } finally {
-    await removeTestReplacement(distPath);
+    await detachAndRemoveTestPath(distPath);
     await rename(backup, distPath);
     await rm(externalRoot, { recursive: true, force: true });
   }
@@ -149,8 +280,96 @@ test('build rejects an output symbolic link without changing external bytes', as
     await expectRejectedBuild('build must reject a symbolic-link output directory');
     assert.deepEqual(await readFile(sentinel), sentinelContents);
   } finally {
-    await removeTestReplacement(outputPath);
+    await detachAndRemoveTestPath(outputPath);
     await rename(backup, outputPath);
     await rm(externalRoot, { recursive: true, force: true });
   }
+});
+
+test('publication never follows a public output swapped to an external link', async () => {
+  const hookDirectory = await mkdtemp(join(tmpdir(), 'cockpit-runtime-hook-'));
+  const externalRoot = await mkdtemp(join(tmpdir(), 'cockpit-runtime-external-'));
+  const backup = join(distPath, `.bundle-test-backup-${randomUUID()}`);
+  let detached = false;
+  const externalFixtures = new Map(expectedFiles.map((file) => [
+    file,
+    Buffer.from(`external-${file}\n`),
+  ]));
+  for (const [file, contents] of externalFixtures) {
+    await writeFile(join(externalRoot, file), contents);
+  }
+  const externalBefore = await snapshotDirectory(externalRoot);
+  const execution = spawnBuild(buildTestEnv(hookDirectory));
+
+  try {
+    await waitForHook(hookDirectory, execution);
+    await rename(outputPath, backup);
+    detached = true;
+    await symlink(externalRoot, outputPath, 'dir');
+    await releaseHook(hookDirectory, execution);
+    const result = await execution.completion;
+    const externalAfter = await snapshotDirectory(externalRoot);
+
+    assert.deepEqual(externalAfter, externalBefore);
+    assert.equal(result.code, 0, result.stderr || result.stdout);
+    assert.deepEqual((await snapshotBundle()).files, expectedFiles);
+  } finally {
+    await releaseHook(hookDirectory, execution);
+    await stopBuild(execution);
+    if (detached) {
+      await detachAndRemoveTestPath(outputPath);
+      await rename(backup, outputPath);
+    }
+    await rm(hookDirectory, { recursive: true, force: true });
+    await rm(externalRoot, { recursive: true, force: true });
+  }
+});
+
+test('two concurrent builds both succeed and publish one complete bundle', async () => {
+  const before = await snapshotBundle();
+  const hookDirectory = await mkdtemp(join(tmpdir(), 'cockpit-runtime-concurrent-'));
+  const first = spawnBuild(buildTestEnv(hookDirectory));
+  const second = spawnBuild(buildTestEnv(hookDirectory));
+
+  try {
+    await Promise.all([
+      waitForHook(hookDirectory, first),
+      waitForHook(hookDirectory, second),
+    ]);
+    await Promise.all([
+      releaseHook(hookDirectory, first),
+      releaseHook(hookDirectory, second),
+    ]);
+    const [firstResult, secondResult] = await Promise.all([
+      first.completion,
+      second.completion,
+    ]);
+
+    assert.equal(firstResult.code, 0, firstResult.stderr || firstResult.stdout);
+    assert.equal(secondResult.code, 0, secondResult.stderr || secondResult.stdout);
+    assert.deepEqual(await snapshotBundle(), before);
+  } finally {
+    await releaseHook(hookDirectory, first);
+    await releaseHook(hookDirectory, second);
+    await Promise.all([stopBuild(first), stopBuild(second)]);
+    await rm(hookDirectory, { recursive: true, force: true });
+  }
+});
+
+test('a pre-publication failure preserves the published bundle and removes staging', async () => {
+  const before = await snapshotBundle();
+  const execution = spawnBuild({
+    NODE_ENV: 'test',
+    COCKPIT_BUILD_TEST_FAIL: 'before-publish',
+  });
+  const result = await execution.completion;
+  const privateArtifacts = (await readdir(distPath)).filter((entry) => (
+    entry.startsWith('.MonacoRuntime.bundle.staging-')
+    || entry.startsWith('.MonacoRuntime.bundle.retired-')
+  ));
+
+  assert.notEqual(result.code, 0, 'the injected build failure must reject');
+  assert.match(result.stderr, /injected build failure before publish/i);
+  assert.deepEqual(await snapshotBundle(), before);
+  assert.deepEqual(privateArtifacts, []);
 });
