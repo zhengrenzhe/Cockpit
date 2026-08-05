@@ -21,6 +21,9 @@ let package = Package(
                 "CockpitTypes",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
+            resources: [
+                .copy("Proto/swift-protobuf-config.json"),
+            ],
             plugins: [
                 .plugin(name: "SwiftProtobufPlugin", package: "swift-protobuf"),
             ]
