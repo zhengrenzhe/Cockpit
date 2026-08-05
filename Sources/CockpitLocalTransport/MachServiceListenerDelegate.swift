@@ -1,5 +1,14 @@
 import Foundation
 
+protocol IncomingXPCConnectionBoundary: AnyObject {
+    var effectiveUserIdentifier: uid_t { get }
+    var exportedInterface: NSXPCInterface? { get set }
+    var exportedObject: Any? { get set }
+    func resume()
+}
+
+extension NSXPCConnection: IncomingXPCConnectionBoundary {}
+
 public final class MachServiceListenerDelegate:
     NSObject,
     NSXPCListenerDelegate,
@@ -23,6 +32,10 @@ public final class MachServiceListenerDelegate:
         _ listener: NSXPCListener,
         shouldAcceptNewConnection connection: NSXPCConnection
     ) -> Bool {
+        shouldAccept(connection)
+    }
+
+    func shouldAccept(_ connection: any IncomingXPCConnectionBoundary) -> Bool {
         guard peerValidator.accepts(
             effectiveUserIdentifier: connection.effectiveUserIdentifier
         ) else {
