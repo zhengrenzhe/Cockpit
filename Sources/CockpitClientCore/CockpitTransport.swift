@@ -31,3 +31,8 @@ public enum ConnectionState: Equatable, Sendable {
     case connecting
     case ready(NegotiatedSession)
 }
+
+public enum ConnectionControllerError: Error, Equatable, Sendable {
+    case alreadyConnecting
+    case alreadyReady
+}

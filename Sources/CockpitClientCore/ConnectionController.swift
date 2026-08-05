@@ -13,7 +13,15 @@ public actor ConnectionController {
     }
 
     public func connect(requestedFeatures: Set<ProtocolFeature>) async throws -> NegotiatedSession {
-        state = .connecting
+        switch state {
+        case .disconnected:
+            state = .connecting
+        case .connecting:
+            throw ConnectionControllerError.alreadyConnecting
+        case .ready:
+            throw ConnectionControllerError.alreadyReady
+        }
+
         do {
             try await transport.connect()
             let request = CPHandshakeRequest.cockpit(deviceID: deviceID, features: requestedFeatures)
@@ -41,17 +49,36 @@ public actor ConnectionController {
                     service: ProtocolVersion.current.major
                 )
             }
+            guard response.protocolMinor <= request.protocolMinor else {
+                throw ProtocolNegotiationError.responseMinorExceedsRequest(
+                    response: response.protocolMinor,
+                    request: request.protocolMinor
+                )
+            }
+            let acceptedFeatures = Set(
+                response.acceptedFeatures.map { ProtocolFeature(rawValue: $0) }
+            )
+            let requestedFeatures = Set(
+                request.requestedFeatures.map { ProtocolFeature(rawValue: $0) }
+            )
+            let unrequestedFeatures = acceptedFeatures
+                .subtracting(requestedFeatures)
+                .map(\.rawValue)
+                .sorted()
+            guard unrequestedFeatures.isEmpty else {
+                throw ProtocolNegotiationError.unrequestedAcceptedFeatures(unrequestedFeatures)
+            }
             let session = NegotiatedSession(
                 connectionID: ConnectionID(uuid),
                 version: negotiatedVersion,
-                acceptedFeatures: Set(response.acceptedFeatures.map { ProtocolFeature(rawValue: $0) }),
+                acceptedFeatures: acceptedFeatures,
                 serviceKind: response.serviceKind
             )
             state = .ready(session)
             return session
         } catch {
-            state = .disconnected
             await transport.disconnect()
+            state = .disconnected
             throw error
         }
     }

@@ -1,11 +1,13 @@
 import Foundation
 import CockpitTypes
 
-public enum ProtocolNegotiationError: Error, Equatable {
+public enum ProtocolNegotiationError: Error, Equatable, Sendable {
     case incompatibleMajor(client: UInt32, service: UInt16)
     case invalidDeviceID(String)
     case invalidConnectionID(String)
     case invalidProtocolVersion(major: UInt32, minor: UInt32)
+    case responseMinorExceedsRequest(response: UInt32, request: UInt32)
+    case unrequestedAcceptedFeatures([String])
 }
 
 public struct ProtocolNegotiator: Sendable {
