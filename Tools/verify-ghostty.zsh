@@ -15,8 +15,8 @@ fail() {
   exit 1
 }
 
-[[ "$(uname -s)" == "Darwin" ]] || fail "host is not Darwin"
-[[ "$(uname -m)" == "arm64" ]] || fail "host is not arm64"
+[[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "host is not Darwin"
+[[ "$(/usr/bin/uname -m)" == "arm64" ]] || fail "host is not arm64"
 [[ -f "$manifest" && ! -L "$manifest" ]] || fail "missing manifest: $manifest"
 
 typeset -a expected_manifest_lines
@@ -60,8 +60,8 @@ fi
 ! /usr/bin/git ls-files | /usr/bin/grep -Eq '(^|/)(\.tools|zig-aarch64-macos-0\.15\.2|zig-cache|\.zig-cache|zig-out)(/|$)|(^|/)zig$' || fail "toolchain or Ghostty build output is tracked"
 for bundle_root in "$repo_root/build" "$repo_root/DerivedData"; do
   [[ -d "$bundle_root" ]] || continue
-  ! find "$bundle_root" -type f \( -name zig -o -name 'zig-aarch64-macos-0.15.2.tar.xz' \) -print -quit | /usr/bin/grep -q . || fail "Zig compiler or archive is present in bundle output"
-  ! find "$bundle_root" -type d \( -name 'zig-aarch64-macos-0.15.2' -o -name zig-cache -o -name .zig-cache -o -name zig-out \) -print -quit | /usr/bin/grep -q . || fail "Ghostty build output is present in bundle output"
+  ! /usr/bin/find "$bundle_root" -type f \( -name zig -o -name 'zig-aarch64-macos-0.15.2.tar.xz' \) -print -quit | /usr/bin/grep -q . || fail "Zig compiler or archive is present in bundle output"
+  ! /usr/bin/find "$bundle_root" -type d \( -name 'zig-aarch64-macos-0.15.2' -o -name zig-cache -o -name .zig-cache -o -name zig-out \) -print -quit | /usr/bin/grep -q . || fail "Ghostty build output is present in bundle output"
 done
 
 compatibility_file="$submodule_path/build.zig.zon"

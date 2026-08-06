@@ -12,8 +12,8 @@ fail() {
   exit 1
 }
 
-[[ "$(uname -s)" == "Darwin" ]] || fail "host is not Darwin"
-[[ "$(uname -m)" == "arm64" ]] || fail "host is not arm64"
+[[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "host is not Darwin"
+[[ "$(/usr/bin/uname -m)" == "arm64" ]] || fail "host is not arm64"
 [[ -f "$manifest" && ! -L "$manifest" ]] || fail "missing manifest: $manifest"
 
 typeset -a expected_manifest_lines
@@ -38,14 +38,14 @@ done
 source "$manifest"
 
 [[ -f "$repo_root/.gitmodules" && ! -L "$repo_root/.gitmodules" ]] || fail "missing .gitmodules"
-[[ "$(git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.path)" == "ThirdParty/ghostty" ]] || fail "Ghostty submodule path mismatch"
-[[ "$(git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.url)" == "$GHOSTTY_REPOSITORY_URL" ]] || fail "Ghostty submodule URL mismatch"
+[[ "$(/usr/bin/git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.path)" == "ThirdParty/ghostty" ]] || fail "Ghostty submodule path mismatch"
+[[ "$(/usr/bin/git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.url)" == "$GHOSTTY_REPOSITORY_URL" ]] || fail "Ghostty submodule URL mismatch"
 
 [[ -d "$submodule_path" && ! -L "$submodule_path" ]] || fail "missing or symlinked Ghostty submodule"
-[[ "$(git -C "$submodule_path" rev-parse HEAD)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty commit mismatch"
-[[ -z "$(git -C "$submodule_path" status --short --untracked-files=no)" ]] || fail "Ghostty tracked source is dirty"
+[[ "$(/usr/bin/git -C "$submodule_path" rev-parse HEAD)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty commit mismatch"
+[[ -z "$(/usr/bin/git -C "$submodule_path" status --short --untracked-files=no)" ]] || fail "Ghostty tracked source is dirty"
 
-gitlink=$(git ls-files --stage -- "$submodule_path")
+gitlink=$(/usr/bin/git ls-files --stage -- "$submodule_path")
 [[ "$gitlink" == "160000 $GHOSTTY_COMMIT 0"$'\t'"ThirdParty/ghostty" ]] || fail "Ghostty gitlink mismatch"
 
 for tool_path in "$repo_root/.tools" "$repo_root/.tools/zig" "$zig_root" "$zig_root/zig"; do
@@ -55,15 +55,15 @@ done
 [[ -x "$zig_root/zig" ]] || fail "missing Zig compiler"
 [[ "$("$zig_root/zig" version)" == "$ZIG_VERSION" ]] || fail "Zig version mismatch"
 
-git check-ignore -q --no-index "$repo_root/.tools" || fail ".tools is not ignored"
-! git ls-files | /usr/bin/grep -Eq '(^|/)(\.tools|zig-aarch64-macos-0\.15\.2|zig-cache|\.zig-cache|zig-out)(/|$)|(^|/)zig$' || fail "toolchain or Ghostty build output is tracked"
+/usr/bin/git check-ignore -q --no-index "$repo_root/.tools" || fail ".tools is not ignored"
+! /usr/bin/git ls-files | /usr/bin/grep -Eq '(^|/)(\.tools|zig-aarch64-macos-0\.15\.2|zig-cache|\.zig-cache|zig-out)(/|$)|(^|/)zig$' || fail "toolchain or Ghostty build output is tracked"
 
 typeset -a bundle_roots
 bundle_roots=("$repo_root/build" "$repo_root/DerivedData")
 for bundle_root in "${bundle_roots[@]}"; do
   [[ -d "$bundle_root" ]] || continue
-  ! find "$bundle_root" -type f \( -name zig -o -name 'zig-aarch64-macos-0.15.2.tar.xz' \) -print -quit | /usr/bin/grep -q . || fail "Zig compiler or archive is present in bundle output"
-  ! find "$bundle_root" -type d \( -name 'zig-aarch64-macos-0.15.2' -o -name zig-cache -o -name .zig-cache -o -name zig-out \) -print -quit | /usr/bin/grep -q . || fail "Ghostty build output is present in bundle output"
+  ! /usr/bin/find "$bundle_root" -type f \( -name zig -o -name 'zig-aarch64-macos-0.15.2.tar.xz' \) -print -quit | /usr/bin/grep -q . || fail "Zig compiler or archive is present in bundle output"
+  ! /usr/bin/find "$bundle_root" -type d \( -name 'zig-aarch64-macos-0.15.2' -o -name zig-cache -o -name .zig-cache -o -name zig-out \) -print -quit | /usr/bin/grep -q . || fail "Ghostty build output is present in bundle output"
 done
 
 print -- "Ghostty $GHOSTTY_VERSION ($GHOSTTY_COMMIT) and Zig $ZIG_VERSION verified"
