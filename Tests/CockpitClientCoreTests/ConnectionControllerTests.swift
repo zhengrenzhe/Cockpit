@@ -173,7 +173,7 @@ private actor DisconnectBarrierTransport: CockpitTransport {
     let requestData = try #require(snapshot.handshakeRequests.first)
     let request = try HandshakeCodec.decodeRequest(requestData)
     #expect(request.protocolMajor == 1)
-    #expect(request.protocolMinor == 0)
+    #expect(request.protocolMinor == 1)
     #expect(request.deviceID == "00000000-0000-0000-0000-000000000041")
     #expect(request.requestedFeatures == ["terminal-frames", "workspace-control"])
 }
@@ -234,11 +234,11 @@ private actor DisconnectBarrierTransport: CockpitTransport {
 }
 
 @Test func controllerRejectsResponseMinorAboveRequestedMinor() async throws {
-    let transport = RecordingTransport(response: try encodedResponse(minor: 1))
+    let transport = RecordingTransport(response: try encodedResponse(minor: 2))
     let controller = ConnectionController(transport: transport, deviceID: DeviceID())
 
     await #expect(
-        throws: ProtocolNegotiationError.responseMinorExceedsRequest(response: 1, request: 0)
+        throws: ProtocolNegotiationError.responseMinorExceedsRequest(response: 2, request: 1)
     ) {
         _ = try await controller.connect(requestedFeatures: [.workspaceControl])
     }
@@ -349,7 +349,7 @@ private actor DisconnectBarrierTransport: CockpitTransport {
 
 private func encodedResponse(
     major: UInt32 = 1,
-    minor: UInt32 = 0,
+    minor: UInt32 = 1,
     connectionID: String = "00000000-0000-0000-0000-000000000042",
     acceptedFeatures: [String] = ["workspace-control"]
 ) throws -> Data {

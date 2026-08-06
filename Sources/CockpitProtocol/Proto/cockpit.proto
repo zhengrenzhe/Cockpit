@@ -2,6 +2,8 @@ syntax = "proto3";
 package cockpit.protocol.v1;
 option swift_prefix = "CP";
 
+import "google/protobuf/timestamp.proto";
+
 message HandshakeRequest {
   uint32 protocol_major = 1;
   uint32 protocol_minor = 2;
@@ -28,4 +30,108 @@ message ProtocolError {
 
   Code code = 1;
   string message = 2;
+}
+
+message WorkspaceContextID {
+  oneof kind {
+    string project_id = 1;
+    string conversation_id = 2;
+  }
+}
+
+message RequestContext {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string client_instance_id = 3;
+  string window_id = 4;
+  WorkspaceContextID workspace_context_id = 5;
+  string environment_id = 6;
+  uint64 active_context_generation = 7;
+  string request_id = 8;
+}
+
+enum TerminalKeyAction {
+  TERMINAL_KEY_ACTION_UNSPECIFIED = 0;
+  TERMINAL_KEY_ACTION_PRESS = 1;
+  TERMINAL_KEY_ACTION_REPEAT = 2;
+  TERMINAL_KEY_ACTION_RELEASE = 3;
+}
+
+message TerminalKeyEvent {
+  uint32 logical_key = 1;
+  uint32 physical_key = 2;
+  uint32 modifiers = 3;
+  TerminalKeyAction action = 4;
+}
+
+enum TerminalMouseAction {
+  TERMINAL_MOUSE_ACTION_UNSPECIFIED = 0;
+  TERMINAL_MOUSE_ACTION_PRESS = 1;
+  TERMINAL_MOUSE_ACTION_RELEASE = 2;
+  TERMINAL_MOUSE_ACTION_MOTION = 3;
+  TERMINAL_MOUSE_ACTION_SCROLL = 4;
+}
+
+message TerminalMouseEvent {
+  int32 cell_x = 1;
+  int32 cell_y = 2;
+  uint32 buttons = 3;
+  sint32 wheel_x = 4;
+  sint32 wheel_y = 5;
+  uint32 modifiers = 6;
+  TerminalMouseAction action = 7;
+}
+
+message TerminalResize {
+  uint32 columns = 1;
+  uint32 rows = 2;
+}
+
+enum TerminalSignal {
+  TERMINAL_SIGNAL_UNSPECIFIED = 0;
+  TERMINAL_SIGNAL_INTERRUPT = 1;
+  TERMINAL_SIGNAL_QUIT = 2;
+  TERMINAL_SIGNAL_SUSPEND = 3;
+  TERMINAL_SIGNAL_CONTINUE = 4;
+}
+
+message TerminalInput {
+  RequestContext context = 1;
+  string terminal_session_id = 2;
+  string input_lease_id = 3;
+  uint64 input_sequence = 4;
+
+  oneof payload {
+    string text = 5;
+    TerminalKeyEvent key = 6;
+    string paste = 7;
+    TerminalMouseEvent mouse = 8;
+    TerminalResize resize = 9;
+    TerminalSignal signal = 10;
+  }
+}
+
+message TerminalArchiveChunk {
+  string name = 1;
+  uint64 first_output_sequence = 2;
+  uint64 last_output_sequence = 3;
+  bytes sha256 = 4;
+}
+
+message TerminalExitStatus {
+  oneof result {
+    uint32 exit_code = 1;
+    int32 darwin_signal = 2;
+  }
+}
+
+message TerminalArchiveManifest {
+  string terminal_session_id = 1;
+  string worker_instance_id = 2;
+  uint64 first_output_sequence = 3;
+  uint64 latest_output_sequence = 4;
+  repeated TerminalArchiveChunk chunks = 5;
+  bytes final_snapshot_sha256 = 6;
+  TerminalExitStatus exit_status = 7;
+  google.protobuf.Timestamp completed_at = 8;
 }

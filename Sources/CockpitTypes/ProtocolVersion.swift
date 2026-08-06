@@ -7,7 +7,7 @@ public struct ProtocolVersion: Hashable, Codable, Sendable, Comparable {
         self.minor = minor
     }
 
-    public static let current = ProtocolVersion(major: 1, minor: 0)
+    public static let current = ProtocolVersion(major: 1, minor: 1)
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
         (lhs.major, lhs.minor) < (rhs.major, rhs.minor)
