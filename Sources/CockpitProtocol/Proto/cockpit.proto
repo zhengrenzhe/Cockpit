@@ -1,0 +1,31 @@
+syntax = "proto3";
+package cockpit.protocol.v1;
+option swift_prefix = "CP";
+
+message HandshakeRequest {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string device_id = 3;
+  repeated string requested_features = 4;
+}
+
+message HandshakeResponse {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string connection_id = 3;
+  repeated string accepted_features = 4;
+  string service_kind = 5;
+}
+
+message ProtocolError {
+  enum Code {
+    UNSPECIFIED = 0;
+    INCOMPATIBLE_MAJOR_VERSION = 1;
+    INVALID_IDENTITY = 2;
+    MALFORMED_MESSAGE = 3;
+    UNAUTHORIZED = 4;
+  }
+
+  Code code = 1;
+  string message = 2;
+}

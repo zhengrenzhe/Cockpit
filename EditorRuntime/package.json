@@ -1,0 +1,24 @@
+{
+  "name": "cockpit-editor-runtime",
+  "private": true,
+  "version": "0.0.1",
+  "packageManager": "pnpm@11.20.0",
+  "engines": {
+    "node": "25.9.0 || 26.7.0",
+    "pnpm": "9.15.9 || 11.20.0"
+  },
+  "type": "module",
+  "scripts": {
+    "check:tools": "node check-tools.mjs",
+    "prebuild": "pnpm run check:tools",
+    "build": "node build.mjs",
+    "pretest": "pnpm run check:tools",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "monaco-editor": "0.56.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}

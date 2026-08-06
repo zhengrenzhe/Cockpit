@@ -6,7 +6,7 @@
 
 **Architecture:** A root Swift Package owns stable value types, protobuf messages, frame codecs, client state, host negotiation, terminal lifecycle values, and transport adapters. An XcodeGen project assembles one AppKit application, two launchd-managed services, and an embedded PTYKeeper executable. Phase 0 uses a no-PTY Keeper probe to verify `POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT`, bootstrap-FD isolation, Supervisor crash survival, and launchd restart; real PTY creation, Ghostty VT state, attach tickets, and session recovery arrive in Phase 1.
 
-**Tech Stack:** Xcode 26.6 (17F113), Swift 6.3.3, Swift tools 6.3, AppKit, Darwin POSIX spawn APIs, NSXPCConnection, Network.framework, Security.framework, SwiftProtobuf 1.38.1, XcodeGen 2.46.0, Node 26.6.0, Monaco 0.56.0, esbuild 0.28.1, pnpm 11.20.0, Ghostty v1.3.1, Zig 0.15.2.
+**Tech Stack:** Xcode 26.6 (17F113), Swift 6.3.3, Swift tools 6.3, AppKit, Darwin POSIX spawn APIs, NSXPCConnection, Network.framework, Security.framework, SwiftProtobuf 1.38.1, XcodeGen 2.46.0, Node 26.7.0, Monaco 0.56.0, esbuild 0.28.1, pnpm 11.20.0, Ghostty v1.3.1, Zig 0.15.2.
 
 ## Global Constraints
 
@@ -3192,7 +3192,7 @@ git commit -m "feat: prove remote tls transport handshake"
 - Create: `EditorRuntime/test/build.test.mjs`
 
 **Interfaces:**
-- Consumes: Node 26.6.0 and pnpm 11.20.0.
+- Consumes: Node 26.7.0 and pnpm 11.20.0.
 - Produces: `EditorRuntime/dist/MonacoRuntime.bundle/index.html` and `editor.js`; no application networking or web UI modules.
 
 - [ ] **Step 1: Write the package manifest and failing build test**
@@ -3489,7 +3489,7 @@ cd "$repo_root"
 cockpit_xcode_version=$(xcodebuild -version)
 [[ "$cockpit_xcode_version" == $'Xcode 26.6\nBuild version 17F113' ]]
 [[ "$(swift --version)" == *"Swift version 6.3.3"* ]]
-[[ "$(node --version)" == "v26.6.0" ]]
+[[ "$(node --version)" == "v26.7.0" ]]
 [[ "$(pnpm --version)" == "11.20.0" ]]
 [[ "$(xcodegen --version)" == "Version: 2.46.0" ]]
 
@@ -3526,7 +3526,7 @@ Cockpit is a native macOS agent development environment. The Mac owns projects, 
 - macOS on Apple Silicon
 - Xcode 26.6 (17F113)
 - Swift 6.3.3
-- Node 26.6.0
+- Node 26.7.0
 - pnpm 11.20.0
 - XcodeGen 2.46.0
 

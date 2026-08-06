@@ -1,1 +1,11 @@
 .worktrees/
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+build/
+.tools/
+EditorRuntime/node_modules/
+EditorRuntime/dist/
+Tests/Fixtures/TLS/generated/
+.superpowers/

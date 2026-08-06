@@ -1,0 +1,138 @@
+name: Cockpit
+options:
+  bundleIdPrefix: dev.cockpit
+  deploymentTarget:
+    macOS: "15.0"
+configs:
+  Debug: debug
+  Release: release
+packages:
+  CockpitKit:
+    path: .
+settings:
+  base:
+    PRODUCT_NAME: $(TARGET_NAME)
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+configFiles:
+  Debug: Config/Build/Base.xcconfig
+  Release: Config/Build/Base.xcconfig
+targets:
+  CockpitHost:
+    type: tool
+    platform: macOS
+    sources: [Applications/CockpitHost]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitHost
+        OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitHost
+    dependencies:
+      - package: CockpitKit
+        product: CockpitHostCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
+  CockpitTerminalSupervisor:
+    type: tool
+    platform: macOS
+    sources: [Applications/CockpitTerminalSupervisor]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitTerminalSupervisor
+        OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitTerminalSupervisor
+    dependencies:
+      - package: CockpitKit
+        product: CockpitTerminalCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
+  CockpitPTYKeeper:
+    type: tool
+    platform: macOS
+    sources: [Applications/CockpitPTYKeeper]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitPTYKeeper
+        OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitPTYKeeper
+    dependencies:
+      - package: CockpitKit
+        product: CockpitTerminalCore
+  Cockpit:
+    type: application
+    platform: macOS
+    sources: [Applications/CockpitApp]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.Cockpit
+        GENERATE_INFOPLIST_FILE: YES
+        LM_FORCE_LINK_GENERATION: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Cockpit
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+    dependencies:
+      - package: CockpitKit
+        product: CockpitClientCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
+      - package: CockpitKit
+        product: CockpitTypes
+      - target: CockpitHost
+        embed: false
+      - target: CockpitTerminalSupervisor
+        embed: false
+      - target: CockpitPTYKeeper
+        embed: false
+    postBuildScripts:
+      - name: Embed LaunchAgents
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/CockpitHost
+          - $(BUILT_PRODUCTS_DIR)/CockpitTerminalSupervisor
+          - $(BUILT_PRODUCTS_DIR)/CockpitPTYKeeper
+          - $(SRCROOT)/Config/LaunchAgents/dev.cockpit.host.plist
+          - $(SRCROOT)/Config/LaunchAgents/dev.cockpit.terminal.plist
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitHost
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitTerminalSupervisor
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/CockpitPTYKeeper
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.host.plist
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/dev.cockpit.terminal.plist
+        script: |
+          set -euo pipefail
+          test -n "$WRAPPER_NAME"
+          test "$CONTENTS_FOLDER_PATH" = "$WRAPPER_NAME/Contents"
+          case "$TARGET_BUILD_DIR" in
+            /*) ;;
+            *) exit 1 ;;
+          esac
+          target_build_dir=$(/bin/realpath "$TARGET_BUILD_DIR")
+          test "$target_build_dir" != "/"
+          contents=$(/bin/realpath "$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH")
+          test "$contents" = "$target_build_dir/$WRAPPER_NAME/Contents"
+          resources="$contents/Resources"
+          agents="$contents/Library/LaunchAgents"
+          test ! -L "$resources"
+          test ! -L "$contents/Library"
+          test ! -L "$agents"
+          /bin/mkdir -p "$resources" "$agents"
+          resources=$(/bin/realpath "$resources")
+          agents=$(/bin/realpath "$agents")
+          test "$resources" = "$contents/Resources"
+          test "$agents" = "$contents/Library/LaunchAgents"
+          /usr/bin/find "$agents" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +
+          /bin/cp "$BUILT_PRODUCTS_DIR/CockpitHost" "$resources/CockpitHost"
+          /bin/cp "$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor" "$resources/CockpitTerminalSupervisor"
+          /bin/cp "$BUILT_PRODUCTS_DIR/CockpitPTYKeeper" "$resources/CockpitPTYKeeper"
+          /bin/cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist" "$agents/"
+          /bin/cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist" "$agents/"
+          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost "$resources/CockpitHost"
+          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor "$resources/CockpitTerminalSupervisor"
+          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper "$resources/CockpitPTYKeeper"
+schemes:
+  Cockpit:
+    build:
+      targets:
+        Cockpit: all
+        CockpitHost: all
+        CockpitTerminalSupervisor: all
+        CockpitPTYKeeper: all
+    run:
+      config: Debug

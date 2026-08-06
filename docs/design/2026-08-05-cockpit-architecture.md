@@ -628,7 +628,7 @@ Cockpit/
 | esbuild | 0.28.1 | https://github.com/evanw/esbuild/releases/tag/v0.28.1 |
 | Ghostty 上游基础版本 | v1.3.1 / `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | https://github.com/ghostty-org/ghostty/releases/tag/v1.3.1 |
 | Ghostty 1.3.x 使用的 Zig | 0.15.2 | https://ghostty.org/docs/install/build |
-| Node | 26.6.0 | https://nodejs.org/dist/index.json |
+| Node | 26.7.0 | https://nodejs.org/dist/index.json |
 | pnpm | 11.20.0 | https://github.com/pnpm/pnpm/releases/tag/v11.20.0 |
 | XcodeGen | 2.46.0 | https://github.com/yonaskolb/XcodeGen/releases/tag/2.46.0 |
 
