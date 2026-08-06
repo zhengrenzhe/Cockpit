@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import Testing
 @testable import CockpitPersistence
 
@@ -80,6 +81,20 @@ import Testing
                 dirtyState: "clean"
             )
         }
+    }
+}
+
+@Test func environmentsMigrationAllowsMissingGitCommonDirectory() async throws {
+    try await withMigrationDatabase { databaseURL in
+        let connection = try SQLiteConnection(databaseURL: databaseURL)
+        try await connection.applyMigrations(WorkspaceMigrations.all)
+
+        let tableInfo = try await connection.query("PRAGMA table_info(environments)")
+        let gitCommonDirectoryColumn = try #require(
+            tableInfo.first { text(in: $0, at: 1) == "git_common_directory" }
+        )
+        #expect(integer(in: gitCommonDirectoryColumn, at: 3) == 0)
+        #expect(await connection.close() == SQLITE_OK)
     }
 }
 

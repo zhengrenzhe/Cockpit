@@ -31,7 +31,7 @@ enum WorkspaceMigrations {
                 kind TEXT NOT NULL CHECK (kind IN ('direct', 'worktree')),
                 workspace_root TEXT NOT NULL,
                 workspace_root_identity TEXT NOT NULL UNIQUE,
-                git_common_directory TEXT NOT NULL,
+                git_common_directory TEXT,
                 worktree_branch TEXT,
                 UNIQUE (project_id, id),
                 FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE

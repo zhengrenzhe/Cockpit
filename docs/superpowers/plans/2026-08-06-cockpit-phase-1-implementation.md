@@ -319,11 +319,11 @@ public protocol WorkspaceRepository: Sendable {
 }
 ```
 
-Migration v1 一次创建 `projects`、`environments`、`conversations`、`documents`、`conversation_deletions` 和 `schema_migrations`；本任务不创建 `client_workspace_states`。约束固定为：一个规范化 root identity 只能对应一个 Environment；Phase 1 一个数据库最多一个 Project；Conversation.environment_id 必须引用所属 Project.base_environment_id。
+Migration v1 一次创建 `projects`、`environments`、`conversations`、`documents`、`conversation_deletions` 和 `schema_migrations`；本任务不创建 `client_workspace_states`。约束固定为：一个规范化 root identity 只能对应一个 Environment；Phase 1 一个数据库最多一个 Project；Conversation.environment_id 必须引用所属 Project.base_environment_id。`Environment.gitCommonDirectory` 与 `NewProject.gitCommonDirectory` 可空，非 Git 目录以 NULL 持久化。
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖 WAL、foreign keys、busy timeout、migration v1 事务回滚、Project+Direct Environment 原子创建、第二个 Project 被 `phaseOneProjectLimit` 拒绝、多个 Conversation 共享 base Environment，以及显式关闭后只凭 databaseURL 重建 repository 仍能枚举完整 Conversation 并保持 Project/Conversation/Environment 解析结果不变；本任务不写布局持久化测试。
+覆盖 WAL、foreign keys、busy timeout、migration v1 事务回滚、Project+Direct Environment 原子创建、第二个 Project 被 `phaseOneProjectLimit` 拒绝、多个 Conversation 共享 base Environment、非 Git Project 的空 gitCommonDirectory 创建与重开解析，以及显式关闭后只凭 databaseURL 重建 repository 仍能枚举完整 Conversation 并保持 Project/Conversation/Environment 解析结果不变；本任务不写布局持久化测试。
 
 - [ ] **Step 2: 运行失败测试**
 
@@ -364,6 +364,7 @@ git commit -m "feat: persist direct workspace state"
 - Modify: `Applications/CockpitHost/main.swift`
 - Create: `Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift`
 - Create: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Modify: `Package.swift`
 
 **Contract:**
 
@@ -393,14 +394,14 @@ Expected: 失败，原因是 WorkspaceServing 与 Host XPC 命令不存在。
 
 - [ ] **Step 3: 实现服务与 Composition Root**
 
-`WorkspaceKernelRegistry` 以 EnvironmentID 为键；Project Context 和 Conversation Context 解析时返回同一 Kernel 实例。`Applications/CockpitHost/main.swift` 只创建 StorageLocations、Repository、WorkspaceService 和 XPC export。
+`WorkspaceKernelRegistry` 以 EnvironmentID 为键；Project Context 和 Conversation Context 解析时返回同一 Kernel 实例。`Applications/CockpitHost/main.swift` 只创建 StorageLocations、Repository、WorkspaceService 和 XPC export。SwiftPM 的 `CockpitHost` target 依赖 `CockpitPersistence` 与 `CockpitWorkspace`，`CockpitHostCoreTests` target 依赖 `CockpitWorkspace`。
 
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
 /usr/bin/swift test --disable-automatic-resolution --filter 'CockpitHostCoreTests|CockpitLocalTransportTests'
 /usr/bin/git diff --check
-git add Sources/CockpitHostCore Sources/CockpitWorkspace Sources/CockpitLocalTransport Applications/CockpitHost Tests/CockpitHostCoreTests Tests/CockpitLocalTransportTests
+git add Package.swift Sources/CockpitHostCore Sources/CockpitWorkspace Sources/CockpitLocalTransport Applications/CockpitHost Tests/CockpitHostCoreTests Tests/CockpitLocalTransportTests
 git commit -m "feat: add direct workspace control plane"
 ```
 

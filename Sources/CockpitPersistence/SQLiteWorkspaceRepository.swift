@@ -60,7 +60,7 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
                     .text(Environment.Kind.direct.rawValue),
                     .text(input.workspaceRoot),
                     .text(input.canonicalRootIdentity),
-                    .text(input.gitCommonDirectory),
+                    input.gitCommonDirectory.map { .text($0) } ?? .null,
                     .null,
                 ]
             )

@@ -37,7 +37,7 @@ public struct Environment: Hashable, Sendable {
     public let kind: Kind
     public let workspaceRoot: String
     public let workspaceRootIdentity: String
-    public let gitCommonDirectory: String
+    public let gitCommonDirectory: String?
     public let worktreeBranch: String?
 
     public init(
@@ -46,7 +46,7 @@ public struct Environment: Hashable, Sendable {
         kind: Kind,
         workspaceRoot: String,
         workspaceRootIdentity: String,
-        gitCommonDirectory: String,
+        gitCommonDirectory: String?,
         worktreeBranch: String?
     ) {
         self.id = id
@@ -97,14 +97,14 @@ public struct NewProject: Hashable, Sendable {
     public let rootBookmark: Data
     public let canonicalRootIdentity: String
     public let workspaceRoot: String
-    public let gitCommonDirectory: String
+    public let gitCommonDirectory: String?
 
     public init(
         displayName: String,
         rootBookmark: Data,
         canonicalRootIdentity: String,
         workspaceRoot: String,
-        gitCommonDirectory: String
+        gitCommonDirectory: String?
     ) {
         self.displayName = displayName
         self.rootBookmark = rootBookmark

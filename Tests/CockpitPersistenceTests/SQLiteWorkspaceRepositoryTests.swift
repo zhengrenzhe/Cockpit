@@ -27,6 +27,13 @@ import CockpitTypes
         #expect(resolved.conversationID == nil)
         #expect(resolved.environmentID == project.baseEnvironmentID)
         #expect(resolved.workspaceRootIdentity == "file-id:cockpit")
+        let inspectionConnection = try SQLiteConnection(databaseURL: databaseURL)
+        #expect(
+            try await inspectionConnection.textValue(
+                for: "SELECT git_common_directory FROM environments"
+            ) == "/Users/example/Cockpit/.git"
+        )
+        #expect(await inspectionConnection.close() == SQLITE_OK)
     }
 }
 
@@ -167,6 +174,35 @@ import CockpitTypes
     }
 }
 
+@Test func nonGitProjectRoundTripsWithoutGitCommonDirectory() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(
+            NewProject(
+                displayName: "Plain Directory",
+                rootBookmark: Data([0x04, 0x05]),
+                canonicalRootIdentity: "file-id:plain-directory",
+                workspaceRoot: "/Users/example/PlainDirectory",
+                gitCommonDirectory: nil
+            )
+        )
+        let expectedResolution = try await repository.resolve(.project(project.id))
+        #expect(await repository.close() == SQLITE_OK)
+
+        let reopenedRepository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        #expect(try await reopenedRepository.listProjects() == [project])
+        #expect(try await reopenedRepository.resolve(.project(project.id)) == expectedResolution)
+        #expect(await reopenedRepository.close() == SQLITE_OK)
+        let inspectionConnection = try SQLiteConnection(databaseURL: databaseURL)
+        let rows = try await inspectionConnection.query(
+            "SELECT git_common_directory FROM environments"
+        )
+        #expect(rows.count == 1)
+        #expect(isSQLiteNull(rows.first?.first))
+        #expect(await inspectionConnection.close() == SQLITE_OK)
+    }
+}
+
 private func makeProjectInput() -> NewProject {
     NewProject(
         displayName: "Cockpit",
@@ -223,6 +259,11 @@ private func seedConversationsAndClose(databaseURL: URL) async throws -> [Conver
 private func conversationOrder(_ lhs: Conversation, _ rhs: Conversation) -> Bool {
     if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
     return lhs.id.description < rhs.id.description
+}
+
+private func isSQLiteNull(_ column: SQLiteColumn?) -> Bool {
+    guard let column, case .null = column else { return false }
+    return true
 }
 
 private extension Array {

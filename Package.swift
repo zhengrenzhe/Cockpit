@@ -80,7 +80,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CockpitHostCoreTests",
-            dependencies: ["CockpitHostCore", "CockpitTypes", "CockpitProtocol"]
+            dependencies: ["CockpitHostCore", "CockpitTypes", "CockpitProtocol", "CockpitWorkspace"]
         ),
         .testTarget(
             name: "CockpitTerminalCoreTests",
@@ -119,7 +119,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "CockpitHost",
-            dependencies: ["CockpitHostCore", "CockpitLocalTransport"],
+            dependencies: [
+                "CockpitHostCore",
+                "CockpitLocalTransport",
+                "CockpitPersistence",
+                "CockpitWorkspace",
+            ],
             path: "Applications/CockpitHost"
         ),
         .executableTarget(
