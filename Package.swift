@@ -11,6 +11,9 @@ let package = Package(
         .library(name: "CockpitClientCore", targets: ["CockpitClientCore"]),
         .library(name: "CockpitHostCore", targets: ["CockpitHostCore"]),
         .library(name: "CockpitTerminalCore", targets: ["CockpitTerminalCore"]),
+        .library(name: "CockpitPersistence", targets: ["CockpitPersistence"]),
+        .library(name: "CockpitWorkspace", targets: ["CockpitWorkspace"]),
+        .library(name: "CockpitTerminalClient", targets: ["CockpitTerminalClient"]),
         .library(name: "CockpitLocalTransport", targets: ["CockpitLocalTransport"]),
         .library(name: "CockpitRemoteTransport", targets: ["CockpitRemoteTransport"]),
         .executable(name: "CockpitHost", targets: ["CockpitHost"]),
@@ -45,11 +48,26 @@ let package = Package(
         .target(name: "CockpitHostCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
         .target(name: "CockpitTerminalCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
         .target(
+            name: "CockpitPersistence",
+            dependencies: ["CockpitTypes", "CockpitHostCore", "CockpitTerminalCore"],
+            linkerSettings: [.linkedLibrary("sqlite3")]
+        ),
+        .target(
+            name: "CockpitWorkspace",
+            dependencies: ["CockpitTypes", "CockpitProtocol", "CockpitHostCore"]
+        ),
+        .target(
+            name: "CockpitTerminalClient",
+            dependencies: ["CockpitTypes", "CockpitProtocol", "CockpitClientCore"]
+        ),
+        .target(
             name: "CockpitLocalTransport",
             dependencies: [
                 "CockpitClientCore",
+                "CockpitHostCore",
                 "CockpitProtocol",
                 "CockpitTerminalCore",
+                "CockpitTerminalClient",
             ]
         ),
         .target(
@@ -67,6 +85,18 @@ let package = Package(
         .testTarget(
             name: "CockpitTerminalCoreTests",
             dependencies: ["CockpitTerminalCore", "CockpitTypes", "CockpitProtocol"]
+        ),
+        .testTarget(
+            name: "CockpitPersistenceTests",
+            dependencies: ["CockpitPersistence"]
+        ),
+        .testTarget(
+            name: "CockpitWorkspaceTests",
+            dependencies: ["CockpitWorkspace"]
+        ),
+        .testTarget(
+            name: "CockpitTerminalClientTests",
+            dependencies: ["CockpitTerminalClient"]
         ),
         .testTarget(
             name: "CockpitLocalTransportTests",

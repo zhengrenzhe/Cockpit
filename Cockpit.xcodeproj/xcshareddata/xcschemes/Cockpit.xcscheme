@@ -81,7 +81,20 @@
          </BuildableReference>
       </MacroExpansion>
       <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "917AF96F70F7A0C34D6087E6"
+               BuildableName = "CockpitAppTests.xctest"
+               BlueprintName = "CockpitAppTests"
+               ReferencedContainer = "container:Cockpit.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
+      <CommandLineArguments>
+      </CommandLineArguments>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"

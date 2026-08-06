@@ -32,6 +32,10 @@ targets:
         product: CockpitHostCore
       - package: CockpitKit
         product: CockpitLocalTransport
+      - package: CockpitKit
+        product: CockpitPersistence
+      - package: CockpitKit
+        product: CockpitWorkspace
   CockpitTerminalSupervisor:
     type: tool
     platform: macOS
@@ -45,6 +49,8 @@ targets:
         product: CockpitTerminalCore
       - package: CockpitKit
         product: CockpitLocalTransport
+      - package: CockpitKit
+        product: CockpitPersistence
   CockpitPTYKeeper:
     type: tool
     platform: macOS
@@ -74,6 +80,8 @@ targets:
         product: CockpitLocalTransport
       - package: CockpitKit
         product: CockpitTypes
+      - package: CockpitKit
+        product: CockpitTerminalClient
       - target: CockpitHost
         embed: false
       - target: CockpitTerminalSupervisor
@@ -126,6 +134,17 @@ targets:
           /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost "$resources/CockpitHost"
           /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor "$resources/CockpitTerminalSupervisor"
           /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper "$resources/CockpitPTYKeeper"
+  CockpitAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests/CockpitAppTests]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitTests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Cockpit.app/Contents/MacOS/Cockpit
+        BUNDLE_LOADER: $(TEST_HOST)
+    dependencies:
+      - target: Cockpit
 schemes:
   Cockpit:
     build:
@@ -136,3 +155,7 @@ schemes:
         CockpitPTYKeeper: all
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - CockpitAppTests
