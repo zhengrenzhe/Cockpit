@@ -122,7 +122,7 @@ CockpitLocalTransport -> CockpitClientCore + CockpitHostCore + CockpitProtocol +
 - [ ] **Step 3: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitPersistenceTests|CockpitWorkspaceTests|CockpitTerminalClientTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitPersistenceTests|CockpitWorkspaceTests|CockpitTerminalClientTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/AppTestScaffoldTests test
 ```
@@ -161,7 +161,7 @@ Expected: 与本计划 Tech Stack 完全一致；Ghostty commit 和 Zig 0.15.2 �
 - [ ] **Step 6: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitPersistenceTests|CockpitWorkspaceTests|CockpitTerminalClientTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitPersistenceTests|CockpitWorkspaceTests|CockpitTerminalClientTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/AppTestScaffoldTests test
 /usr/bin/git diff --check
@@ -243,7 +243,7 @@ extension ChannelID {
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitTypesTests|CockpitProtocolTests|CockpitClientCoreTests.ConnectionControllerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitTypesTests|CockpitProtocolTests|CockpitClientCoreTests.ConnectionControllerTests'
 ```
 
 Expected: 失败，原因是 Phase 1 类型、消息和 protocol 1.1 尚不存在。
@@ -255,7 +255,7 @@ Expected: 失败，原因是 Phase 1 类型、消息和 protocol 1.1 尚不存�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitTypesTests|CockpitProtocolTests|CockpitClientCoreTests.ConnectionControllerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitTypesTests|CockpitProtocolTests|CockpitClientCoreTests.ConnectionControllerTests'
 /usr/bin/git diff --check
 git add Sources/CockpitTypes Sources/CockpitProtocol Tests/CockpitTypesTests Tests/CockpitProtocolTests Tests/CockpitClientCoreTests/ConnectionControllerTests.swift
 git commit -m "feat: define phase 1 domain protocol"
@@ -301,7 +301,7 @@ Migration v1 一次创建 `projects`、`environments`、`conversations`、`docum
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter CockpitPersistenceTests
+/usr/bin/swift test --disable-automatic-resolution --filter CockpitPersistenceTests
 ```
 
 Expected: 失败，原因是 SQLite 封装、迁移和 repository 尚不存在。
@@ -313,7 +313,7 @@ Expected: 失败，原因是 SQLite 封装、迁移和 repository 尚不存在�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter CockpitPersistenceTests
+/usr/bin/swift test --disable-automatic-resolution --filter CockpitPersistenceTests
 /usr/bin/git diff --check
 git add Sources/CockpitHostCore/WorkspaceRepository.swift Sources/CockpitPersistence Tests/CockpitPersistenceTests
 git commit -m "feat: persist direct workspace state"
@@ -359,7 +359,7 @@ Host 解析 security-scoped bookmark、取得 canonical path 与 volume/file res
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitHostCoreTests|CockpitLocalTransportTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitHostCoreTests|CockpitLocalTransportTests'
 ```
 
 Expected: 失败，原因是 WorkspaceServing 与 Host XPC 命令不存在。
@@ -371,7 +371,7 @@ Expected: 失败，原因是 WorkspaceServing 与 Host XPC 命令不存在。
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitHostCoreTests|CockpitLocalTransportTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitHostCoreTests|CockpitLocalTransportTests'
 /usr/bin/git diff --check
 git add Sources/CockpitHostCore Sources/CockpitWorkspace Sources/CockpitLocalTransport Applications/CockpitHost Tests/CockpitHostCoreTests Tests/CockpitLocalTransportTests
 git commit -m "feat: add direct workspace control plane"
@@ -431,7 +431,7 @@ Generation 从进程内 1 单调递增，不写数据库。每个异步 UI respo
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
 ```
 
 Expected: 失败，原因是 ActiveContextController 与布局模型不存在。
@@ -443,7 +443,7 @@ ClientCore 只保存稳定 ID 和值类型；不导入 AppKit、XPC 或 SQLite3�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
 /usr/bin/git diff --check
 git add Sources/CockpitClientCore Sources/CockpitLocalTransport/ClientIdentityStore.swift Sources/CockpitHostCore/WorkspaceRepository.swift Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Tests/CockpitClientCoreTests Tests/CockpitLocalTransportTests/ClientIdentityStoreTests.swift Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift
 git commit -m "feat: isolate workspace context state"
@@ -496,7 +496,7 @@ public protocol FileTreeProviding: Sendable {
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter CockpitWorkspaceTests
+/usr/bin/swift test --disable-automatic-resolution --filter CockpitWorkspaceTests
 ```
 
 Expected: 失败，原因是 FileTree provider、event source 和 reconciler 不存在。
@@ -508,7 +508,7 @@ Expected: 失败，原因是 FileTree provider、event source 和 reconciler 不
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter CockpitWorkspaceTests
+/usr/bin/swift test --disable-automatic-resolution --filter CockpitWorkspaceTests
 /usr/bin/git diff --check
 git add Sources/CockpitTypes/WorkspaceModels.swift Sources/CockpitHostCore/FileTreeProviding.swift Sources/CockpitWorkspace Tests/CockpitWorkspaceTests
 git commit -m "feat: add lazy environment file tree"
@@ -562,7 +562,7 @@ public protocol FileOperationServing: Sendable {
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitWorkspaceTests.FileOperationCoordinatorTests|CockpitLocalTransportTests.HostXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.FileOperationCoordinatorTests|CockpitLocalTransportTests.HostXPCTests'
 ```
 
 Expected: 失败，原因是 WorkspaceRootHandle 与文件操作协调器不存在。
@@ -574,7 +574,7 @@ Expected: 失败，原因是 WorkspaceRootHandle 与文件操作协调器不存�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitWorkspaceTests.WorkspaceRootHandleTests|CockpitWorkspaceTests.FileOperationCoordinatorTests|CockpitLocalTransportTests.HostXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.WorkspaceRootHandleTests|CockpitWorkspaceTests.FileOperationCoordinatorTests|CockpitLocalTransportTests.HostXPCTests'
 /usr/bin/git diff --check
 git add Sources/CockpitHostCore Sources/CockpitWorkspace Sources/CockpitLocalTransport Tests/CockpitWorkspaceTests Tests/CockpitLocalTransportTests/HostXPCTests.swift
 git commit -m "feat: manage files inside environment root"
@@ -627,7 +627,7 @@ public struct DecodedDocument: Sendable {
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.DocumentCodecTests|CockpitWorkspaceTests.DocumentRecoveryLogTests|CockpitWorkspaceTests.AtomicFileWriterTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.DocumentCodecTests|CockpitWorkspaceTests.DocumentRecoveryLogTests|CockpitWorkspaceTests.AtomicFileWriterTests'
 ```
 
 Expected: 失败，原因是 codec、recovery log 和 atomic writer 不存在。
@@ -639,7 +639,7 @@ Expected: 失败，原因是 codec、recovery log 和 atomic writer 不存在。
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.DocumentCodecTests|CockpitWorkspaceTests.DocumentRecoveryLogTests|CockpitWorkspaceTests.AtomicFileWriterTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.DocumentCodecTests|CockpitWorkspaceTests.DocumentRecoveryLogTests|CockpitWorkspaceTests.AtomicFileWriterTests'
 /usr/bin/git diff --check
 git add Sources/CockpitProtocol/Proto/cockpit.proto Sources/CockpitProtocol/DocumentMessages.swift Sources/CockpitHostCore/DocumentServing.swift Sources/CockpitWorkspace Tests/CockpitProtocolTests/Phase1MessageTests.swift Tests/CockpitWorkspaceTests
 git commit -m "feat: add recoverable utf8 document storage"
@@ -690,7 +690,7 @@ public actor DocumentActor {
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests'
 ```
 
 Expected: 失败，原因是 DocumentActor、registry 与 client controller 不存在。
@@ -702,7 +702,7 @@ Monaco 本地 edit 在 Host acknowledgement 前只存在于客户端副本；Hos
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests'
 /usr/bin/git diff --check
 git add Sources/CockpitWorkspace Sources/CockpitClientCore Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Tests/CockpitWorkspaceTests Tests/CockpitClientCoreTests
 git commit -m "feat: coordinate authoritative documents"
@@ -766,7 +766,7 @@ JS 测试断言 schema 拒绝未知消息、edit sequence 单调、model 复用�
 
 ```bash
 fnm exec --using 26.7.0 pnpm --dir EditorRuntime test
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter HostDataPlaneTests
+/usr/bin/swift test --disable-automatic-resolution --filter HostDataPlaneTests
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -only-testing:CockpitAppTests/MonacoBridgeTests test
 ```
@@ -784,7 +784,7 @@ WKWebView 禁止任意导航、网络请求和新窗口；只加载签名 App Bu
 ```bash
 fnm exec --using 26.7.0 pnpm --dir EditorRuntime build
 fnm exec --using 26.7.0 pnpm --dir EditorRuntime test
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter HostDataPlaneTests
+/usr/bin/swift test --disable-automatic-resolution --filter HostDataPlaneTests
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -only-testing:CockpitAppTests/MonacoBridgeTests test
 Tests/ProcessIntegrationTests/app-bundle-layout.zsh
@@ -995,7 +995,7 @@ Attach ticket 固定为 30 秒有效、单次消费，并绑定 TerminalSessionI
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'SQLiteTerminalSessionRepositoryTests|WorkerSecretDeriverTests|TerminalAttachTicketTests|InstallationMasterKeyStoreTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'SQLiteTerminalSessionRepositoryTests|WorkerSecretDeriverTests|TerminalAttachTicketTests|InstallationMasterKeyStoreTests'
 ```
 
 Expected: 失败，原因是 terminal store、secret 与 ticket 实现不存在。
@@ -1007,7 +1007,7 @@ Expected: 失败，原因是 terminal store、secret 与 ticket 实现不存在�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'SQLiteTerminalSessionRepositoryTests|WorkerSecretDeriverTests|TerminalAttachTicketTests|InstallationMasterKeyStoreTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'SQLiteTerminalSessionRepositoryTests|WorkerSecretDeriverTests|TerminalAttachTicketTests|InstallationMasterKeyStoreTests'
 /usr/bin/git diff --check
 git add Sources/CockpitTerminalCore Sources/CockpitPersistence Sources/CockpitLocalTransport Tests/CockpitPersistenceTests Tests/CockpitTerminalCoreTests Tests/CockpitLocalTransportTests
 git commit -m "feat: persist authenticated terminal sessions"
@@ -1119,7 +1119,7 @@ PTY 固定使用 `openpty` 取得 master 与 slave path，然后关闭 parent sl
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'AgentExecutableResolverTests|PTYSessionTests|TerminalSupervisorTwoPhaseTests|KeeperControlTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'AgentExecutableResolverTests|PTYSessionTests|TerminalSupervisorTwoPhaseTests|KeeperControlTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -target CockpitPTYKeeper -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation build
 COCKPIT_KEEPER_EXECUTABLE="$PWD/build/Debug/CockpitPTYKeeper" Tests/ProcessIntegrationTests/terminal-pty-exec.zsh
@@ -1134,7 +1134,7 @@ Expected: 失败，原因是 LaunchSpec、真实 PTY 和两阶段 Supervisor 尚
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'AgentExecutableResolverTests|PTYSessionTests|TerminalSupervisorTwoPhaseTests|KeeperControlTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'AgentExecutableResolverTests|PTYSessionTests|TerminalSupervisorTwoPhaseTests|KeeperControlTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -target CockpitPTYKeeper -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation build
 COCKPIT_KEEPER_EXECUTABLE="$PWD/build/Debug/CockpitPTYKeeper" Tests/ProcessIntegrationTests/terminal-pty-exec.zsh
@@ -1189,7 +1189,7 @@ text 直接写 UTF-8；key/paste/mouse 必须调用 Task 11 基于当前 Ghostty
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'KeeperUDSTests|TerminalStreamCoordinatorTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'KeeperUDSTests|TerminalStreamCoordinatorTests'
 ```
 
 Expected: 失败，原因是 UDS server/client 与 stream coordinator 不存在。
@@ -1201,7 +1201,7 @@ Channel 1 只发 snapshot/delta/scrollback，Channel 2 只发 input/resize/ack�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'KeeperUDSTests|TerminalStreamCoordinatorTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'KeeperUDSTests|TerminalStreamCoordinatorTests'
 /usr/bin/git diff --check
 git add Sources/CockpitLocalTransport Sources/CockpitTerminalCore Applications/CockpitPTYKeeper Tests/CockpitLocalTransportTests Tests/CockpitTerminalCoreTests
 git commit -m "feat: stream terminal sessions over keeper uds"
@@ -1245,7 +1245,7 @@ chunk 是不可变、按首 sequence 命名的 Ghostty scrollback frame；`manif
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'TerminalArchiveTests|TerminalReconcilerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'TerminalArchiveTests|TerminalReconcilerTests'
 Tests/ProcessIntegrationTests/terminal-reconciliation.zsh
 ```
 
@@ -1258,7 +1258,7 @@ Supervisor 启动只读取 Committed/Running records，枚举 Task 13 含 endpoi
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'TerminalArchiveTests|TerminalReconcilerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'TerminalArchiveTests|TerminalReconcilerTests'
 Tests/ProcessIntegrationTests/terminal-reconciliation.zsh
 /usr/bin/git diff --check
 git add Sources/CockpitTerminalCore Applications/CockpitPTYKeeper Tests/CockpitTerminalCoreTests Tests/ProcessIntegrationTests/terminal-reconciliation.zsh
@@ -1325,7 +1325,7 @@ public actor TerminalAttachmentController {
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitTerminalClientTests|TerminalSupervisorXPCTests|HostXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitTerminalClientTests|TerminalSupervisorXPCTests|HostXPCTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/GhosttyTerminalViewTests test
 Tests/ProcessIntegrationTests/terminal-app-reattach.zsh
@@ -1340,7 +1340,7 @@ Expected: 失败，原因是正式 XPC API、TerminalClient 和 Metal view 不�
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'CockpitTerminalClientTests|TerminalSupervisorXPCTests|HostXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitTerminalClientTests|TerminalSupervisorXPCTests|HostXPCTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/GhosttyTerminalViewTests test
 Tests/ProcessIntegrationTests/terminal-app-reattach.zsh
@@ -1537,7 +1537,7 @@ Task 19 新增 terminal migration v2 表 `terminal_context_deletions(context_kin
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'ConversationDeletionCoordinatorTests|ContextTerminationTests|TerminalSupervisorXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'ConversationDeletionCoordinatorTests|ContextTerminationTests|TerminalSupervisorXPCTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/ConversationDeletionControllerTests test
 Tests/ProcessIntegrationTests/phase1-conversation-deletion.zsh
@@ -1552,7 +1552,7 @@ Expected: 失败，原因是 deletion saga 与 UI confirmation controller 不存
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --skip-update --filter 'ConversationDeletionCoordinatorTests|ContextTerminationTests|TerminalSupervisorXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'ConversationDeletionCoordinatorTests|ContextTerminationTests|TerminalSupervisorXPCTests'
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/ConversationDeletionControllerTests test
 Tests/ProcessIntegrationTests/phase1-conversation-deletion.zsh
