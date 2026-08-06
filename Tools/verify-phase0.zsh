@@ -50,6 +50,6 @@ COCKPIT_TLS_FIXTURE_DIR="$repo_root/Tests/Fixtures/TLS/generated" /usr/bin/swift
 Tests/ProcessIntegrationTests/service-start-failure-cleanup.zsh
 Tests/ProcessIntegrationTests/service-keeper-foundation.zsh
 "$xcodegen" generate --no-env
-/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData CONFIGURATION_BUILD_DIR="$repo_root/build/Debug" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates build
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$repo_root/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation build
 Tests/ProcessIntegrationTests/app-bundle-layout.zsh
 /usr/bin/git diff --check
