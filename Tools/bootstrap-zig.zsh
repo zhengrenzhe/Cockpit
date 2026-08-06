@@ -101,6 +101,14 @@ owner_is_dead() {
   [[ -z "$current_start" || "$current_start" != "$owner_start" ]] || return 1
 }
 
+owner_metadata_is_well_formed() {
+  local owner_file="$1" owner_pid owner_start
+  [[ -f "$owner_file" && ! -L "$owner_file" ]] || return 1
+  owner_pid=$(/usr/bin/sed -n '1p' "$owner_file")
+  owner_start=$(/usr/bin/sed -n '2p' "$owner_file")
+  [[ "$owner_pid" == <-> && -n "$owner_start" && "$(/usr/bin/wc -l < "$owner_file" | /usr/bin/tr -d ' ')" == "2" ]]
+}
+
 write_owner_metadata() {
   local owner_file="$1" owner_start
   owner_start=$(ps -o lstart= -p "$$" | /usr/bin/sed 's/^ *//')
@@ -137,10 +145,12 @@ prepare_staging_directory() {
 reclaim_dead_owner_candidates() {
   local candidate
   while IFS= read -r candidate; do
-    [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+    [[ ! -L "$candidate" ]] || fail "refusing symlinked Zig owner residue: $candidate"
+    [[ -f "$candidate" ]] || fail "invalid Zig owner residue: $candidate"
     [[ "$(/usr/bin/stat -f %z "$candidate")" == "0" ]] && { /bin/rm -f "$candidate"; continue; }
-    owner_is_dead "$candidate" && rm -f "$candidate"
-  done < <(find "$zig_parent" -maxdepth 1 -type f -name '.bootstrap-owner.*' -print)
+    owner_metadata_is_well_formed "$candidate" || fail "malformed Zig owner residue: $candidate"
+    owner_is_dead "$candidate" && /bin/rm -f "$candidate"
+  done < <(/usr/bin/find "$zig_parent" -maxdepth 1 -name '.bootstrap-owner.*' -print)
 }
 
 reclaim_stale_lock() {
@@ -148,23 +158,25 @@ reclaim_stale_lock() {
   [[ -e "$lock_file" ]] || return 0
   [[ -f "$lock_file" ]] || fail "refusing non-file bootstrap lock: $lock_file"
   [[ "$(/usr/bin/stat -f %z "$lock_file")" == "0" ]] && { /bin/rm -f "$lock_file"; return 0; }
+  owner_metadata_is_well_formed "$lock_file" || fail "malformed bootstrap lock: $lock_file"
   owner_is_dead "$lock_file" || return 1
-  rm -f "$lock_file"
+  /bin/rm -f "$lock_file"
   reclaim_dead_owner_candidates
 }
 
 reclaim_dead_staging_dirs() {
   local candidate owner_file
   while IFS= read -r candidate; do
-    [[ -d "$candidate" && ! -L "$candidate" && "$candidate" == "$zig_parent"/.staging.* ]] || continue
+    [[ ! -L "$candidate" ]] || fail "refusing symlinked Zig staging residue: $candidate"
+    [[ -d "$candidate" && "$candidate" == "$zig_parent"/.staging.* ]] || fail "invalid Zig staging residue: $candidate"
     owner_file="$candidate/.owner"
     if [[ -z "$(/usr/bin/find "$candidate" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
       /bin/rm -rf "$candidate"
       continue
     fi
-    [[ -f "$owner_file" && ! -L "$owner_file" ]] || fail "unowned nonempty Zig staging residue: $candidate"
-    owner_is_dead "$owner_file" && rm -rf "$candidate"
-  done < <(find "$zig_parent" -maxdepth 1 -type d -name '.staging.*' -print)
+    owner_metadata_is_well_formed "$owner_file" || fail "unowned nonempty Zig staging residue: $candidate"
+    owner_is_dead "$owner_file" && /bin/rm -rf "$candidate"
+  done < <(/usr/bin/find "$zig_parent" -maxdepth 1 -name '.staging.*' -print)
 }
 
 reclaim_preparing_paths() {
@@ -180,8 +192,14 @@ reclaim_preparing_paths() {
       /bin/rm -rf "$candidate"
       continue
     fi
-    owner_is_dead "$candidate" && { /bin/rm -rf "$candidate"; continue; }
+    if [[ -f "$candidate" ]]; then
+      owner_metadata_is_well_formed "$candidate" || fail "malformed Zig owner preparation: $candidate"
+      owner_is_dead "$candidate" && { /bin/rm -f "$candidate"; continue; }
+      continue
+    fi
+    owner_metadata_is_well_formed "$candidate/.owner" || fail "malformed Zig staging preparation: $candidate"
     owner_is_dead "$candidate/.owner" && { /bin/rm -rf "$candidate"; continue; }
+    continue
     fail "malformed Zig preparation residue: $candidate"
   done < <(/usr/bin/find "$zig_parent" -maxdepth 1 -name '.preparing.*' -print)
 }

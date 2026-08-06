@@ -59,4 +59,29 @@ set -e
 [[ -z "$(/usr/bin/find "$marker_offline" -mindepth 1 -maxdepth 1 -print -quit)" ]] || fail "PATH-injected command ran for offline fresh install"
 [[ "$("$install_root/zig" version)" == "0.15.2" ]] || fail "offline fresh install Zig version mismatch"
 
+legacy_owner="$zig_parent/.bootstrap-owner.legacy-empty"
+legacy_lock="$zig_parent/.bootstrap-lock"
+legacy_staging="$zig_parent/.staging.legacy-empty"
+/usr/bin/touch "$legacy_owner" "$legacy_lock"
+/bin/mkdir "$legacy_staging"
+"$repo_root/Tools/bootstrap-zig.zsh"
+[[ ! -e "$legacy_owner" && ! -e "$legacy_lock" && ! -e "$legacy_staging" ]] || fail "empty legacy residue was not recovered"
+
+malformed_staging="$zig_parent/.staging.malformed"
+/bin/mkdir "$malformed_staging"
+/usr/bin/touch "$malformed_staging/sentinel"
+set +e
+"$repo_root/Tools/bootstrap-zig.zsh" > /tmp/cockpit-hardening-malformed.stdout 2> /tmp/cockpit-hardening-malformed.stderr
+malformed_rc=$?
+set -e
+[[ "$malformed_rc" != "0" && -f "$malformed_staging/sentinel" ]] || fail "nonempty malformed staging was not conservatively rejected"
+/bin/rm -rf "$malformed_staging"
+
+active_owner="$zig_parent/.bootstrap-owner.active"
+active_start=$(/bin/ps -o lstart= -p "$$" | /usr/bin/sed 's/^ *//')
+/usr/bin/printf '%s\n%s\n' "$$" "$active_start" > "$active_owner"
+"$repo_root/Tools/bootstrap-zig.zsh"
+[[ -f "$active_owner" ]] || fail "active owner was removed"
+/bin/rm -f "$active_owner"
+
 print -- "PATH hardening and offline project archive fallback verified"
