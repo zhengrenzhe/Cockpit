@@ -112,17 +112,17 @@ targets:
           test ! -L "$resources"
           test ! -L "$contents/Library"
           test ! -L "$agents"
-          mkdir -p "$resources" "$agents"
+          /bin/mkdir -p "$resources" "$agents"
           resources=$(/bin/realpath "$resources")
           agents=$(/bin/realpath "$agents")
           test "$resources" = "$contents/Resources"
           test "$agents" = "$contents/Library/LaunchAgents"
           /usr/bin/find "$agents" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +
-          cp "$BUILT_PRODUCTS_DIR/CockpitHost" "$resources/CockpitHost"
-          cp "$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor" "$resources/CockpitTerminalSupervisor"
-          cp "$BUILT_PRODUCTS_DIR/CockpitPTYKeeper" "$resources/CockpitPTYKeeper"
-          cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist" "$agents/"
-          cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist" "$agents/"
+          /bin/cp "$BUILT_PRODUCTS_DIR/CockpitHost" "$resources/CockpitHost"
+          /bin/cp "$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor" "$resources/CockpitTerminalSupervisor"
+          /bin/cp "$BUILT_PRODUCTS_DIR/CockpitPTYKeeper" "$resources/CockpitPTYKeeper"
+          /bin/cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist" "$agents/"
+          /bin/cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist" "$agents/"
           /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost "$resources/CockpitHost"
           /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor "$resources/CockpitTerminalSupervisor"
           /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper "$resources/CockpitPTYKeeper"

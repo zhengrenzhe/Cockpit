@@ -9,6 +9,9 @@ submodule_path="$repo_root/ThirdParty/ghostty"
 tools_root="$repo_root/.tools"
 zig_root="$tools_root/zig/0.15.2"
 zig_binary="$zig_root/zig"
+no_bootstrap=0
+[[ "${1:-}" == --no-bootstrap ]] && { no_bootstrap=1; shift; }
+[[ "$#" == 0 ]] || { print -u2 -- "usage: Tools/verify-ghostty.zsh [--no-bootstrap]"; exit 64; }
 
 fail() {
   print -u2 -- "$1"

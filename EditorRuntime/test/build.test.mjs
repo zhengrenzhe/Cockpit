@@ -21,6 +21,11 @@ import { basename, dirname, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import {
+  evaluateToolchain,
+  parsePnpmUserAgent,
+  parseVersion,
+} from '../toolchain-contract.mjs';
 
 const runtimeRoot = new URL('../', import.meta.url);
 const output = new URL('dist/MonacoRuntime.bundle/', runtimeRoot);
@@ -218,16 +223,54 @@ async function cleanupOwnedArtifactFixture(...paths) {
   }
 }
 
-test('package pins the exact runtime toolchain', async () => {
+test('package declares the supported paired runtime toolchains', async () => {
   const manifest = JSON.parse(
     await readFile(new URL('package.json', runtimeRoot), 'utf8'),
   );
   assert.equal(manifest.packageManager, 'pnpm@11.20.0');
-  assert.deepEqual(manifest.engines, { node: '26.7.0', pnpm: '11.20.0' });
+  assert.deepEqual(manifest.engines, {
+    node: '25.9.0 || 26.7.0',
+    pnpm: '9.15.9 || 11.20.0',
+  });
   assert.deepEqual(manifest.dependencies, { 'monaco-editor': '0.56.0' });
   assert.deepEqual(manifest.devDependencies, { esbuild: '0.28.1' });
-  assert.equal(process.versions.node, '26.7.0');
-  assert.match(process.env.npm_config_user_agent ?? '', /^pnpm\/11\.20\.0\b/);
+});
+
+test('toolchain contract accepts only supported paired profile boundaries', () => {
+  const accepted = [
+    ['25.9.0', 'pnpm/9.15.9 npm/? node/v25.9.0 darwin arm64'],
+    ['26.7.0', 'pnpm/11.20.0 npm/? node/v26.7.0 darwin arm64'],
+  ];
+  for (const [nodeVersion, userAgent] of accepted) {
+    assert.deepEqual(evaluateToolchain({ nodeVersion, userAgent }), { ok: true });
+  }
+});
+
+test('toolchain contract rejects unpaired, unsupported, and malformed versions', () => {
+  const rejected = [
+    ['25.9.0', 'pnpm/11.20.0 npm/? node/v25.9.0 darwin arm64'],
+    ['26.7.0', 'pnpm/9.15.9 npm/? node/v26.7.0 darwin arm64'],
+    ['26.6.99', 'pnpm/11.20.0 npm/? node/v26.6.99 darwin arm64'],
+    ['27.0.0', 'pnpm/11.20.0 npm/? node/v27.0.0 darwin arm64'],
+    ['25.8.99', 'pnpm/9.15.9 npm/? node/v25.8.99 darwin arm64'],
+    ['25.9.1', 'pnpm/9.15.9 npm/? node/v25.9.1 darwin arm64'],
+    ['26.7.1', 'pnpm/11.20.0 npm/? node/v26.7.1 darwin arm64'],
+    ['25.9.0', 'pnpm/9.15.8 npm/? node/v25.9.0 darwin arm64'],
+    ['25.9.0', 'pnpm/10.0.0 npm/? node/v25.9.0 darwin arm64'],
+    ['26.7.0', 'pnpm/11.19.99 npm/? node/v26.7.0 darwin arm64'],
+    ['26.7.0', 'pnpm/12.0.0 npm/? node/v26.7.0 darwin arm64'],
+    ['26.7.0', ''],
+    ['26.7.0', 'npm/11.20.0'],
+    ['26.7.0', 'pnpm/not-a-version'],
+    ['v26.7', 'pnpm/11.20.0 npm/?'],
+  ];
+  for (const [nodeVersion, userAgent] of rejected) {
+    assert.equal(evaluateToolchain({ nodeVersion, userAgent }).ok, false, `${nodeVersion} / ${userAgent}`);
+  }
+  assert.deepEqual(parseVersion('v25.9.0'), { major: 25, minor: 9, patch: 0 });
+  assert.equal(parseVersion('25.9'), null);
+  assert.deepEqual(parsePnpmUserAgent('pnpm/11.20.0 npm/?'), { major: 11, minor: 20, patch: 0 });
+  assert.equal(parsePnpmUserAgent('pnpm/11.20.0'), null);
 });
 
 test('build emits a self-contained local editor bundle', async () => {

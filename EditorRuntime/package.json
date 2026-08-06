@@ -4,12 +4,12 @@
   "version": "0.0.1",
   "packageManager": "pnpm@11.20.0",
   "engines": {
-    "node": "26.7.0",
-    "pnpm": "11.20.0"
+    "node": "25.9.0 || 26.7.0",
+    "pnpm": "9.15.9 || 11.20.0"
   },
   "type": "module",
   "scripts": {
-    "check:tools": "node --input-type=module -e \"const ua = process.env.npm_config_user_agent ?? ''; if (process.versions.node !== '26.7.0') throw new Error('Node 26.7.0 required'); if (!ua.startsWith('pnpm/11.20.0 ')) throw new Error('pnpm 11.20.0 required')\"",
+    "check:tools": "node check-tools.mjs",
     "prebuild": "pnpm run check:tools",
     "build": "node build.mjs",
     "pretest": "pnpm run check:tools",

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=${0:A:h:h}
 fixture_dir="$repo_root/.build/phase0-launchagents"
 service_root_record="$fixture_dir/service-root.path"
-domain="gui/$(id -u)"
+domain="gui/$(/usr/bin/id -u)"
 
 stop_service() {
   /bin/launchctl bootout "$domain/$1" >/dev/null 2>&1 || true
@@ -24,7 +24,7 @@ cleanup_service_path() {
   [[ "${cleanup_root:h}" == /private/tmp ]]
   [[ -e "$cleanup_root" ]] || return 0
   [[ -d "$cleanup_root" && ! -L "$cleanup_root" ]]
-  [[ "$(/usr/bin/stat -f %u "$cleanup_root")" == "$(id -u)" ]]
+  [[ "$(/usr/bin/stat -f %u "$cleanup_root")" == "$(/usr/bin/id -u)" ]]
   /bin/rm -rf -- "$cleanup_root"
   [[ ! -e "$cleanup_root" ]]
 }
@@ -52,7 +52,7 @@ render_terminal() {
 
 case "${1:-}" in
   start)
-    swift build --package-path "$repo_root"
+    /usr/bin/swift build --package-path "$repo_root" --disable-automatic-resolution --skip-update --no-parallel
     /bin/mkdir -p "$fixture_dir"
 
     stop_service dev.cockpit.host.local

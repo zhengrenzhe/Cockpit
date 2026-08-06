@@ -29,8 +29,8 @@ if [[ -d "$output" ]]; then
     fi
 fi
 
-rm -rf -- "$output"
-mkdir -p "$output"
+/bin/rm -rf -- "$output"
+/bin/mkdir -p "$output"
 /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$output/key.pem" \
   -out "$output/certificate.pem" \

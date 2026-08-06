@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=${0:A:h:h:h}
-domain="gui/$(id -u)"
+domain="gui/$(/usr/bin/id -u)"
 keeper_pid=""
 
 cleanup() {

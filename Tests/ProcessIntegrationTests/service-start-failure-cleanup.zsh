@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=${0:A:h:h:h}
-domain="gui/$(id -u)"
+domain="gui/$(/usr/bin/id -u)"
 service_root_record="$repo_root/.build/phase0-launchagents/service-root.path"
 
 cleanup() {
