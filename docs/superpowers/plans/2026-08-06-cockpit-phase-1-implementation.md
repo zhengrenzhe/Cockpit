@@ -124,7 +124,7 @@ CockpitLocalTransport -> CockpitClientCore + CockpitHostCore + CockpitProtocol +
 ```bash
 /usr/bin/swift test --disable-automatic-resolution --filter 'CockpitPersistenceTests|CockpitWorkspaceTests|CockpitTerminalClientTests'
 xcodegen generate --no-env
-/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/AppTestScaffoldTests test
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation -only-testing:CockpitAppTests/AppTestScaffoldTests test
 ```
 
 Expected: Swift 测试进入新 test targets 后，因 `CockpitStorageLocations` 尚未实现而编译失败；App scaffold 测试通过并证明 test host/scheme 已接通。
@@ -163,7 +163,7 @@ Expected: 与本计划 Tech Stack 完全一致；Ghostty commit 和 Zig 0.15.2 �
 ```bash
 /usr/bin/swift test --disable-automatic-resolution --filter 'CockpitPersistenceTests|CockpitWorkspaceTests|CockpitTerminalClientTests'
 xcodegen generate --no-env
-/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -only-testing:CockpitAppTests/AppTestScaffoldTests test
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation -only-testing:CockpitAppTests/AppTestScaffoldTests test
 /usr/bin/git diff --check
 git add Package.swift project.yml Cockpit.xcodeproj Cockpit.xcworkspace Sources/CockpitPersistence Sources/CockpitWorkspace Sources/CockpitTerminalClient Tests/CockpitPersistenceTests Tests/CockpitWorkspaceTests Tests/CockpitTerminalClientTests Tests/CockpitAppTests/AppTestScaffoldTests.swift
 git commit -m "build: add phase 1 module boundaries"
