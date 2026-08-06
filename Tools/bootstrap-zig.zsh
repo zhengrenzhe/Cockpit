@@ -55,6 +55,7 @@ staging_dir=''
 temp_dir=''
 lock_file="$zig_parent/.bootstrap-lock"
 lock_candidate=''
+preparing_path=''
 lock_owned=0
 
 is_physical_directory_or_absent() {
@@ -108,6 +109,31 @@ write_owner_metadata() {
   [[ -f "$owner_file" && ! -L "$owner_file" ]] || fail "could not create Zig bootstrap owner metadata"
 }
 
+prepare_owner_candidate() {
+  local candidate
+  preparing_path=$(/usr/bin/mktemp "$zig_parent/.preparing.owner.XXXXXX")
+  [[ -f "$preparing_path" && ! -L "$preparing_path" ]] || fail "invalid Zig owner preparation"
+  /bin/chmod 600 "$preparing_path"
+  write_owner_metadata "$preparing_path"
+  candidate="$zig_parent/.bootstrap-owner.$(/usr/bin/uuidgen)"
+  /bin/mv "$preparing_path" "$candidate"
+  preparing_path=''
+  [[ -f "$candidate" && ! -L "$candidate" ]] || fail "owner candidate publication failed"
+  print -r -- "$candidate"
+}
+
+prepare_staging_directory() {
+  local candidate
+  preparing_path=$(/usr/bin/mktemp -d "$zig_parent/.preparing.staging.XXXXXX")
+  [[ -d "$preparing_path" && ! -L "$preparing_path" ]] || fail "invalid Zig staging preparation"
+  write_owner_metadata "$preparing_path/.owner"
+  candidate="$zig_parent/.staging.$(/usr/bin/uuidgen)"
+  /bin/mv "$preparing_path" "$candidate"
+  preparing_path=''
+  [[ -d "$candidate" && ! -L "$candidate" && -f "$candidate/.owner" && ! -L "$candidate/.owner" ]] || fail "staging publication failed"
+  print -r -- "$candidate"
+}
+
 reclaim_dead_owner_candidates() {
   local candidate
   while IFS= read -r candidate; do
@@ -141,16 +167,32 @@ reclaim_dead_staging_dirs() {
   done < <(find "$zig_parent" -maxdepth 1 -type d -name '.staging.*' -print)
 }
 
+reclaim_preparing_paths() {
+  local candidate
+  while IFS= read -r candidate; do
+    [[ ! -L "$candidate" ]] || fail "refusing symlinked Zig preparation: $candidate"
+    [[ "$candidate" == "$zig_parent"/.preparing.* ]] || fail "invalid Zig preparation: $candidate"
+    if [[ -f "$candidate" && "$(/usr/bin/stat -f %z "$candidate")" == "0" ]]; then
+      /bin/rm -f "$candidate"
+      continue
+    fi
+    if [[ -d "$candidate" && -z "$(/usr/bin/find "$candidate" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      /bin/rm -rf "$candidate"
+      continue
+    fi
+    owner_is_dead "$candidate" && { /bin/rm -rf "$candidate"; continue; }
+    owner_is_dead "$candidate/.owner" && { /bin/rm -rf "$candidate"; continue; }
+    fail "malformed Zig preparation residue: $candidate"
+  done < <(/usr/bin/find "$zig_parent" -maxdepth 1 -name '.preparing.*' -print)
+}
+
 acquire_publish_lock() {
   local attempt=0
   while true; do
-    lock_candidate=$(mktemp "$zig_parent/.bootstrap-owner.XXXXXX")
-    [[ -f "$lock_candidate" && ! -L "$lock_candidate" ]] || fail "invalid Zig lock candidate"
-    if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_CANDIDATE_CREATED:-}" == "1" ]]; then
+    lock_candidate=$(prepare_owner_candidate)
+    if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_CANDIDATE_PUBLISHED:-}" == "1" ]]; then
       kill -KILL "$$"
     fi
-    chmod 600 "$lock_candidate"
-    write_owner_metadata "$lock_candidate"
     if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_BEFORE_ACQUIRE:-}" == "1" ]]; then
       kill -KILL "$$"
     fi
@@ -193,6 +235,7 @@ for tool_path in "$tools_root" "$zig_parent"; do
 done
 reclaim_dead_owner_candidates
 reclaim_dead_staging_dirs
+reclaim_preparing_paths
 if [[ -e "$lock_file" || -L "$lock_file" ]]; then
   reclaim_stale_lock || true
 fi
@@ -240,12 +283,10 @@ extracted_root="$temp_dir/$archive_root"
 /usr/bin/codesign --verify --strict "$extracted_root/zig" >/dev/null
 [[ "$("$extracted_root/zig" version)" == "$ZIG_VERSION" ]] || fail "extracted Zig version mismatch"
 
-staging_dir=$(mktemp -d "$zig_parent/.staging.XXXXXX")
-[[ -d "$staging_dir" && ! -L "$staging_dir" && "$staging_dir" == "$zig_parent"/.staging.* ]] || fail "invalid Zig staging directory"
-if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_STAGING_CREATED:-}" == "1" ]]; then
+staging_dir=$(prepare_staging_directory)
+if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_STAGING_PUBLISHED:-}" == "1" ]]; then
   kill -KILL "$$"
 fi
-write_owner_metadata "$staging_dir/.owner"
 mv "$extracted_root" "$staging_dir/payload"
 [[ -d "$staging_dir/payload" && ! -L "$staging_dir/payload" ]] || fail "invalid Zig staging payload"
 [[ -x "$staging_dir/payload/zig" && ! -L "$staging_dir/payload/zig" ]] || fail "staged Zig compiler is not physical"
