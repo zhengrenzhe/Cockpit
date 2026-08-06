@@ -99,3 +99,27 @@ private func documentUUID(_ suffix: Int) throws -> UUID {
     }
 }
 
+@Test func textPositionCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let data = try #require(#"{"line":0,"column":1}"#.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.zeroTextPosition) {
+        _ = try JSONDecoder().decode(TextPosition.self, from: data)
+    }
+}
+
+@Test func documentViewStateCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let invalidScroll = try #require("""
+    {"cursor":{"line":1,"column":1},"selections":[],
+     "firstVisibleLine":1,"horizontalScrollOffset":-1}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidHorizontalScrollOffset) {
+        _ = try JSONDecoder().decode(DocumentViewState.self, from: invalidScroll)
+    }
+
+    let zeroFirstVisibleLine = try #require("""
+    {"cursor":{"line":1,"column":1},"selections":[],
+     "firstVisibleLine":0,"horizontalScrollOffset":0}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.zeroTextPosition) {
+        _ = try JSONDecoder().decode(DocumentViewState.self, from: zeroFirstVisibleLine)
+    }
+}

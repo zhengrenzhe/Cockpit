@@ -95,3 +95,52 @@ private func workspaceID(_ suffix: Int) throws -> UUID {
     }
 }
 
+@Test func activeContextCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let zeroGeneration = try #require("""
+    {"contextID":{"project":{"rawValue":"00000000-0000-0000-0000-000000000020"}},
+     "projectID":{"rawValue":"00000000-0000-0000-0000-000000000020"},
+     "environmentID":{"rawValue":"00000000-0000-0000-0000-000000000021"},
+     "workspaceRootIdentity":"root","generation":0}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.zeroActiveContextGeneration) {
+        _ = try JSONDecoder().decode(ActiveContext.self, from: zeroGeneration)
+    }
+
+    let emptyRoot = try #require("""
+    {"contextID":{"project":{"rawValue":"00000000-0000-0000-0000-000000000020"}},
+     "projectID":{"rawValue":"00000000-0000-0000-0000-000000000020"},
+     "environmentID":{"rawValue":"00000000-0000-0000-0000-000000000021"},
+     "workspaceRootIdentity":"","generation":1}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.emptyWorkspaceRootIdentity) {
+        _ = try JSONDecoder().decode(ActiveContext.self, from: emptyRoot)
+    }
+}
+
+@Test func requestContextCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let invalidVersion = try #require("""
+    {"protocolVersion":{"major":0,"minor":1},
+     "clientInstanceID":{"rawValue":"00000000-0000-0000-0000-000000000022"},
+     "windowID":{"rawValue":"00000000-0000-0000-0000-000000000023"},
+     "workspaceContextID":{"project":{"rawValue":"00000000-0000-0000-0000-000000000024"}},
+     "environmentID":{"rawValue":"00000000-0000-0000-0000-000000000025"},
+     "activeContextGeneration":17,
+     "requestID":{"rawValue":"00000000-0000-0000-0000-000000000026"}}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidProtocolVersion) {
+        _ = try JSONDecoder().decode(RequestContext.self, from: invalidVersion)
+    }
+
+    let zeroGeneration = try #require("""
+    {"protocolVersion":{"major":1,"minor":1},
+     "clientInstanceID":{"rawValue":"00000000-0000-0000-0000-000000000022"},
+     "windowID":{"rawValue":"00000000-0000-0000-0000-000000000023"},
+     "workspaceContextID":{"project":{"rawValue":"00000000-0000-0000-0000-000000000024"}},
+     "environmentID":{"rawValue":"00000000-0000-0000-0000-000000000025"},
+     "activeContextGeneration":0,
+     "requestID":{"rawValue":"00000000-0000-0000-0000-000000000026"}}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.zeroActiveContextGeneration) {
+        _ = try JSONDecoder().decode(RequestContext.self, from: zeroGeneration)
+    }
+}

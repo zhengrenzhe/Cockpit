@@ -31,6 +31,33 @@ private func terminalInput(_ payload: TerminalInput.Payload, sequence: UInt64 = 
     )
 }
 
+private func archiveMessageForMalformedTests() throws -> CPTerminalArchiveManifest {
+    let digest = try SHA256Digest(validating: Data(repeating: 0x44, count: 32))
+    let first = try TerminalArchiveChunk(
+        validatingName: "00000000000000000001.ckgs",
+        firstOutputSequence: 1,
+        lastOutputSequence: 10,
+        sha256: digest
+    )
+    let second = try TerminalArchiveChunk(
+        validatingName: "00000000000000000021.ckgs",
+        firstOutputSequence: 21,
+        lastOutputSequence: 25,
+        sha256: digest
+    )
+    let manifest = try TerminalArchiveManifest(
+        validatingTerminalSessionID: TerminalSessionID(try protocolUUID(40)),
+        workerInstanceID: WorkerInstanceID(try protocolUUID(41)),
+        firstOutputSequence: 1,
+        latestOutputSequence: 30,
+        chunks: [first, second],
+        finalSnapshotSHA256: digest,
+        exitStatus: .exited(0),
+        completedAt: Date(timeIntervalSince1970: 1_700_000_000)
+    )
+    return try TerminalMessages.encode(manifest, negotiatedVersion: protocol11)
+}
+
 @Test func workspaceContextAndRequestContextRoundTripAllContextKindsAndGenerations() throws {
     let project = ProjectID(try protocolUUID(10))
     let conversation = ConversationID(try protocolUUID(11))
@@ -185,6 +212,127 @@ private func terminalInput(_ payload: TerminalInput.Payload, sequence: UInt64 = 
     }
 }
 
+@Test func terminalInputDecoderRejectsEveryFrozenMalformedPayload() throws {
+    var message = try TerminalMessages.encode(
+        try terminalInput(.text("valid")), channelID: .terminalInput,
+        negotiatedVersion: protocol11
+    )
+    message.text = ""
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_input")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+
+    message = try TerminalMessages.encode(
+        try terminalInput(.paste("valid")), channelID: .terminalInput,
+        negotiatedVersion: protocol11
+    )
+    message.paste = ""
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_input")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+
+    let key = try TerminalKeyEvent(
+        validatingLogicalKey: 65, physicalKey: 4, modifiers: 0, action: .press
+    )
+    message = try TerminalMessages.encode(
+        try terminalInput(.key(key)), channelID: .terminalInput,
+        negotiatedVersion: protocol11
+    )
+    message.key.logicalKey = 0
+    message.key.physicalKey = 0
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_key")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+    message.key.logicalKey = 0xD800
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_key")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+    message.key.logicalKey = 65
+    message.key.modifiers = 1 << 10
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_key")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+
+    let mouse = try TerminalMouseEvent(
+        validatingCellX: 0, cellY: 0, buttons: 0, wheelX: 0,
+        wheelY: 0, modifiers: 0, action: .motion
+    )
+    message = try TerminalMessages.encode(
+        try terminalInput(.mouse(mouse)), channelID: .terminalInput,
+        negotiatedVersion: protocol11
+    )
+    message.mouse.action = .UNRECOGNIZED(99)
+    #expect(throws: ProtocolMappingError.unknownEnum(field: "terminal_mouse.action", rawValue: 99)) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+    message.mouse.action = .motion
+    message.mouse.buttons = 1 << 11
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_mouse")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+    message.mouse.buttons = 0
+    message.mouse.wheelX = 1
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_mouse")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+    message.mouse.action = .scroll
+    message.mouse.wheelX = 0
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_mouse")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+
+    message = try TerminalMessages.encode(
+        try terminalInput(.resize(try TerminalResize(validatingColumns: 80, rows: 24))),
+        channelID: .terminalInput, negotiatedVersion: protocol11
+    )
+    message.resize.columns = 0
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_resize")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+
+    message = try TerminalMessages.encode(
+        try terminalInput(.signal(.interrupt)), channelID: .control,
+        negotiatedVersion: protocol11
+    )
+    message.signal = .UNRECOGNIZED(99)
+    #expect(throws: ProtocolMappingError.unknownEnum(field: "terminal_signal", rawValue: 99)) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .control, negotiatedVersion: protocol11
+        )
+    }
+
+    message = try TerminalMessages.encode(
+        try terminalInput(.text("valid")), channelID: .terminalInput,
+        negotiatedVersion: protocol11
+    )
+    message.terminalSessionID = "invalid-terminal-id"
+    #expect(throws: ProtocolMappingError.invalidIdentifier("terminal_session_id")) {
+        _ = try TerminalMessages.decode(
+            message, channelID: .terminalInput, negotiatedVersion: protocol11
+        )
+    }
+}
+
 @Test func terminalInputDecoderRejectsUnknownEnumBeforeMappingIdentifiers() throws {
     let key = try TerminalKeyEvent(
         validatingLogicalKey: 65, physicalKey: 4, modifiers: 0, action: .press
@@ -313,6 +461,106 @@ private func terminalInput(_ payload: TerminalInput.Payload, sequence: UInt64 = 
     message.chunks[0] = try CPTerminalArchiveChunk(serializedBytes: chunkBytes)
     message.clearExitStatus()
     #expect(throws: ProtocolMappingError.unknownFields("terminal_archive_chunk")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+}
+
+@Test func archiveDecoderRejectsEveryFrozenMalformedField() throws {
+    var message = try archiveMessageForMalformedTests()
+    message.terminalSessionID = "invalid-terminal-id"
+    #expect(throws: ProtocolMappingError.invalidIdentifier("terminal_session_id")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.workerInstanceID = "invalid-worker-id"
+    #expect(throws: ProtocolMappingError.invalidIdentifier("worker_instance_id")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.chunks[0].sha256 = Data(repeating: 0, count: 31)
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_archive_chunk.sha256")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.clearExitStatus()
+    #expect(throws: ProtocolMappingError.missingRequiredField("exit_status")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.clearCompletedAt()
+    #expect(throws: ProtocolMappingError.missingRequiredField("completed_at")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    for signal in [Int32(0), 32] {
+        message = try archiveMessageForMalformedTests()
+        message.exitStatus.darwinSignal = signal
+        #expect(throws: ProtocolMappingError.invalidValue("terminal_exit_status")) {
+            _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+        }
+    }
+
+    for nanos in [Int32(-1), 1_000_000_000] {
+        message = try archiveMessageForMalformedTests()
+        message.completedAt.nanos = nanos
+        #expect(throws: ProtocolMappingError.invalidValue("completed_at")) {
+            _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+        }
+    }
+    message = try archiveMessageForMalformedTests()
+    message.completedAt.seconds = -62_135_596_801
+    #expect(throws: ProtocolMappingError.invalidValue("completed_at")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.chunks.swapAt(0, 1)
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_archive_manifest")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.chunks[1].name = "00000000000000000005.ckgs"
+    message.chunks[1].firstOutputSequence = 5
+    message.chunks[1].lastOutputSequence = 15
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_archive_manifest")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.chunks[1].lastOutputSequence = 31
+    #expect(throws: ProtocolMappingError.invalidValue("terminal_archive_manifest")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    #expect(throws: CockpitDomainValidationError.invalidTerminalExitStatus) {
+        _ = try JSONEncoder().encode(TerminalExitStatus.signaled(0))
+    }
+}
+
+@Test func archiveDecoderAppliesFrozenValidationOrderToCombinedFailures() throws {
+    var message = try archiveMessageForMalformedTests()
+    message.exitStatus.result = nil
+    message.terminalSessionID = "invalid-terminal-id"
+    message.workerInstanceID = "invalid-worker-id"
+    message.completedAt.seconds = 253_402_300_800
+    message.finalSnapshotSha256 = Data(repeating: 0, count: 31)
+    message.chunks[0].name = "/absolute.ckgs"
+    #expect(throws: ProtocolMappingError.unknownOneOf("terminal_exit_status.result")) {
+        _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
+    }
+
+    message = try archiveMessageForMalformedTests()
+    message.terminalSessionID = "invalid-terminal-id"
+    message.workerInstanceID = "invalid-worker-id"
+    message.completedAt.seconds = 253_402_300_800
+    message.finalSnapshotSha256 = Data(repeating: 0, count: 31)
+    message.chunks[0].name = "/absolute.ckgs"
+    #expect(throws: ProtocolMappingError.invalidIdentifier("terminal_session_id")) {
         _ = try TerminalMessages.decode(message, negotiatedVersion: protocol11)
     }
 }

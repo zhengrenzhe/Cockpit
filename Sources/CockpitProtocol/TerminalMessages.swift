@@ -115,8 +115,18 @@ public enum TerminalMessages {
             try rejectUnknownFields(chunk.unknownFields.data, field: "terminal_archive_chunk")
         }
         guard message.hasExitStatus else { throw ProtocolMappingError.missingRequiredField("exit_status") }
+        guard message.exitStatus.result != nil else {
+            throw ProtocolMappingError.unknownOneOf("terminal_exit_status.result")
+        }
         guard message.hasCompletedAt else { throw ProtocolMappingError.missingRequiredField("completed_at") }
+        let terminalSessionID: TerminalSessionID = try decodeID(
+            message.terminalSessionID, field: "terminal_session_id"
+        )
+        let workerInstanceID: WorkerInstanceID = try decodeID(
+            message.workerInstanceID, field: "worker_instance_id"
+        )
         guard isValid(message.completedAt) else { throw ProtocolMappingError.invalidValue("completed_at") }
+        let completedAt = message.completedAt.date
         let chunks = try message.chunks.map(decodeChunk)
         let digest: SHA256Digest
         do { digest = try SHA256Digest(validating: message.finalSnapshotSha256) }
@@ -124,14 +134,14 @@ public enum TerminalMessages {
         let exitStatus = try decodeExitStatus(message.exitStatus)
         do {
             return try TerminalArchiveManifest(
-                validatingTerminalSessionID: decodeID(message.terminalSessionID, field: "terminal_session_id"),
-                workerInstanceID: decodeID(message.workerInstanceID, field: "worker_instance_id"),
+                validatingTerminalSessionID: terminalSessionID,
+                workerInstanceID: workerInstanceID,
                 firstOutputSequence: message.firstOutputSequence,
                 latestOutputSequence: message.latestOutputSequence,
                 chunks: chunks,
                 finalSnapshotSHA256: digest,
                 exitStatus: exitStatus,
-                completedAt: message.completedAt.date
+                completedAt: completedAt
             )
         } catch let error as ProtocolMappingError {
             throw error

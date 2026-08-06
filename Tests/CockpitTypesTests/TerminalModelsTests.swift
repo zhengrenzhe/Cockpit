@@ -142,3 +142,145 @@ private func makeTerminalRequestContext() throws -> RequestContext {
         requestID: RequestID(try terminalUUID(5))
     )
 }
+
+@Test func terminalKeyEventCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let invalidIdentity = try #require("""
+    {"logicalKey":0,"physicalKey":0,"modifiers":0,"action":1}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalKeyIdentity) {
+        _ = try JSONDecoder().decode(TerminalKeyEvent.self, from: invalidIdentity)
+    }
+
+    let invalidLogicalKey = try #require("""
+    {"logicalKey":55296,"physicalKey":4,"modifiers":0,"action":1}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalLogicalKey) {
+        _ = try JSONDecoder().decode(TerminalKeyEvent.self, from: invalidLogicalKey)
+    }
+
+    let invalidModifiers = try #require("""
+    {"logicalKey":65,"physicalKey":4,"modifiers":1024,"action":1}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalModifiers) {
+        _ = try JSONDecoder().decode(TerminalKeyEvent.self, from: invalidModifiers)
+    }
+}
+
+@Test func terminalMouseEventCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let invalidButtons = try #require("""
+    {"cellX":0,"cellY":0,"buttons":2048,"wheelX":0,"wheelY":0,
+     "modifiers":0,"action":3}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalMouseButtons) {
+        _ = try JSONDecoder().decode(TerminalMouseEvent.self, from: invalidButtons)
+    }
+
+    let invalidWheel = try #require("""
+    {"cellX":0,"cellY":0,"buttons":0,"wheelX":1,"wheelY":0,
+     "modifiers":0,"action":3}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalMouseWheel) {
+        _ = try JSONDecoder().decode(TerminalMouseEvent.self, from: invalidWheel)
+    }
+
+    let invalidModifiers = try #require("""
+    {"cellX":0,"cellY":0,"buttons":0,"wheelX":0,"wheelY":0,
+     "modifiers":1024,"action":3}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalModifiers) {
+        _ = try JSONDecoder().decode(TerminalMouseEvent.self, from: invalidModifiers)
+    }
+}
+
+@Test func terminalResizeCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let data = try #require(#"{"columns":0,"rows":24}"#.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalResize) {
+        _ = try JSONDecoder().decode(TerminalResize.self, from: data)
+    }
+}
+
+@Test func terminalArchiveLeafCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let shortDigest = Data(repeating: 0, count: 31).base64EncodedString()
+    let digestData = try #require("\"\(shortDigest)\"".data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidSHA256DigestLength) {
+        _ = try JSONDecoder().decode(SHA256Digest.self, from: digestData)
+    }
+
+    let validDigest = Data(repeating: 0, count: 32).base64EncodedString()
+    let invalidChunkName = try #require("""
+    {"name":"/absolute.ckgs","firstOutputSequence":1,"lastOutputSequence":10,
+     "sha256":"\(validDigest)"}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalArchiveChunkName) {
+        _ = try JSONDecoder().decode(TerminalArchiveChunk.self, from: invalidChunkName)
+    }
+
+    let invalidChunkRange = try #require("""
+    {"name":"00000000000000000002.ckgs","firstOutputSequence":2,
+     "lastOutputSequence":1,"sha256":"\(validDigest)"}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalArchiveChunkRange) {
+        _ = try JSONDecoder().decode(TerminalArchiveChunk.self, from: invalidChunkRange)
+    }
+
+    let invalidExitStatus = try #require("""
+    {"kind":"signaled","value":0}
+    """.data(using: .utf8))
+    #expect(throws: CockpitDomainValidationError.invalidTerminalExitStatus) {
+        _ = try JSONDecoder().decode(TerminalExitStatus.self, from: invalidExitStatus)
+    }
+}
+
+@Test func terminalArchiveManifestCodableRejectsInvalidPersistedValuesWithDomainErrors() throws {
+    let digest = try SHA256Digest(validating: Data(repeating: 0x55, count: 32))
+    let chunk = try TerminalArchiveChunk(
+        validatingName: "00000000000000000001.ckgs",
+        firstOutputSequence: 1,
+        lastOutputSequence: 10,
+        sha256: digest
+    )
+    let manifest = try TerminalArchiveManifest(
+        validatingTerminalSessionID: TerminalSessionID(try terminalUUID(50)),
+        workerInstanceID: WorkerInstanceID(try terminalUUID(51)),
+        firstOutputSequence: 1,
+        latestOutputSequence: 30,
+        chunks: [chunk],
+        finalSnapshotSHA256: digest,
+        exitStatus: .exited(0),
+        completedAt: Date(timeIntervalSince1970: 1_700_000_000)
+    )
+
+    var object = try terminalJSONObject(manifest)
+    object["firstOutputSequence"] = 0
+    #expect(throws: CockpitDomainValidationError.invalidTerminalArchiveRange) {
+        _ = try JSONDecoder().decode(
+            TerminalArchiveManifest.self, from: terminalJSONData(object)
+        )
+    }
+
+    object = try terminalJSONObject(manifest)
+    let chunks = try #require(object["chunks"] as? [[String: Any]])
+    object["chunks"] = [chunks[0], chunks[0]]
+    #expect(throws: CockpitDomainValidationError.invalidTerminalArchiveChunks) {
+        _ = try JSONDecoder().decode(
+            TerminalArchiveManifest.self, from: terminalJSONData(object)
+        )
+    }
+
+    object = try terminalJSONObject(manifest)
+    object["completedAt"] = 1.0e20
+    #expect(throws: CockpitDomainValidationError.invalidTerminalArchiveCompletionDate) {
+        _ = try JSONDecoder().decode(
+            TerminalArchiveManifest.self, from: terminalJSONData(object)
+        )
+    }
+}
+
+private func terminalJSONObject<T: Encodable>(_ value: T) throws -> [String: Any] {
+    let encoded = try JSONEncoder().encode(value)
+    return try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+}
+
+private func terminalJSONData(_ object: Any) throws -> Data {
+    try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+}
