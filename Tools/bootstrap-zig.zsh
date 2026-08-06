@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 script_path=${0:P}
 repo_root=${script_path:h:h}
@@ -46,6 +47,8 @@ source "$manifest"
 
 tools_root="$repo_root/.tools"
 zig_parent="$tools_root/zig"
+archive_dir="$tools_root/archives"
+project_archive="$archive_dir/zig-aarch64-macos-0.15.2.tar.xz"
 install_root="$zig_parent/$ZIG_VERSION"
 zig_binary="$install_root/zig"
 staging_dir=''
@@ -63,7 +66,7 @@ is_physical_directory_or_absent() {
 validate_installed_compiler() {
   [[ -d "$install_root" && ! -L "$install_root" ]] || return 1
   [[ -x "$zig_binary" && ! -L "$zig_binary" ]] || return 1
-  codesign --verify --strict "$zig_binary" >/dev/null 2>&1 || return 1
+  /usr/bin/codesign --verify --strict "$zig_binary" >/dev/null 2>&1 || return 1
   [[ "$("$zig_binary" version)" == "$ZIG_VERSION" ]]
 }
 
@@ -109,6 +112,7 @@ reclaim_dead_owner_candidates() {
   local candidate
   while IFS= read -r candidate; do
     [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+    [[ "$(/usr/bin/stat -f %z "$candidate")" == "0" ]] && { /bin/rm -f "$candidate"; continue; }
     owner_is_dead "$candidate" && rm -f "$candidate"
   done < <(find "$zig_parent" -maxdepth 1 -type f -name '.bootstrap-owner.*' -print)
 }
@@ -117,6 +121,7 @@ reclaim_stale_lock() {
   [[ ! -L "$lock_file" ]] || fail "refusing symlinked bootstrap lock: $lock_file"
   [[ -e "$lock_file" ]] || return 0
   [[ -f "$lock_file" ]] || fail "refusing non-file bootstrap lock: $lock_file"
+  [[ "$(/usr/bin/stat -f %z "$lock_file")" == "0" ]] && { /bin/rm -f "$lock_file"; return 0; }
   owner_is_dead "$lock_file" || return 1
   rm -f "$lock_file"
   reclaim_dead_owner_candidates
@@ -127,6 +132,11 @@ reclaim_dead_staging_dirs() {
   while IFS= read -r candidate; do
     [[ -d "$candidate" && ! -L "$candidate" && "$candidate" == "$zig_parent"/.staging.* ]] || continue
     owner_file="$candidate/.owner"
+    if [[ -z "$(/usr/bin/find "$candidate" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      /bin/rm -rf "$candidate"
+      continue
+    fi
+    [[ -f "$owner_file" && ! -L "$owner_file" ]] || fail "unowned nonempty Zig staging residue: $candidate"
     owner_is_dead "$owner_file" && rm -rf "$candidate"
   done < <(find "$zig_parent" -maxdepth 1 -type d -name '.staging.*' -print)
 }
@@ -136,6 +146,9 @@ acquire_publish_lock() {
   while true; do
     lock_candidate=$(mktemp "$zig_parent/.bootstrap-owner.XXXXXX")
     [[ -f "$lock_candidate" && ! -L "$lock_candidate" ]] || fail "invalid Zig lock candidate"
+    if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_CANDIDATE_CREATED:-}" == "1" ]]; then
+      kill -KILL "$$"
+    fi
     chmod 600 "$lock_candidate"
     write_owner_metadata "$lock_candidate"
     if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_BEFORE_ACQUIRE:-}" == "1" ]]; then
@@ -163,7 +176,7 @@ acquire_publish_lock() {
   done
 }
 
-for tool_path in "$tools_root" "$zig_parent" "$install_root"; do
+for tool_path in "$tools_root" "$zig_parent" "$archive_dir" "$install_root"; do
   is_physical_directory_or_absent "$tool_path" || fail "refusing non-directory or symlinked tool path: $tool_path"
 done
 
@@ -199,39 +212,44 @@ if [[ -n "$archive_override" ]]; then
 elif [[ "$testing" == "1" && -n "${COCKPIT_ZIG_BOOTSTRAP_TEST_ARCHIVE:-}" ]]; then
   [[ -f "$COCKPIT_ZIG_BOOTSTRAP_TEST_ARCHIVE" && ! -L "$COCKPIT_ZIG_BOOTSTRAP_TEST_ARCHIVE" ]] || fail "test archive is not a regular file"
   cp "$COCKPIT_ZIG_BOOTSTRAP_TEST_ARCHIVE" "$archive"
+elif [[ -f "$project_archive" && ! -L "$project_archive" ]]; then
+  cp "$project_archive" "$archive"
 else
-  curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 1 --retry-max-time 45 "$ZIG_AARCH64_MACOS_URL" -o "$archive"
+  /usr/bin/curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 1 --retry-max-time 45 "$ZIG_AARCH64_MACOS_URL" -o "$archive"
 fi
 
-actual_size=$(stat -f %z "$archive")
+actual_size=$(/usr/bin/stat -f %z "$archive")
 [[ "$actual_size" == "$ZIG_AARCH64_MACOS_SIZE" ]] || fail "Zig archive size mismatch: $actual_size"
-actual_sha256=$(shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
+actual_sha256=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
 [[ "$actual_sha256" == "$ZIG_AARCH64_MACOS_SHA256" ]] || fail "Zig SHA-256 mismatch: $actual_sha256"
 [[ "$test_validation_only" == "0" ]] || fail "test archive unexpectedly passed checksum validation"
 
 archive_root="zig-aarch64-macos-$ZIG_VERSION"
-while IFS= read -r archive_member; do
+/usr/bin/tar -tf "$archive" | while IFS= read -r archive_member; do
   [[ -n "$archive_member" ]] || fail "archive contains an empty member"
   [[ "$archive_member" != /* ]] || fail "archive contains an absolute path: $archive_member"
   [[ "/$archive_member/" != *'/../'* ]] || fail "archive contains path traversal: $archive_member"
   [[ "$archive_member" == "$archive_root" || "$archive_member" == "$archive_root/"* ]] || fail "archive member escapes expected root: $archive_member"
-done < <(tar -tf "$archive")
+done
 
-tar -xf "$archive" -C "$temp_dir"
+/usr/bin/tar -xf "$archive" -C "$temp_dir"
 extracted_root="$temp_dir/$archive_root"
 [[ -d "$extracted_root" && ! -L "$extracted_root" ]] || fail "archive did not extract the expected root"
 [[ -x "$extracted_root/zig" && ! -L "$extracted_root/zig" ]] || fail "archive did not extract a physical Zig compiler"
-xattr -dr com.apple.quarantine "$extracted_root" 2>/dev/null || true
-codesign --verify --strict "$extracted_root/zig" >/dev/null
+/usr/bin/xattr -dr com.apple.quarantine "$extracted_root" 2>/dev/null || true
+/usr/bin/codesign --verify --strict "$extracted_root/zig" >/dev/null
 [[ "$("$extracted_root/zig" version)" == "$ZIG_VERSION" ]] || fail "extracted Zig version mismatch"
 
 staging_dir=$(mktemp -d "$zig_parent/.staging.XXXXXX")
 [[ -d "$staging_dir" && ! -L "$staging_dir" && "$staging_dir" == "$zig_parent"/.staging.* ]] || fail "invalid Zig staging directory"
+if [[ "$testing" == "1" && "${COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_STAGING_CREATED:-}" == "1" ]]; then
+  kill -KILL "$$"
+fi
 write_owner_metadata "$staging_dir/.owner"
 mv "$extracted_root" "$staging_dir/payload"
 [[ -d "$staging_dir/payload" && ! -L "$staging_dir/payload" ]] || fail "invalid Zig staging payload"
 [[ -x "$staging_dir/payload/zig" && ! -L "$staging_dir/payload/zig" ]] || fail "staged Zig compiler is not physical"
-codesign --verify --strict "$staging_dir/payload/zig" >/dev/null
+/usr/bin/codesign --verify --strict "$staging_dir/payload/zig" >/dev/null
 [[ "$("$staging_dir/payload/zig" version)" == "$ZIG_VERSION" ]] || fail "staged Zig version mismatch"
 
 acquire_publish_lock

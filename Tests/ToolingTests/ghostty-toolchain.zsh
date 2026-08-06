@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 repo_root=${0:A:h:h:h}
 manifest="$repo_root/Config/Toolchains/ghostty.env"

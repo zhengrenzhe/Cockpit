@@ -1,5 +1,6 @@
 #!/bin/zsh
 set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 script_path=${0:P}
 repo_root=${script_path:h:h}
@@ -38,12 +39,12 @@ done
 source "$manifest"
 
 [[ -f "$repo_root/.gitmodules" && ! -L "$repo_root/.gitmodules" ]] || fail "missing .gitmodules"
-[[ "$(git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.path)" == "ThirdParty/ghostty" ]] || fail "Ghostty submodule path mismatch"
-[[ "$(git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.url)" == "$GHOSTTY_REPOSITORY_URL" ]] || fail "Ghostty submodule URL mismatch"
+[[ "$(/usr/bin/git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.path)" == "ThirdParty/ghostty" ]] || fail "Ghostty submodule path mismatch"
+[[ "$(/usr/bin/git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.url)" == "$GHOSTTY_REPOSITORY_URL" ]] || fail "Ghostty submodule URL mismatch"
 [[ -d "$submodule_path" && ! -L "$submodule_path" ]] || fail "missing or symlinked Ghostty submodule"
-[[ "$(git -C "$submodule_path" rev-parse HEAD)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty commit mismatch"
-[[ -z "$(git -C "$submodule_path" status --short --untracked-files=no)" ]] || fail "Ghostty tracked source is dirty"
-gitlink=$(git ls-files --stage -- "$submodule_path")
+[[ "$(/usr/bin/git -C "$submodule_path" rev-parse HEAD)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty commit mismatch"
+[[ -z "$(/usr/bin/git -C "$submodule_path" status --short --untracked-files=no)" ]] || fail "Ghostty tracked source is dirty"
+gitlink=$(/usr/bin/git ls-files --stage -- "$submodule_path")
 [[ "$gitlink" == "160000 $GHOSTTY_COMMIT 0"$'\t'"ThirdParty/ghostty" ]] || fail "Ghostty gitlink mismatch"
 
 for tool_path in "$tools_root" "$tools_root/zig" "$zig_root" "$zig_binary"; do
@@ -55,8 +56,8 @@ fi
 [[ -d "$tools_root" && -d "$tools_root/zig" && -d "$zig_root" && -x "$zig_binary" ]] || fail "missing Zig compiler"
 [[ "$("$zig_binary" version)" == "$ZIG_VERSION" ]] || fail "Zig version mismatch"
 
-git check-ignore -q --no-index "$tools_root" || fail ".tools is not ignored"
-! git ls-files | /usr/bin/grep -Eq '(^|/)(\.tools|zig-aarch64-macos-0\.15\.2|zig-cache|\.zig-cache|zig-out)(/|$)|(^|/)zig$' || fail "toolchain or Ghostty build output is tracked"
+/usr/bin/git check-ignore -q --no-index "$tools_root" || fail ".tools is not ignored"
+! /usr/bin/git ls-files | /usr/bin/grep -Eq '(^|/)(\.tools|zig-aarch64-macos-0\.15\.2|zig-cache|\.zig-cache|zig-out)(/|$)|(^|/)zig$' || fail "toolchain or Ghostty build output is tracked"
 for bundle_root in "$repo_root/build" "$repo_root/DerivedData"; do
   [[ -d "$bundle_root" ]] || continue
   ! find "$bundle_root" -type f \( -name zig -o -name 'zig-aarch64-macos-0.15.2.tar.xz' \) -print -quit | /usr/bin/grep -q . || fail "Zig compiler or archive is present in bundle output"
