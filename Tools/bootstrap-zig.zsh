@@ -30,6 +30,7 @@ typeset -a expected_manifest_lines
 expected_manifest_lines=(
   'GHOSTTY_VERSION=1.3.1'
   'GHOSTTY_TAG=v1.3.1'
+  'GHOSTTY_TAG_OBJECT=22efb0be2bbea73e5339f5426fa3b20edabcaa11'
   'GHOSTTY_COMMIT=332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28'
   'GHOSTTY_REPOSITORY_URL=https://github.com/ghostty-org/ghostty.git'
   'ZIG_VERSION=0.15.2'
@@ -314,14 +315,23 @@ reclaim_preparing_paths() {
     path_is_absent "$candidate" && continue
     [[ ! -L "$candidate" ]] || fail "refusing symlinked Zig preparation: $candidate"
     [[ "$candidate" == "$zig_parent"/.preparing.* ]] || fail "invalid Zig preparation: $candidate"
-    preparing_name_owner_is_active "$candidate" && continue
     leaf=${candidate:t}
+    if preparing_name_has_owner_identity "$candidate"; then
+      preparing_name_owner_is_active "$candidate" && continue
+      case "$leaf" in
+        .preparing.owner.*)
+          [[ -f "$candidate" ]] || fail "invalid Zig file preparation: $candidate"
+          /bin/rm -f "$candidate"
+          ;;
+        .preparing.staging.*|.preparing.temp.*)
+          [[ -d "$candidate" ]] || fail "invalid Zig directory preparation: $candidate"
+          /bin/rm -rf "$candidate"
+          ;;
+        *) fail "invalid owner-identified Zig preparation: $candidate" ;;
+      esac
+      continue
+    fi
     if [[ "$leaf" == .preparing.temp.* ]]; then
-      if preparing_name_has_owner_identity "$candidate"; then
-        [[ -d "$candidate" ]] || fail "invalid Zig temp preparation: $candidate"
-        /bin/rm -rf "$candidate"
-        continue
-      fi
       if [[ -d "$candidate" ]]; then
         first_entry=$(/usr/bin/find "$candidate" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)
         path_is_absent "$candidate" && continue

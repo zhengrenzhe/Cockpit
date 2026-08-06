@@ -20,6 +20,7 @@ typeset -a expected_manifest_lines
 expected_manifest_lines=(
   'GHOSTTY_VERSION=1.3.1'
   'GHOSTTY_TAG=v1.3.1'
+  'GHOSTTY_TAG_OBJECT=22efb0be2bbea73e5339f5426fa3b20edabcaa11'
   'GHOSTTY_COMMIT=332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28'
   'GHOSTTY_REPOSITORY_URL=https://github.com/ghostty-org/ghostty.git'
   'ZIG_VERSION=0.15.2'
@@ -43,6 +44,9 @@ source "$manifest"
 
 [[ -d "$submodule_path" && ! -L "$submodule_path" ]] || fail "missing or symlinked Ghostty submodule"
 [[ "$(/usr/bin/git -C "$submodule_path" rev-parse HEAD)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty commit mismatch"
+[[ "$(/usr/bin/git -C "$submodule_path" cat-file -t "$GHOSTTY_TAG" 2>/dev/null || true)" == "tag" ]] || fail "Ghostty tag is not annotated: $GHOSTTY_TAG"
+[[ "$(/usr/bin/git -C "$submodule_path" rev-parse --verify "$GHOSTTY_TAG" 2>/dev/null || true)" == "$GHOSTTY_TAG_OBJECT" ]] || fail "Ghostty tag object mismatch"
+[[ "$(/usr/bin/git -C "$submodule_path" rev-parse --verify "$GHOSTTY_TAG^{}" 2>/dev/null || true)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty tag peel mismatch"
 [[ -z "$(/usr/bin/git -C "$submodule_path" status --short --untracked-files=no)" ]] || fail "Ghostty tracked source is dirty"
 
 gitlink=$(/usr/bin/git ls-files --stage -- "$submodule_path")
@@ -53,6 +57,7 @@ for tool_path in "$repo_root/.tools" "$repo_root/.tools/zig" "$zig_root" "$zig_r
 done
 [[ -d "$repo_root/.tools" && -d "$repo_root/.tools/zig" && -d "$zig_root" ]] || fail "missing Zig install directory"
 [[ -x "$zig_root/zig" ]] || fail "missing Zig compiler"
+/usr/bin/codesign --verify --strict "$zig_root/zig" >/dev/null 2>&1 || fail "Zig code signature is invalid"
 [[ "$("$zig_root/zig" version)" == "$ZIG_VERSION" ]] || fail "Zig version mismatch"
 
 /usr/bin/git check-ignore -q --no-index "$repo_root/.tools" || fail ".tools is not ignored"

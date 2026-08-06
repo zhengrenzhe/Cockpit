@@ -15,6 +15,16 @@ fail() {
   exit 1
 }
 
+bootstrap_allowed=1
+case "$#" in
+  0) ;;
+  1)
+    [[ "$1" == "--no-bootstrap" ]] || fail "usage: $0 [--no-bootstrap]"
+    bootstrap_allowed=0
+    ;;
+  *) fail "usage: $0 [--no-bootstrap]" ;;
+esac
+
 [[ "$(/usr/bin/uname -s)" == "Darwin" ]] || fail "host is not Darwin"
 [[ "$(/usr/bin/uname -m)" == "arm64" ]] || fail "host is not arm64"
 [[ -f "$manifest" && ! -L "$manifest" ]] || fail "missing manifest: $manifest"
@@ -23,6 +33,7 @@ typeset -a expected_manifest_lines
 expected_manifest_lines=(
   'GHOSTTY_VERSION=1.3.1'
   'GHOSTTY_TAG=v1.3.1'
+  'GHOSTTY_TAG_OBJECT=22efb0be2bbea73e5339f5426fa3b20edabcaa11'
   'GHOSTTY_COMMIT=332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28'
   'GHOSTTY_REPOSITORY_URL=https://github.com/ghostty-org/ghostty.git'
   'ZIG_VERSION=0.15.2'
@@ -43,6 +54,9 @@ source "$manifest"
 [[ "$(/usr/bin/git config --file "$repo_root/.gitmodules" --get submodule.ThirdParty/ghostty.url)" == "$GHOSTTY_REPOSITORY_URL" ]] || fail "Ghostty submodule URL mismatch"
 [[ -d "$submodule_path" && ! -L "$submodule_path" ]] || fail "missing or symlinked Ghostty submodule"
 [[ "$(/usr/bin/git -C "$submodule_path" rev-parse HEAD)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty commit mismatch"
+[[ "$(/usr/bin/git -C "$submodule_path" cat-file -t "$GHOSTTY_TAG" 2>/dev/null || true)" == "tag" ]] || fail "Ghostty tag is not annotated: $GHOSTTY_TAG"
+[[ "$(/usr/bin/git -C "$submodule_path" rev-parse --verify "$GHOSTTY_TAG" 2>/dev/null || true)" == "$GHOSTTY_TAG_OBJECT" ]] || fail "Ghostty tag object mismatch"
+[[ "$(/usr/bin/git -C "$submodule_path" rev-parse --verify "$GHOSTTY_TAG^{}" 2>/dev/null || true)" == "$GHOSTTY_COMMIT" ]] || fail "Ghostty tag peel mismatch"
 [[ -z "$(/usr/bin/git -C "$submodule_path" status --short --untracked-files=no)" ]] || fail "Ghostty tracked source is dirty"
 gitlink=$(/usr/bin/git ls-files --stage -- "$submodule_path")
 [[ "$gitlink" == "160000 $GHOSTTY_COMMIT 0"$'\t'"ThirdParty/ghostty" ]] || fail "Ghostty gitlink mismatch"
@@ -51,9 +65,11 @@ for tool_path in "$tools_root" "$tools_root/zig" "$zig_root" "$zig_binary"; do
   [[ ! -L "$tool_path" ]] || fail "symlinked tool path: $tool_path"
 done
 if [[ ! -e "$zig_binary" ]]; then
+  [[ "$bootstrap_allowed" == "1" ]] || fail "missing Zig compiler in --no-bootstrap mode"
   "$repo_root/Tools/bootstrap-zig.zsh"
 fi
 [[ -d "$tools_root" && -d "$tools_root/zig" && -d "$zig_root" && -x "$zig_binary" ]] || fail "missing Zig compiler"
+/usr/bin/codesign --verify --strict "$zig_binary" >/dev/null 2>&1 || fail "Zig code signature is invalid"
 [[ "$("$zig_binary" version)" == "$ZIG_VERSION" ]] || fail "Zig version mismatch"
 
 /usr/bin/git check-ignore -q --no-index "$tools_root" || fail ".tools is not ignored"
