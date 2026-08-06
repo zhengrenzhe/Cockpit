@@ -34,7 +34,7 @@ const expectedFiles = ['editor.css', 'editor.js', 'editor.js.map', 'index.html']
 const stagingFileAllowlist = new Set([...expectedFiles, 'editor.css.map']);
 const canonicalRuntimeRoot = await realpath(runtimeRoot);
 const expectedCanonicalDist = join(canonicalRuntimeRoot, 'dist');
-const processIdentityCache = new Map();
+const processStartIdentitySecondsCache = new Map();
 
 if (dist !== resolve(runtimeRoot, 'dist')) {
   throw new Error(`unexpected dist output path: ${dist}`);
@@ -52,9 +52,11 @@ async function metadata(path) {
   }
 }
 
-async function processStartIdentity(pid) {
+async function processStartIdentitySeconds(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-  if (processIdentityCache.has(pid)) return processIdentityCache.get(pid);
+  if (processStartIdentitySecondsCache.has(pid)) {
+    return processStartIdentitySecondsCache.get(pid);
+  }
   let identity;
   try {
     const { stdout } = await runFile(
@@ -66,13 +68,13 @@ async function processStartIdentity(pid) {
   } catch (error) {
     if (typeof error?.code !== 'number') throw error;
   }
-  processIdentityCache.set(pid, identity);
+  processStartIdentitySecondsCache.set(pid, identity);
   return identity;
 }
 
-const ownerProcessStartIdentity = await processStartIdentity(process.pid);
-if (!ownerProcessStartIdentity) {
-  throw new Error(`cannot determine process start identity for PID ${process.pid}`);
+const ownerProcessStartIdentitySeconds = await processStartIdentitySeconds(process.pid);
+if (!ownerProcessStartIdentitySeconds) {
+  throw new Error(`cannot determine process start-second identity for PID ${process.pid}`);
 }
 
 async function requireLocalDist() {
@@ -186,18 +188,40 @@ function manifestMatchesPath(manifest, path) {
   );
 }
 
-function validOwnershipManifest(manifest, path) {
-  if (!manifest || typeof manifest !== 'object') return false;
-  if (manifest.version !== 1) return false;
-  if (manifest.kind !== 'staging' && manifest.kind !== 'retired') return false;
-  if (!Number.isSafeInteger(manifest.pid) || manifest.pid <= 0) return false;
-  if (typeof manifest.processStartIdentity !== 'string') return false;
-  if (typeof manifest.ownerToken !== 'string') return false;
-  if (typeof manifest.artifactName !== 'string') return false;
-  if (typeof manifest.device !== 'string' || typeof manifest.inode !== 'string') return false;
+function normalizeOwnershipManifest(manifest, path) {
+  if (!manifest || typeof manifest !== 'object') return undefined;
+  let processStartIdentitySeconds;
+  if (manifest.version === 1) {
+    if (typeof manifest.processStartIdentity !== 'string') return undefined;
+    processStartIdentitySeconds = manifest.processStartIdentity;
+  } else if (manifest.version === 2) {
+    if (typeof manifest.processStartIdentitySeconds !== 'string') return undefined;
+    processStartIdentitySeconds = manifest.processStartIdentitySeconds;
+  } else {
+    return undefined;
+  }
+  if (manifest.kind !== 'staging' && manifest.kind !== 'retired') return undefined;
+  if (!Number.isSafeInteger(manifest.pid) || manifest.pid <= 0) return undefined;
+  if (typeof manifest.ownerToken !== 'string') return undefined;
+  if (typeof manifest.artifactName !== 'string') return undefined;
+  if (typeof manifest.device !== 'string' || typeof manifest.inode !== 'string') {
+    return undefined;
+  }
   const expectedPrefix = manifest.kind === 'staging' ? stagingPrefix : retiredPrefix;
-  if (!manifest.artifactName.startsWith(`${expectedPrefix}${manifest.ownerToken}`)) return false;
-  return manifestMatchesPath(manifest, path);
+  if (!manifest.artifactName.startsWith(`${expectedPrefix}${manifest.ownerToken}`)) {
+    return undefined;
+  }
+  if (!manifestMatchesPath(manifest, path)) return undefined;
+  return {
+    version: manifest.version,
+    kind: manifest.kind,
+    pid: manifest.pid,
+    processStartIdentitySeconds,
+    ownerToken: manifest.ownerToken,
+    artifactName: manifest.artifactName,
+    device: manifest.device,
+    inode: manifest.inode,
+  };
 }
 
 async function readOwnershipManifest(path, sidecar = ownerManifestPath(path)) {
@@ -207,7 +231,7 @@ async function readOwnershipManifest(path, sidecar = ownerManifestPath(path)) {
   }
   try {
     const manifest = JSON.parse(await readFile(sidecar, 'utf8'));
-    return validOwnershipManifest(manifest, path) ? manifest : undefined;
+    return normalizeOwnershipManifest(manifest, path);
   } catch (error) {
     if (error instanceof SyntaxError || error?.code === 'ENOENT') return undefined;
     throw error;
@@ -231,10 +255,10 @@ async function verifiedOwnedArtifact(path, sidecar = ownerManifestPath(path)) {
 
 async function writeOwnershipManifest(path, kind, stats) {
   const manifest = {
-    version: 1,
+    version: 2,
     kind,
     pid: process.pid,
-    processStartIdentity: ownerProcessStartIdentity,
+    processStartIdentitySeconds: ownerProcessStartIdentitySeconds,
     ownerToken,
     artifactName: basename(path),
     device: String(stats.dev),
@@ -362,6 +386,51 @@ async function cleanupPrivateArtifact(path) {
   await unlink(quarantineSidecar);
 }
 
+async function reconcileSplitOwnershipStates() {
+  const names = await readdir(dist);
+  const privateArtifactPaths = names
+    .filter((name) => !name.endsWith(ownerManifestSuffix))
+    .map((name) => join(dist, name))
+    .filter(isPrivateArtifactPath);
+
+  for (const name of names) {
+    if (!name.endsWith(ownerManifestSuffix)) continue;
+    const sidecar = join(dist, name);
+    const sidecarArtifactPath = sidecar.slice(0, -ownerManifestSuffix.length);
+    if (!isPrivateArtifactPath(sidecarArtifactPath)) continue;
+    const manifest = await readOwnershipManifest(sidecarArtifactPath, sidecar);
+    if (!manifest) continue;
+
+    const sidecarArtifactStats = await metadata(sidecarArtifactPath);
+    if (
+      sidecarArtifactStats
+      && !sidecarArtifactStats.isSymbolicLink()
+      && artifactIdentityMatches(sidecarArtifactStats, manifest)
+    ) continue;
+
+    const candidates = [];
+    for (const path of privateArtifactPaths) {
+      if (!manifestMatchesPath(manifest, path)) continue;
+      const stats = await metadata(path);
+      if (
+        stats
+        && !stats.isSymbolicLink()
+        && artifactIdentityMatches(stats, manifest)
+      ) candidates.push(path);
+    }
+    if (candidates.length !== 1) continue;
+
+    const targetSidecar = ownerManifestPath(candidates[0]);
+    if (await metadata(targetSidecar)) continue;
+    try {
+      await rename(sidecar, targetSidecar);
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+}
+
 async function cleanupAbandonedArtifacts() {
   const names = await readdir(dist);
   for (const name of names) {
@@ -376,8 +445,8 @@ async function cleanupAbandonedArtifacts() {
     }
     const owned = await verifiedOwnedArtifact(path);
     if (!owned) continue;
-    const liveIdentity = await processStartIdentity(owned.manifest.pid);
-    if (liveIdentity !== owned.manifest.processStartIdentity) {
+    const liveIdentitySeconds = await processStartIdentitySeconds(owned.manifest.pid);
+    if (liveIdentitySeconds !== owned.manifest.processStartIdentitySeconds) {
       await cleanupPrivateArtifact(path);
     }
   }
@@ -389,8 +458,8 @@ async function cleanupAbandonedArtifacts() {
     if (!isPrivateArtifactPath(path) || (await metadata(path))) continue;
     const manifest = await readOwnershipManifest(path, join(dist, name));
     if (!manifest) continue;
-    const liveIdentity = await processStartIdentity(manifest.pid);
-    if (liveIdentity !== manifest.processStartIdentity) {
+    const liveIdentitySeconds = await processStartIdentitySeconds(manifest.pid);
+    if (liveIdentitySeconds !== manifest.processStartIdentitySeconds) {
       await removeManifestSidecar(path);
     }
   }
@@ -507,6 +576,7 @@ async function publishStagingBundle(stagingSnapshot, retiredPaths) {
 await requireLocalDist();
 await rejectInitialOutputLink();
 await recoverPublishedBundle();
+await reconcileSplitOwnershipStates();
 await cleanupAbandonedArtifacts();
 
 const retiredPaths = [];

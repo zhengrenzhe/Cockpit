@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   access,
@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 const runtimeRoot = new URL('../', import.meta.url);
 const output = new URL('dist/MonacoRuntime.bundle/', runtimeRoot);
@@ -28,6 +29,7 @@ const distPath = fileURLToPath(new URL('dist', runtimeRoot));
 const outputPath = fileURLToPath(new URL('dist/MonacoRuntime.bundle', runtimeRoot));
 const expectedFiles = ['editor.css', 'editor.js', 'editor.js.map', 'index.html'];
 const testHookName = 'before-public-detach';
+const runFile = promisify(execFile);
 
 function spawnBuild(extraEnv = {}) {
   const child = spawn(process.execPath, ['build.mjs'], {
@@ -168,6 +170,52 @@ async function privateArtifactNames() {
     || entry.startsWith('.MonacoRuntime.bundle.retired-')
     || entry.startsWith('.MonacoRuntime.bundle.quarantine-')
   ));
+}
+
+async function processStartIdentitySecondsForTest(pid) {
+  const { stdout } = await runFile(
+    '/bin/ps',
+    ['-o', 'lstart=', '-p', String(pid)],
+    { encoding: 'utf8', maxBuffer: 4_096 },
+  );
+  return stdout.trim();
+}
+
+async function createOwnedArtifactFixture(
+  processStartIdentitySeconds,
+  { legacyVersionOne = false } = {},
+) {
+  const ownerToken = `${process.pid}-${randomUUID()}`;
+  const artifactName = `.MonacoRuntime.bundle.staging-${ownerToken}`;
+  const artifact = join(distPath, artifactName);
+  const sidecar = `${artifact}.owner.json`;
+  await mkdir(artifact);
+  await writeFile(join(artifact, 'index.html'), 'owned-artifact-fixture\n');
+  const stats = await lstat(artifact);
+  await writeFile(sidecar, JSON.stringify({
+    version: legacyVersionOne ? 1 : 2,
+    kind: 'staging',
+    pid: process.pid,
+    ...(legacyVersionOne
+      ? { processStartIdentity: processStartIdentitySeconds }
+      : { processStartIdentitySeconds }),
+    ownerToken,
+    artifactName,
+    device: String(stats.dev),
+    inode: String(stats.ino),
+  }));
+  return { artifact, artifactName, ownerToken, sidecar };
+}
+
+async function cleanupOwnedArtifactFixture(...paths) {
+  for (const path of paths) {
+    await detachAndRemoveTestPath(path);
+    try {
+      await unlink(`${path}.owner.json`);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 test('package pins the exact runtime toolchain', async () => {
@@ -399,37 +447,79 @@ test('a pre-publication failure preserves the published bundle and removes stagi
   assert.deepEqual(privateArtifacts, []);
 });
 
-test('a reused live PID with a different start identity does not retain an artifact', async () => {
-  const ownerToken = `${process.pid}-${randomUUID()}`;
-  const artifactName = `.MonacoRuntime.bundle.staging-${ownerToken}`;
-  const artifact = join(distPath, artifactName);
-  const ownerManifest = `${artifact}.owner.json`;
-
-  await mkdir(artifact);
-  await writeFile(join(artifact, 'index.html'), 'stale-owned-artifact\n');
-  const stats = await lstat(artifact);
-  await writeFile(ownerManifest, JSON.stringify({
-    version: 1,
-    kind: 'staging',
-    pid: process.pid,
-    processStartIdentity: 'definitely-not-the-current-process-start',
-    ownerToken,
-    artifactName,
-    device: String(stats.dev),
-    inode: String(stats.ino),
-  }));
+test('a reused live PID with a different start-second identity does not retain an artifact', async () => {
+  const fixture = await createOwnedArtifactFixture(
+    'definitely-not-the-current-process-start',
+  );
 
   try {
     await runBuild();
-    await assert.rejects(access(artifact), { code: 'ENOENT' });
-    await assert.rejects(access(ownerManifest), { code: 'ENOENT' });
+    await assert.rejects(access(fixture.artifact), { code: 'ENOENT' });
+    await assert.rejects(access(fixture.sidecar), { code: 'ENOENT' });
   } finally {
-    await detachAndRemoveTestPath(artifact);
-    try {
-      await unlink(ownerManifest);
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
+    await cleanupOwnedArtifactFixture(fixture.artifact);
+  }
+});
+
+test('a legacy version 1 start identity is normalized and cleaned', async () => {
+  const fixture = await createOwnedArtifactFixture(
+    'legacy-owner-is-not-live',
+    { legacyVersionOne: true },
+  );
+
+  try {
+    await runBuild();
+    await assert.rejects(access(fixture.artifact), { code: 'ENOENT' });
+    await assert.rejects(access(fixture.sidecar), { code: 'ENOENT' });
+  } finally {
+    await cleanupOwnedArtifactFixture(fixture.artifact);
+  }
+});
+
+test('a same-second live PID identity is conservatively retained', async () => {
+  const fixture = await createOwnedArtifactFixture(
+    await processStartIdentitySecondsForTest(process.pid),
+  );
+  try {
+    await runBuild();
+    await access(fixture.artifact);
+    await access(fixture.sidecar);
+  } finally {
+    await cleanupOwnedArtifactFixture(fixture.artifact);
+  }
+});
+
+test('next build reconciles an artifact-only quarantine rename split', async () => {
+  const fixture = await createOwnedArtifactFixture(
+    'split-state-owner-is-not-live',
+  );
+  const quarantine = join(
+    distPath,
+    `.MonacoRuntime.bundle.quarantine-staging-${fixture.ownerToken}-${randomUUID()}`,
+  );
+  await rename(fixture.artifact, quarantine);
+  try {
+    await runBuild();
+    assert.deepEqual(await privateArtifactNames(), []);
+  } finally {
+    await cleanupOwnedArtifactFixture(fixture.artifact, quarantine);
+  }
+});
+
+test('next build reconciles a sidecar-only quarantine rename split', async () => {
+  const fixture = await createOwnedArtifactFixture(
+    'split-state-owner-is-not-live',
+  );
+  const quarantine = join(
+    distPath,
+    `.MonacoRuntime.bundle.quarantine-staging-${fixture.ownerToken}-${randomUUID()}`,
+  );
+  await rename(fixture.sidecar, `${quarantine}.owner.json`);
+  try {
+    await runBuild();
+    assert.deepEqual(await privateArtifactNames(), []);
+  } finally {
+    await cleanupOwnedArtifactFixture(fixture.artifact, quarantine);
   }
 });
 
