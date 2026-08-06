@@ -20,4 +20,5 @@ Project and Conversation persistence, attach tickets, session recovery, scrollba
 
 Architecture: `docs/design/2026-08-05-cockpit-architecture.md`
 Terminal resilience: `docs/superpowers/specs/2026-08-05-terminal-session-resilience-design.md`
-Implementation plan: `docs/superpowers/plans/2026-08-05-cockpit-phase-0-implementation.md`
+Phase 1 design: `docs/superpowers/specs/2026-08-06-cockpit-phase-1-design.md`
+Phase 0 implementation plan: `docs/superpowers/plans/2026-08-05-cockpit-phase-0-implementation.md`

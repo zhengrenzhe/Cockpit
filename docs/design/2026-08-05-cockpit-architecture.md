@@ -20,8 +20,8 @@ Cockpit 是一个原生 Agent 开发环境，提供项目、对话、代码编�
 - 通过固定版本的轻量 fork 使用 Ghostty 终端核心和 Metal 渲染器。
 - 在 Cockpit.app、CockpitHost 和 CockpitTerminalSupervisor 重启期间保留所有活动终端会话。
 - 从首个实现阶段开始，确保每个产品 API 都具备远程调用能力。
-- 保持 Project、Conversation 和 Environment 身份稳定且明确。
-- 所有文件、搜索、Git、编辑器和终端操作都绑定到不可变的 EnvironmentID。
+- 保持 Project、Conversation、WorkspaceContext 和 Environment 身份稳定且明确。
+- 文件、搜索、Git、编辑器和终端工作目录绑定到不可变的 EnvironmentID；页签和终端产品归属绑定到 WorkspaceContextID。
 
 ### 首个开发者预览版不包含
 
@@ -50,9 +50,10 @@ Cockpit 是一个原生 Agent 开发环境，提供项目、对话、代码编�
 ```
 
 - Project 映射到用户选择的一个物理文件夹。
-- 一个 Project 包含多个 Conversation。
+- Project 本身是可选择的完整 IDE 工作上下文，可以不包含 Conversation。
+- 一个 Project 可以包含多个 Conversation。
 - Conversation 展示自身是直接使用项目目录，还是使用一个 Git worktree。
-- 选择 Conversation 会切换整个活动工作环境。
+- 选择 Project 或 Conversation 会切换整个活动 WorkspaceContext。
 
 ### 中央工作区
 
@@ -64,7 +65,7 @@ Cockpit 是一个原生 Agent 开发环境，提供项目、对话、代码编�
 
 ### 右侧工具栏
 
-右侧栏跟随当前选中 Conversation 的 EnvironmentID。
+右侧栏跟随当前 ActiveContext 的 EnvironmentID。
 
 - 文件树。
 - 文件搜索。
@@ -84,10 +85,11 @@ ProjectID
 displayName
 rootBookmark
 canonicalRootIdentity
+baseEnvironmentID
 createdAt
 ```
 
-一个 Project 表示用户选择的一个物理文件夹。
+一个 Project 表示用户选择的一个固定物理文件夹。Project 自身对应 `WorkspaceContextID.project(ProjectID)`，并通过 baseEnvironmentID 使用项目目录唯一的 Direct Environment。
 
 ### Conversation
 
@@ -96,31 +98,43 @@ ConversationID
 ProjectID
 EnvironmentID
 title
-agentProfile
-primaryTerminalSessionID
-tabRecords
+lifecycleState: active | deleting(phase)
+deletionOperationID?
+createdAt
 archivedAt
 ```
 
-Conversation 是左侧栏展示的产品级工作上下文。它既不是 PTY，也不是 UI 页签。
+Conversation 是左侧栏展示的产品级任务容器。它既不是 PTY、Agent 进程，也不是 UI 页签。一个 Conversation 可以拥有多个 Shell 和 Agent TerminalSession。Agent Profile 属于单个 TerminalSession 的 LaunchSpec，页签属于客户端 WorkspaceContext 状态。
+
+### WorkspaceContext
+
+WorkspaceContext 统一表示可选择的产品上下文：
+
+```text
+WorkspaceContextID
+├── project(ProjectID)
+└── conversation(ConversationID)
+```
+
+ProjectContext 和 ConversationContext 是 WorkspaceContextID 的两个变体，不建立额外数据库实体。
 
 ### Environment
-
-Conversation 创建完成后，其 Environment 不再变化。
 
 ```text
 EnvironmentID
 ProjectID
 kind: direct | worktree
 workspaceRoot
+workspaceRootIdentity
 gitCommonDirectory
-worktreeBranch
+worktreeBranch?
 ```
 
-- Direct Environment 解析到 Project 根目录。
+- 一个规范化物理工作目录对应一个 EnvironmentID。
+- 每个 Project 的 baseEnvironmentID 指向项目根目录唯一的 Direct Environment。
+- Project Context 与该 Project 下全部 Direct Conversation 共享 baseEnvironmentID。
 - Worktree Environment 解析到一个 Git worktree 根目录。
-- 多个 Direct Environment 可以共享同一个物理根目录。
-- WorkspaceKernel 资源按照规范化物理根目录去重，产品状态继续以 EnvironmentID 为键。
+- WorkspaceKernel 以 EnvironmentID 为键，不为同一规范化物理目录创建重复实例。
 
 把 Conversation 从 Direct 改为 Worktree 时，将创建一个新 Conversation。已有终端、文档和 Git 历史的 Environment 身份不会发生变化。
 
@@ -128,8 +142,9 @@ worktreeBranch
 
 ```text
 TerminalSessionID
-ConversationID
+WorkspaceContextID
 EnvironmentID
+kind: shell | agent
 launchSpec
 workerInstanceID
 keeperProcessIdentifier
@@ -139,17 +154,21 @@ protocolVersion
 latestSequence
 ```
 
-Agent CLI 和普通 Shell 会话使用同一套模型。
+Agent CLI 和普通 Shell 会话使用同一套模型。Project Context 与 Conversation Context 都可以拥有 TerminalSession。Conversation 不包含 primaryTerminalSessionID，一个 Context 可以拥有任意数量的独立 TerminalSession。
 
 ### DocumentSession
 
-文档身份由以下组合确定：
-
 ```text
-EnvironmentID + RelativePath
+DocumentID
+EnvironmentID
+relativePath
+documentVersion
+persistedVersion
+dirtyState
+editLease
 ```
 
-两个 worktree 中相同的相对路径会产生两个不同的 DocumentSession。
+`EnvironmentID + normalized RelativePath` 是唯一文件定位键，DocumentID 是稳定身份。Cockpit 发起重命名或移动时保持 DocumentID 不变，并原子更新 relativePath 和所有页签引用。两个 worktree 中相同的相对路径仍产生不同 DocumentSession。
 
 ### TabRecord
 
@@ -164,9 +183,9 @@ position
 
 关闭 TabRecord 永远不会终止 PTY。终止 PTY 必须发送明确的 TerminalSession 命令。
 
-### ClientViewState
+### ClientWorkspaceState
 
-ClientViewState 是按设备分别保存的界面状态：
+ClientWorkspaceState 按 `DeviceID + WindowID + WorkspaceContextID` 分别保存界面状态：
 
 - 当前选中的页签。
 - 侧栏宽度。
@@ -174,15 +193,17 @@ ClientViewState 是按设备分别保存的界面状态：
 - 滚动位置。
 - 焦点和本地选区。
 
-它不属于跨设备共享的领域状态。
+它不属于跨设备共享的领域状态。文件、Conversation、DocumentSession 和 TerminalSession 继续作为跨设备领域状态。
 
 ## 4. 活动上下文
 
-选择 Conversation 会创建新的客户端 generation，并订阅一个不可变的 ActiveContext：
+选择 Project 或 Conversation 会创建新的 ActiveContextGeneration，并订阅一个不可变的 ActiveContext：
 
 ```text
 ActiveContext
-├── ConversationID
+├── WorkspaceContextID
+├── ProjectID
+├── ConversationID?
 ├── EnvironmentID
 ├── WorkspaceRootIdentity
 ├── GitContext
@@ -191,7 +212,7 @@ ActiveContext
 
 CockpitHost 返回一个带 revision 的启动快照，其中包含页签、文档、终端、文件树和 Git 状态。客户端以原子方式显示该快照，随后只应用 revision 大于启动快照的增量。
 
-每个异步结果都携带 EnvironmentID、generation、resource ID 和本地 revision。来自旧 generation 的结果直接丢弃。
+ConversationID 在 Project Context 中为空。Generation 是客户端窗口内单调递增的选择版本，不写入数据库。每个异步结果都携带 WorkspaceContextID、EnvironmentID、generation、resource ID 和本地 revision。来自旧 generation 的结果直接丢弃；Environment 级缓存仍可复用。
 
 ## 5. 进程架构
 
@@ -205,7 +226,7 @@ Cockpit 定义四种应用自有的可执行进程角色。每个活动 Terminal
 - 原生项目、对话、页签和工具界面。
 - 每个窗口一个 Monaco WKWebView 运行时。
 - Ghostty Metal NSView 渲染表面。
-- CockpitClientCore 和 ClientViewState。
+- CockpitClientCore、ActiveContextGeneration 和 ClientWorkspaceState。
 - 本地用户输入和命令路由。
 
 Cockpit.app 不拥有文件系统、Git、PTY 或持久化文档状态。
@@ -215,6 +236,7 @@ Cockpit.app 不拥有文件系统、Git、PTY 或持久化文档状态。
 职责：
 
 - Project、Conversation 和 Environment 的权威状态。
+- WorkspaceContext 解析和设备布局状态。
 - WorkspaceKernel 池。
 - 文件服务、FSEvents 对账、文件索引和搜索。
 - Git 模型和串行化 Git 操作。
@@ -224,7 +246,6 @@ Cockpit.app 不拥有文件系统、Git、PTY 或持久化文档状态。
 - 本地控制端点。
 - 基于 Network.framework 的远程网关。
 - 设备、项目和能力授权。
-- Conversation 到 TerminalSession 的产品元数据。
 
 CockpitHost 不拥有活动 PTY。
 
@@ -235,6 +256,7 @@ CockpitTerminalSupervisor 是独立的当前用户级 LaunchAgent，并启用 `K
 职责：
 
 - TerminalSession 注册表。
+- TerminalSession 到 WorkspaceContext 和 Environment 的权威绑定。
 - TerminalSession 两阶段创建事务。
 - PTYKeeper 启动、发现、认证和恢复对账。
 - 单次使用的本地连接票据。
@@ -322,7 +344,7 @@ acknowledgement   UInt64
 payloadLength     UInt32
 ```
 
-channelID 只在一条连接内有效，不是 UUID 领域身份。featureSet、deviceID、connectionID、requestID、environmentID 和 payloadType 位于握手消息或 SwiftProtobuf 控制载荷中，不占用固定传输头。
+channelID 只在一条连接内有效，不是 UUID 领域身份。featureSet、deviceID、connectionID、windowID、requestID、workspaceContextID、environmentID、activeContextGeneration 和 payloadType 位于握手消息或 SwiftProtobuf 控制载荷中，不占用固定传输头。
 
 载荷策略：
 
@@ -432,6 +454,16 @@ Preparing -> Committed -> Running
 
 如果 Supervisor 在 Committed 之前退出，Keeper 永远不会启动 CLI，并在 30 秒引导期限结束时退出。如果 Supervisor 在 Committed 之后退出，替代它的新 Supervisor 会完成启动或执行恢复对账。因此，每个已启动 CLI 都对应一条持久化的 committed TerminalSession 记录。
 
+### Shell 与 Agent LaunchSpec
+
+- Project Context 和 Conversation Context 都可以创建普通 Shell、Codex 与 Claude TerminalSession。
+- 普通 Shell 在 Environment.workspaceRoot 启动用户登录 Shell。
+- Codex 与 Claude 是 Phase 1 内建 Agent Profile；其他 Agent 可以由用户在普通 Shell 中手动启动。
+- 专用 Agent 页签完成登录 Shell 环境初始化后使用结构化参数执行 `exec`。Agent 退出时 TerminalSession 同步结束，不退回普通 Shell。
+- Agent 可执行文件首次解析后保存绝对路径，每次启动前重新验证。
+- LaunchSpec 不持久化完整用户环境或密钥，只保存明确的非敏感覆盖项。
+- 重新启动已结束 Agent 时创建新的 TerminalSessionID，原页签改为连接新会话。
+
 ### 连接与恢复
 
 - UDS 运行目录是 `/private/tmp/cockpit.<uid>/terminal`，归当前用户所有，权限为 `0700`；每个 socket 的权限为 `0600`。
@@ -468,14 +500,18 @@ Monaco 是低延迟编辑副本。CockpitHost 的 DocumentActor 是持久恢复�
 
 ```text
 Monaco 编辑事务
--> 异步有序编辑消息
--> DocumentActor 应用版本
+-> 异步有序编辑消息(EditLeaseID, baseVersion, clientSequence)
+-> DocumentActor 校验租约并应用版本
 -> 追加恢复日志
 -> LSP didChange
 -> acknowledgement(version)
 ```
 
 保存操作先执行 flush barrier，等待 Host 收到当前版本，再以原子方式替换磁盘文件，最后返回新的磁盘指纹。
+
+`EnvironmentID + normalized RelativePath` 是唯一文件定位键，DocumentID 是稳定身份。Cockpit 内发起重命名或移动时保持 DocumentID 不变，并同步更新全部页签引用。
+
+Phase 1 只支持 UTF-8 与 UTF-8 BOM，保存时保留 BOM 和原有 LF/CRLF。二进制文件与无效 UTF-8 不进入 Monaco。Phase 1 使用手动保存和未保存文档恢复日志，不实现自动保存。
 
 外部修改处理：
 
@@ -493,6 +529,10 @@ Monaco 编辑事务
 - FSEvents 只作为失效信号，不作为最终事实来源。
 - 收到事件后执行针对性的文件系统对账。
 - 使用树增量，不执行整树重新加载。
+- 新建、重命名和移动限制在 Environment 根目录内。
+- 删除使用 macOS 废纸篓。
+- 每个 Environment 使用一个串行文件操作协调器。
+- 文件系统操作成功后再提交 DocumentSession、页签和树状态。
 
 ### 搜索
 
@@ -525,10 +565,13 @@ Monaco 编辑事务
 - 只有 CockpitHost 可以写入 workspace.sqlite。
 - 只有 CockpitTerminalSupervisor 可以写入 terminal.sqlite。
 - 每个 CockpitPTYKeeper 只能写入自己的运行时描述符、不可变 scrollback 分块和最终 VT 快照。
+- workspace.sqlite 保存 Project、Environment、Conversation、DocumentSession 和设备 WorkspaceContext 布局。
+- terminal.sqlite 保存 TerminalSession、LaunchSpec、生命周期以及 WorkspaceContextID 和 EnvironmentID 权威绑定。
+- Host 页签状态只保存 TerminalSessionID 引用，不复制 TerminalSession 权威记录。
 - 不同进程永远不共享可变数据库的写入所有权。
 - 启动恢复通过 IPC 完成对账。
 
-### EnvironmentKernel 状态
+### WorkspaceKernel 状态
 
 ```text
 Cold -> Active -> Background -> Evicted
@@ -567,7 +610,10 @@ Cold -> Active -> Background -> Evicted
 归档和删除规则：
 
 - Archive 隐藏 Conversation，但保留状态。
-- 删除 Conversation 前先处理所有活动会话。
+- 删除 Conversation 使用 Active、Deleting、TerminatingSessions、PurgingTerminalRecords、RemovingClientState、Deleted 的可恢复状态机。
+- 删除 Conversation 前先明确处理因移除该 Context 而失去最后一个 viewer 的脏 DocumentSession，以及全部活动 TerminalSession。
+- 正常终止未完成时提供单独的强制终止确认，不自动强杀。
+- 删除 Direct Conversation 不删除 Project 文件或共享 Direct Environment。
 - 删除 Conversation 永远不会隐式删除 worktree。
 - 删除 worktree 是独立操作，执行前检查本地变更。
 
@@ -659,18 +705,22 @@ dev.cockpit.terminal
 - 固定版本的 Monaco 与 Ghostty 构建输入。
 - 远程 Transport 一致性测试框架。
 
-### Phase 1：本地 Direct Conversation 垂直切片
+### Phase 1：本地 Direct Workspace 垂直切片
 
-- 添加 Project。
-- 创建 Direct Conversation。
-- 文件树。
-- Monaco 基础打开和保存。
-- TerminalSupervisor 与每会话 PTYKeeper 启动 Shell 和 Agent CLI。
-- App 退出、Supervisor 崩溃和状态恢复。
+详细设计：`docs/superpowers/specs/2026-08-06-cockpit-phase-1-design.md`
+
+- 添加一个 Project，并提供无需 Conversation 的完整 Project Context。
+- 在一个 Project 下创建、重命名和删除多个 Direct Conversation。
+- Project Context 与 Direct Conversation 共享一个 Direct Environment，分别保存页签和终端。
+- 文件树、新建、重命名、移动和删除到废纸篓。
+- Monaco UTF-8 基础打开、编辑、恢复和原子保存。
+- TerminalSupervisor 与每会话 PTYKeeper 启动普通 Shell、Codex 和 Claude。
+- 一个 Conversation 运行多个独立 Agent TerminalSession。
+- App、Host、Supervisor 和单 Keeper 故障恢复。
 
 ### Phase 2：工作环境隔离
 
-- 多 Project 和多 Conversation。
+- 多 Project。
 - Direct 与 Worktree Environment。
 - ActiveContext 原子切换。
 - 跨 Environment 隔离测试。
@@ -692,6 +742,13 @@ dev.cockpit.terminal
 ### Phase 6：产品化
 
 - Hardened Runtime、签名、公证、服务升级、迁移、恢复、安全验证和性能诊断。
+
+### 后续独立 Agent Integration
+
+- 为 Codex 与 Claude 分别实现结构化对话适配。
+- 根据 Conversation 内的 Agent 对话更新默认标题。
+- 普通终端 VT 输出不作为语义对话数据源。
+- 本总体架构不为该阶段分配编号；编号、范围和工期通过单独设计审批确定。
 
 ## 17. Phase 完成规则
 
