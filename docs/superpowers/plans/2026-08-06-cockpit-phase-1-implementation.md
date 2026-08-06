@@ -188,8 +188,12 @@ git commit -m "build: add phase 1 module boundaries"
 - Create: `Sources/CockpitProtocol/TerminalMessages.swift`
 - Modify: `Tests/CockpitTypesTests/IdentifiersTests.swift`
 - Create: `Tests/CockpitTypesTests/WorkspaceModelsTests.swift`
+- Create: `Tests/CockpitTypesTests/DocumentModelsTests.swift`
+- Create: `Tests/CockpitTypesTests/TerminalModelsTests.swift`
 - Create: `Tests/CockpitProtocolTests/Phase1MessageTests.swift`
 - Modify: `Tests/CockpitClientCoreTests/ConnectionControllerTests.swift`
+
+**Normative design:** `docs/superpowers/specs/2026-08-06-cockpit-phase-1-protocol-1-1-design.md`。该文档已经逐项批准，固定本任务的 Swift 领域类型、tagged Codable、protobuf field number、enum numeric value、oneof、ChannelID、校验顺序和 malformed-message 行为；实现不得重新选择 wire shape。Protocol 1.1 从本任务合入起成为冻结 ABI，后续只允许 additive evolution。
 
 **Contract:**
 
@@ -207,6 +211,14 @@ public enum WorkspaceContextID: Hashable, Codable, Sendable {
     case conversation(ConversationID)
 }
 
+public struct ResolvedWorkspaceContext: Hashable, Codable, Sendable {
+    public let contextID: WorkspaceContextID
+    public let projectID: ProjectID
+    public let conversationID: ConversationID?
+    public let environmentID: EnvironmentID
+    public let workspaceRootIdentity: String
+}
+
 public struct ActiveContext: Hashable, Codable, Sendable {
     public let contextID: WorkspaceContextID
     public let projectID: ProjectID
@@ -217,7 +229,9 @@ public struct ActiveContext: Hashable, Codable, Sendable {
 }
 ```
 
-现有 `DocumentSessionID`/`DocumentSessionScope` 在本任务迁移为 `DocumentID`/`DocumentScope`；仓库内调用点和测试一起更新，不保留两套文档身份。`TabRecord.Resource` 固定为 `.file(DocumentID)`、`.terminal(TerminalSessionID)`、`.newTabPicker`；file 保存每 Context 独立的 cursor/selection/scroll view state，terminal 只保存 session 引用，newTabPicker 不携带资源。`TerminalInput` 明确定义 text、key、paste、mouse、resize、signal；不把 AppKit `NSEvent` 或本地路径放入协议。
+现有 `DocumentSessionID`/`DocumentSessionScope` 在本任务迁移为 `DocumentID`/`DocumentScope`；仓库内调用点和测试一起更新，不保留两套文档身份。`TextPosition`、`TextRange`、`DocumentViewState` 与 `TabRecord` 在本任务定义，供 Task 5 直接消费；Task 5 不再重复定义这些基础值。`TabRecord.Resource` 固定为 `.file(DocumentID)`、`.terminal(TerminalSessionID)`、`.newTabPicker`，并使用批准设计中的显式 tagged Codable 和 resource/view-state 组合校验。
+
+`TerminalInput` 固定为 RequestContext + TerminalSessionID + InputLeaseID + inputSequence envelope，并以 oneof 定义 text、key、paste、mouse、resize、signal。key 使用 Cockpit `1/2/3` action、Unicode logical key、USB HID physical key 与固定 modifier bits；mouse 使用 `1...4` action、固定 button bits 与 Q16.16 cell wheel；signal 只允许 interrupt/quit/suspend/continue，且只走 Channel 0。不得把 AppKit `NSEvent`、IME preedit 或本地路径放入协议。
 
 协议版本从 `1.0` 升为 `1.1`。Channel 固定为：
 
@@ -234,11 +248,18 @@ extension ChannelID {
 
 所有 Phase 1 request/event 复用同一个 `RequestContext`：protocol version、ClientInstanceID、WindowID、WorkspaceContextID、EnvironmentID、ActiveContextGeneration、RequestID。terminal output 的 sequence/ack 使用现有 32-byte `FrameHeader`，protobuf 不复制第二套传输序号。
 
-`cockpit.proto` 同时定义 Task 15 直接消费的 `TerminalArchiveManifest`：TerminalSessionID、WorkerInstanceID、first/latest output sequence、重复的 chunk name/first sequence/last sequence/SHA-256、final snapshot SHA-256、exit status、completion timestamp。路径只允许单个相对文件名；SHA-256 固定 32 bytes；映射器拒绝缺字段、重复 chunk name、倒序/重叠 sequence 和绝对路径。
+`cockpit.proto` 只新增批准设计列出的 WorkspaceContextID、RequestContext、TerminalInput 子图与 Task 15 直接消费的 TerminalArchiveManifest 子图。TabRecord 和 DocumentViewState 不进入 protobuf；`DocumentMessages.swift` 只提供 DocumentID 的显式 UUID 字符串映射工具。archive 使用 oneof exit status 与 `google.protobuf.Timestamp`；路径只允许固定格式的单文件名；SHA-256 固定 32 bytes；映射器拒绝缺字段、重复 chunk name、倒序/重叠 sequence、非法 timestamp/exit status 和绝对路径，并接受批准设计明确允许的 chunk sequence 间隔。
 
 - [ ] **Step 1: 写领域值与 protobuf round-trip 失败测试**
 
-断言 `.project` 解码后没有 ConversationID；`.conversation` 保留 ConversationID；`A(17) -> B(18) -> A(19)` 的 generation 完整 round-trip；未知 `oneof` 和未知 enum 返回显式 malformed-message 错误；archive manifest 合法值 round-trip，非法 hash、路径与 sequence 被拒绝。
+先写且只写测试，不创建 production 类型或 mapper：
+
+- `IdentifiersTests.swift`：新增 ID、DocumentSessionID 完整迁移与 ChannelID `0...5`；
+- `WorkspaceModelsTests.swift`：project/conversation 不变量、ResolvedWorkspaceContext、RequestContext 和 `A(17) -> B(18) -> A(19)`；
+- `DocumentModelsTests.swift`：一基 TextPosition、anchor/active 方向、三种 Tab resource、tagged Codable 与非法 view-state 组合；
+- `TerminalModelsTests.swift`：key/mouse/resize/signal 数值和领域校验、SHA-256、exit status 与 archive range/name；
+- `Phase1MessageTests.swift`：批准 schema 的全部 round-trip、unknown field/oneof/enum、非法 UUID/scalar/hash/path/timestamp/sequence；
+- `ConnectionControllerTests.swift`：ProtocolVersion.current 与 handshake 从 1.0 更新为 1.1，并保留现有 negotiation 行为。
 
 - [ ] **Step 2: 运行失败测试**
 
@@ -250,7 +271,14 @@ Expected: 失败，原因是 Phase 1 类型、消息和 protocol 1.1 尚不存�
 
 - [ ] **Step 3: 实现类型、protobuf schema 和显式映射器**
 
-不得把 Swift `Codable` JSON 放入 protobuf bytes 字段。`WorkspaceMessages.swift`、`DocumentMessages.swift` 与 `TerminalMessages.swift` 对每个 enum/ID 显式映射并拒绝空 UUID 字符串。
+严格按 normative design 实现：
+
+1. 在 `Identifiers.swift` 完成 ID 迁移与 ChannelID；在 `ProtocolVersion.swift` 把 current 改为 1.1。
+2. 在三个 CockpitTypes model 文件实现所有构造不变量与 TabRecord tagged Codable。
+3. 在 `cockpit.proto` 使用批准的固定 field number、enum value、oneof 与 Google Timestamp；不得添加额外业务 message。
+4. 在三个 message mapper 文件实现 encode/decode 双向校验与 `ProtocolMappingError`；所有 mapping error 映射到现有 malformed-message wire code 3。
+5. Protocol 1.1 mapper 拒绝 SwiftProtobuf unknownFields、nil/unknown oneof 与 `.UNRECOGNIZED` enum；不得把 Swift Codable JSON 放入 protobuf bytes 字段。
+6. 保持现有 32-byte FrameHeader 不变，terminal output protobuf 不增加 sequence/ack。
 
 - [ ] **Step 4: 运行 focused checks 并提交**
 
@@ -411,16 +439,9 @@ public struct ClientWorkspaceState: Codable, Hashable, Sendable {
     public var sidebar: SidebarState
     public var splitView: SplitViewState
 }
-
-public struct DocumentViewState: Codable, Hashable, Sendable {
-    public var cursor: TextPosition
-    public var selections: [TextRange]
-    public var firstVisibleLine: UInt64
-    public var horizontalScrollOffset: Double
-}
 ```
 
-Generation 从进程内 1 单调递增，不写数据库。每个异步 UI response/event 必须先通过 `accepts(generation:)`，相同 Context 的旧 generation 也被拒绝。file `TabRecord` 按 WorkspaceContext 保存 `DocumentViewState`；文本仍由 Environment 级 DocumentID 共享。
+`TabRecord`、`TextPosition`、`TextRange` 与 `DocumentViewState` 直接使用 Task 2 已批准并实现的 CockpitTypes 领域值，不在本任务重复定义。Generation 从进程内 1 单调递增，不写数据库。每个异步 UI response/event 必须先通过 `accepts(generation:)`，相同 Context 的旧 generation 也被拒绝。file `TabRecord` 按 WorkspaceContext 保存 `DocumentViewState`；文本仍由 Environment 级 DocumentID 共享。
 
 `ClientIdentityStore` 使用可注入的 Keychain/Preferences ports：DeviceID 以 service `dev.cockpit.client-identity`、account `device-id-v1` 持久化；Phase 1 主窗口的 WindowID 以 preferences key `main-window-id-v1` 持久化；ClientInstanceID 每次 App 启动重新生成。生产实现只在 App composition root 使用，测试使用 UUID 隔离的 service 与独立 `UserDefaults` suite。
 
@@ -838,10 +859,28 @@ typedef struct {
 } cockpit_ghostty_bytes_t;
 
 typedef enum {
+  COCKPIT_GHOSTTY_MOD_SHIFT = 1u << 0,
+  COCKPIT_GHOSTTY_MOD_CONTROL = 1u << 1,
+  COCKPIT_GHOSTTY_MOD_ALT = 1u << 2,
+  COCKPIT_GHOSTTY_MOD_SUPER = 1u << 3,
+  COCKPIT_GHOSTTY_MOD_CAPS_LOCK = 1u << 4,
+  COCKPIT_GHOSTTY_MOD_NUM_LOCK = 1u << 5,
+  COCKPIT_GHOSTTY_MOD_SHIFT_RIGHT = 1u << 6,
+  COCKPIT_GHOSTTY_MOD_CONTROL_RIGHT = 1u << 7,
+  COCKPIT_GHOSTTY_MOD_ALT_RIGHT = 1u << 8,
+  COCKPIT_GHOSTTY_MOD_SUPER_RIGHT = 1u << 9
+} cockpit_ghostty_modifiers_t;
+typedef enum {
   COCKPIT_GHOSTTY_KEY_PRESS = 1,
   COCKPIT_GHOSTTY_KEY_REPEAT = 2,
   COCKPIT_GHOSTTY_KEY_RELEASE = 3
 } cockpit_ghostty_key_action_t;
+typedef enum {
+  COCKPIT_GHOSTTY_MOUSE_PRESS = 1,
+  COCKPIT_GHOSTTY_MOUSE_RELEASE = 2,
+  COCKPIT_GHOSTTY_MOUSE_MOTION = 3,
+  COCKPIT_GHOSTTY_MOUSE_SCROLL = 4
+} cockpit_ghostty_mouse_action_t;
 typedef struct {
   uint32_t logical_key;
   uint32_t physical_key;
@@ -899,6 +938,8 @@ COCKPIT_GHOSTTY_API void cockpit_ghostty_renderer_set_visible(
 }
 #endif
 ```
+
+Task 11 的输入数值语义直接使用 Task 2 冻结的 Protocol 1.1 定义：logical key 是未加修饰键的 Unicode scalar，physical key 是 W3C/Chromium table 的 USB HID usage code；modifier 只允许 bit `0...9`；mouse buttons 使用 left/right/middle/button4...11 的 bit `0...10`；wheel 使用有符号 Q16.16 cell 单位。bridge 对 Cockpit action 与 Ghostty 内部 enum 做显式映射，不把 Ghostty ordinal 暴露为 ABI。以上补充不改变已批准 C struct 的字段顺序、类型或大小。
 
 header 在 typedef 前完整定义 key/mouse event 的固定宽度 enum/struct。所有返回 bytes 均由 bridge 分配，成功时由调用方且只由调用方调用 `cockpit_ghostty_bytes_free`；失败时必须返回 `{NULL, 0}`。renderer create 在 destroy 前 retain 传入的 NSView；其余指针只在调用期间借用。
 
@@ -1180,7 +1221,7 @@ public actor TerminalStreamCoordinator {
 
 Supervisor 是输入租约唯一权威端，通过 control protocol 创建/转移/释放 `InputLeaseGrant(leaseID, holderViewerID, sequenceBase, capabilities)` 并注册给 Keeper；Keeper 只校验和执行。每个 viewer queue 固定为最多 2 个 screen frame；第三个 frame 到来时合并中间帧并保留最新权威 frame。输入 lease 单调 sequence，重复 sequence 返回原 ACK，不重复写 PTY；断开持有者时 Keeper 立即使本地 grant 失效并向 Supervisor 报告 revocation，Supervisor 不可用时不授予替代 lease。read-only viewer 无权 input/resize/signal/terminate。
 
-text 直接写 UTF-8；key/paste/mouse 必须调用 Task 11 基于当前 Ghostty VT mode 的 encoder 后再写 PTY；resize 在 Keeper 调用 `TIOCSWINSZ`；signal/terminate 经 Terminal control transport，不伪装成 PTY bytes。所有输入只接受 Task 2 的结构化 `TerminalInput`，不传 AppKit `NSEvent`。
+text 直接写 UTF-8；key/paste/mouse 必须调用 Task 11 基于当前 Ghostty VT mode 的 encoder 后再写 PTY；resize 在 Keeper 调用 `TIOCSWINSZ`；signal/terminate 经 Terminal control transport，不伪装成 PTY bytes。signal 只接受 Task 2 冻结的 interrupt/quit/suspend/continue，并发送给 PTY 当前 foreground process group；SIGHUP 被拒绝，SIGTERM/SIGKILL 只能走独立 terminate policy。所有输入只接受 Task 2 的结构化 `TerminalInput`，不传 AppKit `NSEvent`。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1237,6 +1278,8 @@ TerminalArchives/{terminalSessionID}/
 ```
 
 chunk 是不可变、按首 sequence 命名的 Ghostty scrollback frame；`manifest.pb` 使用 Task 2 生成的 `TerminalArchiveManifest`。`TerminalArchiveStore` 与 runtime directory 分离，只能写 Task 1 的 Application Support archive root，创建目录 `0700`、文件 `0600`，拒绝 symlink；Keeper 先 fsync chunks/snapshot，再用临时文件 + rename + 父目录 fsync 原子发布 manifest。Supervisor 只把存在且 hash 全部匹配的 manifest 标为 Exited/Terminated archive。
+
+manifest 的 field number、exit-status oneof、Google Timestamp、32-byte hash、20 位 chunk name、sequence range 与允许 gap 的规则固定引用 `docs/superpowers/specs/2026-08-06-cockpit-phase-1-protocol-1-1-design.md`；Task 15 不修改或重新解释 Task 2 已冻结 ABI。
 
 - [ ] **Step 1: 写失败测试**
 
