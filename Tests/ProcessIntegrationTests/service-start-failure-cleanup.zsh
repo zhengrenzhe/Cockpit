@@ -22,6 +22,9 @@ set -e
 
 print -r -- "$failure_output"
 [[ "$failure_status" -ne 0 ]]
+[[ "$failure_output" != *"Unknown option"* ]]
+[[ "$failure_output" != *"Usage:"* ]]
+[[ "$failure_output" == *"injected failure after Host bootstrap"* ]]
 [[ -f "$service_root_record" ]]
 IFS= read -r service_root < "$service_root_record"
 [[ "$service_root" == /private/tmp/cockpit-phase0.* ]]

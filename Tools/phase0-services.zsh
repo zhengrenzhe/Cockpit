@@ -52,7 +52,7 @@ render_terminal() {
 
 case "${1:-}" in
   start)
-    /usr/bin/swift build --package-path "$repo_root" --disable-automatic-resolution --skip-update --no-parallel
+    /usr/bin/swift build --package-path "$repo_root" --disable-automatic-resolution --skip-update
     /bin/mkdir -p "$fixture_dir"
 
     stop_service dev.cockpit.host.local
