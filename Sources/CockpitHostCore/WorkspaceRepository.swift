@@ -135,6 +135,7 @@ public protocol WorkspaceRepository: Sendable {
     func createProjectWithDirectEnvironment(_ input: NewProject) async throws -> Project
     func listProjects() async throws -> [Project]
     func createConversation(_ input: NewConversation) async throws -> Conversation
+    func listConversations(projectID: ProjectID) async throws -> [Conversation]
     func renameConversation(id: ConversationID, title: String) async throws
     func resolve(_ contextID: WorkspaceContextID) async throws -> ResolvedWorkspaceContext
 }

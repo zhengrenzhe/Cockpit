@@ -26,7 +26,7 @@ enum SQLiteColumn: Sendable {
 
 actor SQLiteConnection {
     private let handle: SQLiteDatabaseHandle
-    private var database: OpaquePointer { handle.pointer }
+    private var database: OpaquePointer { handle.pointer! }
 
     init(databaseURL: URL) throws {
         var openedDatabase: OpaquePointer?
@@ -50,6 +50,10 @@ actor SQLiteConnection {
             throw error
         }
         handle = SQLiteDatabaseHandle(openedDatabase)
+    }
+
+    func close() -> Int32 {
+        handle.close()
     }
 
     func textValue(for sql: String) throws -> String? {
@@ -135,7 +139,13 @@ actor SQLiteConnection {
                 case SQLITE_INTEGER: .integer(sqlite3_column_int64(statement, index))
                 case SQLITE_FLOAT: .real(sqlite3_column_double(statement, index))
                 case SQLITE_TEXT:
-                    .text(String(cString: sqlite3_column_text(statement, index)))
+                    .text(String(
+                        decoding: UnsafeBufferPointer(
+                            start: sqlite3_column_text(statement, index),
+                            count: Int(sqlite3_column_bytes(statement, index))
+                        ),
+                        as: UTF8.self
+                    ))
                 case SQLITE_BLOB:
                     .blob(Data(
                         bytes: sqlite3_column_blob(statement, index),
@@ -163,7 +173,21 @@ actor SQLiteConnection {
             let index = Int32(offset + 1)
             let result: Int32
             switch value {
-            case let .text(text): result = sqlite3_bind_text(statement, index, text, -1, transient)
+            case let .text(text):
+                let utf8 = text.utf8CString
+                let byteCount = utf8.count - 1
+                guard byteCount <= Int(Int32.max) else {
+                    throw SQLiteFailure(code: SQLITE_TOOBIG, message: "UTF-8 value exceeds SQLite limit")
+                }
+                result = utf8.withUnsafeBufferPointer { buffer in
+                    sqlite3_bind_text(
+                        statement,
+                        index,
+                        buffer.baseAddress,
+                        Int32(byteCount),
+                        transient
+                    )
+                }
             case let .blob(data):
                 result = data.withUnsafeBytes { bytes in
                     sqlite3_bind_blob(statement, index, bytes.baseAddress, Int32(bytes.count), transient)
@@ -189,13 +213,24 @@ actor SQLiteConnection {
 }
 
 private final class SQLiteDatabaseHandle: @unchecked Sendable {
-    let pointer: OpaquePointer
+    private(set) var pointer: OpaquePointer?
 
     init(_ pointer: OpaquePointer) {
         self.pointer = pointer
     }
 
+    func close() -> Int32 {
+        guard let pointer else { return SQLITE_OK }
+        let result = sqlite3_close(pointer)
+        if result == SQLITE_OK {
+            self.pointer = nil
+        }
+        return result
+    }
+
     deinit {
-        sqlite3_close(pointer)
+        if let pointer {
+            sqlite3_close(pointer)
+        }
     }
 }

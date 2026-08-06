@@ -36,6 +36,180 @@ import Testing
     }
 }
 
+@Test func documentsMigrationUsesEnvironmentLocatorAndApprovedPersistentState() async throws {
+    try await withMigrationDatabase { databaseURL in
+        let connection = try SQLiteConnection(databaseURL: databaseURL)
+        try await connection.applyMigrations(WorkspaceMigrations.all)
+
+        let tableInfo = try await connection.query("PRAGMA table_info(documents)")
+        #expect(tableInfo.compactMap { text(in: $0, at: 1) } == [
+            "id",
+            "environment_id",
+            "relative_path",
+            "document_version",
+            "persisted_version",
+            "dirty_state",
+            "edit_lease_id",
+        ])
+        #expect(integer(in: tableInfo[6], at: 3) == 0)
+
+        let foreignKeys = try await connection.query("PRAGMA foreign_key_list(documents)")
+        #expect(foreignKeys.count == 1)
+        #expect(text(in: foreignKeys[0], at: 2) == "environments")
+        #expect(text(in: foreignKeys[0], at: 3) == "environment_id")
+        #expect(text(in: foreignKeys[0], at: 4) == "id")
+
+        let indexes = try await connection.query("PRAGMA index_list(documents)")
+        let uniqueIndexName = indexes.first { integer(in: $0, at: 2) == 1 }
+            .flatMap { text(in: $0, at: 1) }
+        let indexName = try #require(uniqueIndexName)
+        let indexedColumns = try await connection.query("PRAGMA index_info('\(indexName)')")
+        #expect(indexedColumns.compactMap { text(in: $0, at: 2) } == [
+            "environment_id",
+            "relative_path",
+        ])
+
+        await #expect(throws: (any Error).self) {
+            try await insertDocument(
+                connection,
+                id: "foreign-key-document",
+                environmentID: "missing-environment",
+                relativePath: "Sources/App.swift",
+                documentVersion: 0,
+                persistedVersion: 0,
+                dirtyState: "clean"
+            )
+        }
+    }
+}
+
+@Test func documentsMigrationEnforcesLocatorDirtyStateAndNonnegativeVersions() async throws {
+    try await withMigrationDatabase { databaseURL in
+        let connection = try SQLiteConnection(databaseURL: databaseURL)
+        try await connection.applyMigrations(WorkspaceMigrations.all)
+        try await connection.execute("PRAGMA foreign_keys=OFF")
+
+        try await insertDocument(
+            connection,
+            id: "document-1",
+            environmentID: "environment-1",
+            relativePath: "Sources/App.swift",
+            documentVersion: 3,
+            persistedVersion: 2,
+            dirtyState: "dirty"
+        )
+        try await insertDocument(
+            connection,
+            id: "clean-document",
+            environmentID: "environment-1",
+            relativePath: "Sources/Clean.swift",
+            documentVersion: 0,
+            persistedVersion: 0,
+            dirtyState: "clean"
+        )
+        try await insertDocument(
+            connection,
+            id: "conflict-document",
+            environmentID: "environment-1",
+            relativePath: "Sources/Conflict.swift",
+            documentVersion: 1,
+            persistedVersion: 1,
+            dirtyState: "conflict"
+        )
+        try await insertDocument(
+            connection,
+            id: "missing-document",
+            environmentID: "environment-1",
+            relativePath: "Sources/Missing.swift",
+            documentVersion: 2,
+            persistedVersion: 2,
+            dirtyState: "missing"
+        )
+        await #expect(throws: (any Error).self) {
+            try await insertDocument(
+                connection,
+                id: "document-2",
+                environmentID: "environment-1",
+                relativePath: "Sources/App.swift",
+                documentVersion: 3,
+                persistedVersion: 2,
+                dirtyState: "dirty"
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            try await insertDocument(
+                connection,
+                id: "document-3",
+                environmentID: "environment-1",
+                relativePath: "Sources/Other.swift",
+                documentVersion: 0,
+                persistedVersion: 0,
+                dirtyState: "unknown"
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            try await insertDocument(
+                connection,
+                id: "document-4",
+                environmentID: "environment-1",
+                relativePath: "Sources/Negative.swift",
+                documentVersion: -1,
+                persistedVersion: 0,
+                dirtyState: "clean"
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            try await insertDocument(
+                connection,
+                id: "document-5",
+                environmentID: "environment-1",
+                relativePath: "Sources/PersistedNegative.swift",
+                documentVersion: 0,
+                persistedVersion: -1,
+                dirtyState: "clean"
+            )
+        }
+    }
+}
+
+private func insertDocument(
+    _ connection: SQLiteConnection,
+    id: String,
+    environmentID: String,
+    relativePath: String,
+    documentVersion: Int64,
+    persistedVersion: Int64,
+    dirtyState: String
+) async throws {
+    try await connection.execute(
+        """
+        INSERT INTO documents (
+            id, environment_id, relative_path, document_version,
+            persisted_version, dirty_state, edit_lease_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        bindings: [
+            .text(id),
+            .text(environmentID),
+            .text(relativePath),
+            .integer(documentVersion),
+            .integer(persistedVersion),
+            .text(dirtyState),
+            .null,
+        ]
+    )
+}
+
+private func text(in row: [SQLiteColumn], at index: Int) -> String? {
+    guard row.indices.contains(index), case let .text(value) = row[index] else { return nil }
+    return value
+}
+
+private func integer(in row: [SQLiteColumn], at index: Int) -> Int64? {
+    guard row.indices.contains(index), case let .integer(value) = row[index] else { return nil }
+    return value
+}
+
 private func withMigrationDatabase(
     _ body: (URL) async throws -> Void
 ) async throws {

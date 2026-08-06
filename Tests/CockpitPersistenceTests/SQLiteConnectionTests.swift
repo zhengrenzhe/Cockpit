@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import Testing
 @testable import CockpitPersistence
 
@@ -9,6 +10,19 @@ import Testing
         #expect(try await connection.textValue(for: "PRAGMA journal_mode") == "wal")
         #expect(try await connection.integerValue(for: "PRAGMA foreign_keys") == 1)
         #expect(try await connection.integerValue(for: "PRAGMA busy_timeout") == 5_000)
+    }
+}
+
+@Test func sqliteConnectionCanCloseExactlyOnceAndReopen() async throws {
+    try await withTemporaryDatabase { databaseURL in
+        let firstConnection = try SQLiteConnection(databaseURL: databaseURL)
+
+        #expect(await firstConnection.close() == SQLITE_OK)
+        #expect(await firstConnection.close() == SQLITE_OK)
+
+        let reopenedConnection = try SQLiteConnection(databaseURL: databaseURL)
+        #expect(try await reopenedConnection.integerValue(for: "PRAGMA foreign_keys") == 1)
+        #expect(await reopenedConnection.close() == SQLITE_OK)
     }
 }
 

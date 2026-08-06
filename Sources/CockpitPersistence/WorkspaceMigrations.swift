@@ -60,8 +60,14 @@ enum WorkspaceMigrations {
             """
             CREATE TABLE documents (
                 id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
-                FOREIGN KEY (conversation_id) REFERENCES conversations (id) ON DELETE CASCADE
+                environment_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                document_version INTEGER NOT NULL CHECK (document_version >= 0),
+                persisted_version INTEGER NOT NULL CHECK (persisted_version >= 0),
+                dirty_state TEXT NOT NULL CHECK (dirty_state IN ('clean', 'dirty', 'conflict', 'missing')),
+                edit_lease_id TEXT,
+                UNIQUE (environment_id, relative_path),
+                FOREIGN KEY (environment_id) REFERENCES environments (id)
             )
             """,
             """

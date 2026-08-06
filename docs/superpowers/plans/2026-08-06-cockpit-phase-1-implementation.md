@@ -313,6 +313,7 @@ public protocol WorkspaceRepository: Sendable {
     func createProjectWithDirectEnvironment(_ input: NewProject) async throws -> Project
     func listProjects() async throws -> [Project]
     func createConversation(_ input: NewConversation) async throws -> Conversation
+    func listConversations(projectID: ProjectID) async throws -> [Conversation]
     func renameConversation(id: ConversationID, title: String) async throws
     func resolve(_ contextID: WorkspaceContextID) async throws -> ResolvedWorkspaceContext
 }
@@ -322,7 +323,7 @@ Migration v1 一次创建 `projects`、`environments`、`conversations`、`docum
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖 WAL、foreign keys、busy timeout、migration v1 事务回滚、Project+Direct Environment 原子创建、第二个 Project 被 `phaseOneProjectLimit` 拒绝、多个 Conversation 共享 base Environment，以及关闭重开数据库后 Project/Conversation/Environment 解析结果不变；本任务不写布局持久化测试。
+覆盖 WAL、foreign keys、busy timeout、migration v1 事务回滚、Project+Direct Environment 原子创建、第二个 Project 被 `phaseOneProjectLimit` 拒绝、多个 Conversation 共享 base Environment，以及显式关闭后只凭 databaseURL 重建 repository 仍能枚举完整 Conversation 并保持 Project/Conversation/Environment 解析结果不变；本任务不写布局持久化测试。
 
 - [ ] **Step 2: 运行失败测试**
 

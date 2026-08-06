@@ -11,6 +11,10 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         self.connection = connection
     }
 
+    func close() async -> Int32 {
+        await connection.close()
+    }
+
     public func createProjectWithDirectEnvironment(_ input: NewProject) async throws -> Project {
         let createdAt = Date(timeIntervalSince1970: Date().timeIntervalSince1970)
         let project = Project(
@@ -120,6 +124,20 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         }
     }
 
+    public func listConversations(projectID: ProjectID) async throws -> [Conversation] {
+        let rows = try await connection.query(
+            """
+            SELECT id, project_id, environment_id, title, lifecycle_state,
+                   deletion_phase, deletion_operation_id, created_at
+            FROM conversations
+            WHERE project_id = ?
+            ORDER BY created_at, id
+            """,
+            bindings: [.text(projectID.description)]
+        )
+        return try rows.map(Self.conversation(from:))
+    }
+
     public func renameConversation(id: ConversationID, title: String) async throws {
         try await connection.withImmediateTransaction { connection in
             guard try !connection.query(
@@ -208,6 +226,49 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         )
     }
 
+    private static func conversation(from row: [SQLiteColumn]) throws -> Conversation {
+        guard let id = conversationID(row[safe: 0]),
+              let projectID = projectID(row[safe: 1]),
+              let environmentID = environmentID(row[safe: 2]),
+              let title = row[safe: 3]?.text,
+              let lifecycleText = row[safe: 4]?.text,
+              let createdAt = row[safe: 7]?.real
+        else {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+
+        let lifecycleState: ConversationLifecycleState
+        let deletionOperationID: DeletionOperationID?
+        switch lifecycleText {
+        case "active":
+            guard row[safe: 5]?.isNull == true, row[safe: 6]?.isNull == true else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            lifecycleState = .active
+            deletionOperationID = nil
+        case "deleting":
+            guard let phase = row[safe: 5]?.text,
+                  let operationID = Self.deletionOperationID(row[safe: 6])
+            else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            lifecycleState = .deleting(phase: phase)
+            deletionOperationID = operationID
+        default:
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+
+        return Conversation(
+            id: id,
+            projectID: projectID,
+            environmentID: environmentID,
+            title: title,
+            lifecycleState: lifecycleState,
+            deletionOperationID: deletionOperationID,
+            createdAt: Date(timeIntervalSince1970: createdAt)
+        )
+    }
+
     private static func projectID(_ column: SQLiteColumn?) -> ProjectID? {
         guard let text = column?.text, let uuid = UUID(uuidString: text) else { return nil }
         return ProjectID(uuid)
@@ -216,6 +277,16 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
     private static func environmentID(_ column: SQLiteColumn?) -> EnvironmentID? {
         guard let text = column?.text, let uuid = UUID(uuidString: text) else { return nil }
         return EnvironmentID(uuid)
+    }
+
+    private static func conversationID(_ column: SQLiteColumn?) -> ConversationID? {
+        guard let text = column?.text, let uuid = UUID(uuidString: text) else { return nil }
+        return ConversationID(uuid)
+    }
+
+    private static func deletionOperationID(_ column: SQLiteColumn?) -> DeletionOperationID? {
+        guard let text = column?.text, let uuid = UUID(uuidString: text) else { return nil }
+        return DeletionOperationID(uuid)
     }
 }
 
@@ -241,6 +312,11 @@ private extension SQLiteColumn {
     var integer: Int64? {
         guard case let .integer(value) = self else { return nil }
         return value
+    }
+
+    var isNull: Bool {
+        if case .null = self { return true }
+        return false
     }
 }
 
