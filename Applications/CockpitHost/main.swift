@@ -1,8 +1,24 @@
 import Foundation
+import CoreFoundation
 import CockpitHostCore
 import CockpitLocalTransport
 import CockpitPersistence
 import CockpitWorkspace
+
+private func parkHostProcess(retaining graph: [Any]) -> Never {
+    withExtendedLifetime(graph) {
+        let processLifetime = CFRunLoopTimerCreateWithHandler(
+            kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + 3_153_600_000,
+            0,
+            0,
+            0
+        ) { _ in }
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), processLifetime, .defaultMode)
+        CFRunLoopRun()
+    }
+    fatalError("CockpitHost process run loop stopped")
+}
 
 let storage = try CockpitStorageLocations.production()
 let repository = try await SQLiteWorkspaceRepository(databaseURL: storage.workspaceDatabase)
@@ -24,4 +40,6 @@ let delegate = MachServiceListenerDelegate(
 let listener = NSXPCListener(machServiceName: "dev.cockpit.host")
 listener.delegate = delegate
 listener.resume()
-await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+parkHostProcess(
+    retaining: [repository, registry, service, router, exported, delegate, listener]
+)

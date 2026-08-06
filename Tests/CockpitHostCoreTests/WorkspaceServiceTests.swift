@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 import CockpitTypes
-import CockpitWorkspace
+@testable import CockpitWorkspace
 @testable import CockpitHostCore
 
 @Test func addingProjectCreatesSelectableProjectContextWithoutConversationOrTerminalCreation() async throws {
@@ -92,7 +92,184 @@ import CockpitWorkspace
     }
 }
 
+@Test func securityScopedResolverStartsAndStopsResolvedURLExactlyOnce() throws {
+    try withSecurityScopeFixture(isDirectory: true) { url in
+        let boundary = RecordingSecurityScopeBoundary(resolvedURL: url)
+        let resolver = SecurityScopedProjectRootResolver(boundary: boundary)
+        var root: ResolvedProjectRoot? = try resolver.resolve(bookmark: Data([0x01]))
+
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs.isEmpty)
+        #expect(boundary.usedWithSecurityScope)
+        #expect(boundary.usedWithoutImplicitStartAccessing)
+        root = nil
+        withExtendedLifetime(root) {}
+
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs == [url])
+    }
+}
+
+@Test func securityScopedResolverBalancesResolvedURLWhenInspectionThrows() throws {
+    try withSecurityScopeFixture(isDirectory: false) { url in
+        let boundary = RecordingSecurityScopeBoundary(resolvedURL: url)
+        let resolver = SecurityScopedProjectRootResolver(boundary: boundary)
+
+        #expect(throws: CocoaError.self) {
+            _ = try resolver.resolve(bookmark: Data([0x01]))
+        }
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs == [url])
+    }
+}
+
+@Test func securityScopedResolverFailsClosedWhenManualAccessCannotStart() throws {
+    try withSecurityScopeFixture(isDirectory: true) { url in
+        let boundary = RecordingSecurityScopeBoundary(
+            resolvedURL: url,
+            startAccessResult: false
+        )
+        let resolver = SecurityScopedProjectRootResolver(boundary: boundary)
+
+        do {
+            _ = try resolver.resolve(bookmark: Data([0x01]))
+            Issue.record("Expected manual security-scope start to fail")
+        } catch {
+            let actual = error as NSError
+            #expect(actual.domain == NSCocoaErrorDomain)
+            #expect(actual.code == CocoaError.Code.fileReadNoPermission.rawValue)
+        }
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs.isEmpty)
+    }
+}
+
+@Test func staleBookmarkFailsAddProjectBeforeStartingSecurityScope() async throws {
+    let url = try makeSecurityScopeFixture(isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let boundary = RecordingSecurityScopeBoundary(resolvedURL: url, isStale: true)
+    let service = WorkspaceService(
+        repository: InMemoryWorkspaceRepository(),
+        rootResolver: SecurityScopedProjectRootResolver(boundary: boundary),
+        kernelRegistry: WorkspaceKernelRegistry()
+    )
+
+    do {
+        _ = try await service.addProject(bookmark: Data([0x01]), displayName: "Stale")
+        Issue.record("Expected stale bookmark to fail addProject")
+    } catch {
+        let actual = error as NSError
+        #expect(actual.domain == NSCocoaErrorDomain)
+        #expect(actual.code == CocoaError.Code.fileReadCorruptFile.rawValue)
+    }
+    #expect(boundary.startURLs.isEmpty)
+    #expect(boundary.stopURLs.isEmpty)
+}
+
+@Test func stalePersistedBookmarkFailsListWorkspaceBeforeStartingSecurityScope() async throws {
+    let url = try makeSecurityScopeFixture(isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let repository = InMemoryWorkspaceRepository()
+    _ = try await repository.createProjectWithDirectEnvironment(
+        NewProject(
+            displayName: "Persisted",
+            rootBookmark: Data([0x02]),
+            canonicalRootIdentity: "volume:test/file:persisted",
+            workspaceRoot: url.path,
+            gitCommonDirectory: nil
+        )
+    )
+    let boundary = RecordingSecurityScopeBoundary(resolvedURL: url, isStale: true)
+    let service = WorkspaceService(
+        repository: repository,
+        rootResolver: SecurityScopedProjectRootResolver(boundary: boundary),
+        kernelRegistry: WorkspaceKernelRegistry()
+    )
+
+    do {
+        _ = try await service.listWorkspace()
+        Issue.record("Expected stale persisted bookmark to fail listWorkspace")
+    } catch {
+        let actual = error as NSError
+        #expect(actual.domain == NSCocoaErrorDomain)
+        #expect(actual.code == CocoaError.Code.fileReadCorruptFile.rawValue)
+    }
+    #expect(boundary.startURLs.isEmpty)
+    #expect(boundary.stopURLs.isEmpty)
+}
+
 private final class TestProjectRootAccessToken: ProjectRootAccessToken, @unchecked Sendable {}
+
+private final class RecordingSecurityScopeBoundary:
+    SecurityScopedBookmarkAccessing,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let resolvedURL: URL
+    private let startAccessResult: Bool
+    private let isStale: Bool
+    private var resolutionOptions: URL.BookmarkResolutionOptions = []
+    private var recordedStartURLs: [URL] = []
+    private var recordedStopURLs: [URL] = []
+
+    init(
+        resolvedURL: URL,
+        startAccessResult: Bool = true,
+        isStale: Bool = false
+    ) {
+        self.resolvedURL = resolvedURL
+        self.startAccessResult = startAccessResult
+        self.isStale = isStale
+    }
+
+    func resolve(
+        bookmark: Data,
+        options: URL.BookmarkResolutionOptions
+    ) throws -> SecurityScopedBookmarkResolution {
+        lock.withLock { resolutionOptions = options }
+        return SecurityScopedBookmarkResolution(url: resolvedURL, isStale: isStale)
+    }
+
+    func startAccessing(_ url: URL) -> Bool {
+        lock.withLock { recordedStartURLs.append(url) }
+        return startAccessResult
+    }
+
+    func stopAccessing(_ url: URL) {
+        lock.withLock { recordedStopURLs.append(url) }
+    }
+
+    var startURLs: [URL] { lock.withLock { recordedStartURLs } }
+    var stopURLs: [URL] { lock.withLock { recordedStopURLs } }
+    var usedWithSecurityScope: Bool {
+        lock.withLock { resolutionOptions.contains(.withSecurityScope) }
+    }
+    var usedWithoutImplicitStartAccessing: Bool {
+        lock.withLock { resolutionOptions.contains(.withoutImplicitStartAccessing) }
+    }
+}
+
+private func withSecurityScopeFixture(
+    isDirectory: Bool,
+    body: (URL) throws -> Void
+) throws {
+    let url = try makeSecurityScopeFixture(isDirectory: isDirectory)
+    defer { try? FileManager.default.removeItem(at: url) }
+    try body(url)
+}
+
+private func makeSecurityScopeFixture(isDirectory: Bool) throws -> URL {
+    let url = URL(
+        fileURLWithPath: "/private/tmp/cockpit-security-scope-tests.\(UUID().uuidString)",
+        isDirectory: isDirectory
+    )
+    if isDirectory {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+    } else {
+        #expect(FileManager.default.createFile(atPath: url.path, contents: Data()))
+    }
+    return url
+}
 
 private func makeResolvedRoot() -> ResolvedProjectRoot {
     ResolvedProjectRoot(

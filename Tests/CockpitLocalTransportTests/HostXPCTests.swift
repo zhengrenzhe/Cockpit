@@ -19,6 +19,66 @@ import CockpitHostCore
     }
 }
 
+@Test func workspaceRequestRejectsUnknownField() {
+    let invalid = Data(#"{"command":"listWorkspace","unknown":1}"#.utf8)
+
+    #expect(throws: DecodingError.self) {
+        _ = try JSONDecoder().decode(WorkspaceCommandRequest.self, from: invalid)
+    }
+}
+
+@Test func workspaceResponseRejectsUnknownTopLevelField() throws {
+    let encoded = try JSONEncoder().encode(WorkspaceCommandResponse.empty)
+    let invalid = try mutatingJSONObject(encoded) { object in
+        object["unknown"] = 1
+    }
+
+    #expect(throws: DecodingError.self) {
+        _ = try JSONDecoder().decode(WorkspaceCommandResponse.self, from: invalid)
+    }
+}
+
+@Test func workspaceResponseRejectsUnknownNestedWireFields() throws {
+    let fixture = try WorkspaceFixture()
+    let projectData = try JSONEncoder().encode(
+        WorkspaceCommandResponse.projectSnapshot(fixture.snapshot)
+    )
+    let projectUnknown = try mutatingJSONObject(projectData) { object in
+        var project = object["projectSnapshot"] as! [String: Any]
+        project["unknown"] = 1
+        object["projectSnapshot"] = project
+    }
+    let conversationUnknown = try mutatingJSONObject(projectData) { object in
+        var project = object["projectSnapshot"] as! [String: Any]
+        var conversations = project["conversations"] as! [[String: Any]]
+        conversations[0]["unknown"] = 1
+        project["conversations"] = conversations
+        object["projectSnapshot"] = project
+    }
+    let contextUnknown = try mutatingJSONObject(projectData) { object in
+        var project = object["projectSnapshot"] as! [String: Any]
+        var context = project["resolvedContext"] as! [String: Any]
+        context["unknown"] = 1
+        project["resolvedContext"] = context
+        object["projectSnapshot"] = project
+    }
+    let contextIDUnknown = try mutatingJSONObject(projectData) { object in
+        var project = object["projectSnapshot"] as! [String: Any]
+        var context = project["resolvedContext"] as! [String: Any]
+        var contextID = context["contextID"] as! [String: Any]
+        contextID["unknown"] = 1
+        context["contextID"] = contextID
+        project["resolvedContext"] = context
+        object["projectSnapshot"] = project
+    }
+
+    for invalid in [projectUnknown, conversationUnknown, contextUnknown, contextIDUnknown] {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder().decode(WorkspaceCommandResponse.self, from: invalid)
+        }
+    }
+}
+
 @Test func routerRoundTripsWorkspaceCommandsWithoutAbsolutePathOnTheWire() async throws {
     let fixture = try WorkspaceFixture()
     let service = RecordingWorkspaceService(fixture: fixture)
@@ -110,12 +170,69 @@ import CockpitHostCore
     await client.disconnect()
 }
 
+@Test func cockpitHostParksWithoutCheckedContinuationMisuse() async throws {
+    let diagnostics = Pipe()
+    let process = Process()
+    process.executableURL = try cockpitHostExecutableURL()
+    process.standardOutput = diagnostics
+    process.standardError = diagnostics
+    try process.run()
+
+    try await Task.sleep(for: .milliseconds(250))
+    let stayedRunning = process.isRunning
+    if stayedRunning {
+        process.terminate()
+    }
+    process.waitUntilExit()
+    let output = String(
+        decoding: diagnostics.fileHandleForReading.readDataToEndOfFile(),
+        as: UTF8.self
+    )
+
+    if !stayedRunning {
+        Issue.record(
+            "CockpitHost exited before parking: executable=\(process.executableURL?.path ?? "nil"), reason=\(String(describing: process.terminationReason)), status=\(process.terminationStatus), output=\(output)"
+        )
+    }
+    #expect(!output.contains("SWIFT TASK CONTINUATION MISUSE"))
+}
+
 private func route(
     _ request: WorkspaceCommandRequest,
     through router: WorkspaceCommandRouter
 ) async throws -> WorkspaceCommandResponse {
     let response = try await router.route(JSONEncoder().encode(request))
     return try JSONDecoder().decode(WorkspaceCommandResponse.self, from: response)
+}
+
+private func mutatingJSONObject(
+    _ data: Data,
+    mutation: (inout [String: Any]) -> Void
+) throws -> Data {
+    var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+    mutation(&object)
+    return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+}
+
+private func cockpitHostExecutableURL() throws -> URL {
+    let repository = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let build = repository.appendingPathComponent(".build", isDirectory: true)
+    let enumerator = FileManager.default.enumerator(
+        at: build,
+        includingPropertiesForKeys: [.isExecutableKey],
+        options: [.skipsHiddenFiles]
+    )
+    while let candidate = enumerator?.nextObject() as? URL {
+        if candidate.lastPathComponent == "CockpitHost",
+           candidate.path.contains("/debug/"),
+           FileManager.default.isExecutableFile(atPath: candidate.path) {
+            return candidate
+        }
+    }
+    throw CocoaError(.fileNoSuchFile)
 }
 
 private struct WorkspaceFixture: Sendable {

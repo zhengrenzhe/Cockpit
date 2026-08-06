@@ -3,35 +3,82 @@ import CockpitHostCore
 
 public final class SecurityScopedProjectRoot: ProjectRootAccessToken, @unchecked Sendable {
     private let url: URL
-    private let didStartAccessing: Bool
+    private let boundary: any SecurityScopedBookmarkAccessing
 
-    init(url: URL) {
+    init(url: URL, boundary: any SecurityScopedBookmarkAccessing) throws {
+        guard boundary.startAccessing(url) else {
+            throw CocoaError(.fileReadNoPermission)
+        }
         self.url = url
-        didStartAccessing = url.startAccessingSecurityScopedResource()
+        self.boundary = boundary
     }
 
     deinit {
-        if didStartAccessing {
-            url.stopAccessingSecurityScopedResource()
-        }
+        boundary.stopAccessing(url)
+    }
+}
+
+struct SecurityScopedBookmarkResolution: Sendable {
+    let url: URL
+    let isStale: Bool
+}
+
+protocol SecurityScopedBookmarkAccessing: Sendable {
+    func resolve(
+        bookmark: Data,
+        options: URL.BookmarkResolutionOptions
+    ) throws -> SecurityScopedBookmarkResolution
+    func startAccessing(_ url: URL) -> Bool
+    func stopAccessing(_ url: URL)
+}
+
+private struct FoundationSecurityScopedBookmarkAccess: SecurityScopedBookmarkAccessing {
+    func resolve(
+        bookmark: Data,
+        options: URL.BookmarkResolutionOptions
+    ) throws -> SecurityScopedBookmarkResolution {
+        var isStale = false
+        let url = try URL(
+            resolvingBookmarkData: bookmark,
+            options: options,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        )
+        return SecurityScopedBookmarkResolution(url: url, isStale: isStale)
+    }
+
+    func startAccessing(_ url: URL) -> Bool {
+        url.startAccessingSecurityScopedResource()
+    }
+
+    func stopAccessing(_ url: URL) {
+        url.stopAccessingSecurityScopedResource()
     }
 }
 
 public struct SecurityScopedProjectRootResolver: ProjectRootResolving {
-    public init() {}
+    private let boundary: any SecurityScopedBookmarkAccessing
+
+    public init() {
+        boundary = FoundationSecurityScopedBookmarkAccess()
+    }
+
+    init(boundary: any SecurityScopedBookmarkAccessing) {
+        self.boundary = boundary
+    }
 
     public func resolve(bookmark: Data) throws -> ResolvedProjectRoot {
-        var isStale = false
-        let resolvedURL = try URL(
-            resolvingBookmarkData: bookmark,
-            options: [.withSecurityScope],
-            relativeTo: nil,
-            bookmarkDataIsStale: &isStale
+        let resolution = try boundary.resolve(
+            bookmark: bookmark,
+            options: [.withSecurityScope, .withoutImplicitStartAccessing]
         )
-        let canonicalURL = resolvedURL
+        guard !resolution.isStale else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let token = try SecurityScopedProjectRoot(url: resolution.url, boundary: boundary)
+        let canonicalURL = resolution.url
             .resolvingSymlinksInPath()
             .standardizedFileURL
-        let token = SecurityScopedProjectRoot(url: canonicalURL)
         let values = try canonicalURL.resourceValues(forKeys: [
             .isDirectoryKey,
             .volumeIdentifierKey,

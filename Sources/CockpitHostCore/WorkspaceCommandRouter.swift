@@ -31,32 +31,43 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         let command = try container.decode(Command.self, forKey: .command)
         switch command {
         case .addProject:
+            try requireExactKeys(
+                decoder,
+                required: ["command", "bookmark", "displayName"]
+            )
             try Self.reject([.projectID, .conversationID, .title, .contextID], in: container)
             self = .addProject(
                 bookmark: try container.decode(Data.self, forKey: .bookmark),
                 displayName: try container.decode(String.self, forKey: .displayName)
             )
         case .listWorkspace:
+            try requireExactKeys(decoder, required: ["command"])
             try Self.reject(
                 [.bookmark, .displayName, .projectID, .conversationID, .title, .contextID],
                 in: container
             )
             self = .listWorkspace
         case .createDirectConversation:
+            try requireExactKeys(decoder, required: ["command", "projectID"])
             try Self.reject([.bookmark, .displayName, .conversationID, .title, .contextID], in: container)
             self = .createDirectConversation(
                 projectID: try container.decode(ProjectID.self, forKey: .projectID)
             )
         case .renameConversation:
+            try requireExactKeys(
+                decoder,
+                required: ["command", "conversationID", "title"]
+            )
             try Self.reject([.bookmark, .displayName, .projectID, .contextID], in: container)
             self = .renameConversation(
                 id: try container.decode(ConversationID.self, forKey: .conversationID),
                 title: try container.decode(String.self, forKey: .title)
             )
         case .resolveContext:
+            try requireExactKeys(decoder, required: ["command", "contextID"])
             try Self.reject([.bookmark, .displayName, .projectID, .conversationID, .title], in: container)
             self = .resolveContext(
-                try container.decode(WorkspaceContextID.self, forKey: .contextID)
+                try container.decode(WireWorkspaceContextID.self, forKey: .contextID).value
             )
         }
     }
@@ -79,7 +90,7 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
             try container.encode(title, forKey: .title)
         case let .resolveContext(contextID):
             try container.encode(Command.resolveContext, forKey: .command)
-            try container.encode(contextID, forKey: .contextID)
+            try container.encode(WireWorkspaceContextID(contextID), forKey: .contextID)
         }
     }
 
@@ -124,11 +135,13 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Result.self, forKey: .result) {
         case .projectSnapshot:
+            try requireExactKeys(decoder, required: ["result", "projectSnapshot"])
             try Self.reject([.workspaceSnapshot, .conversation, .resolvedContext], in: container)
             self = .projectSnapshot(
                 try container.decode(WireProjectSnapshot.self, forKey: .projectSnapshot).value
             )
         case .workspaceSnapshot:
+            try requireExactKeys(decoder, required: ["result", "workspaceSnapshot"])
             try Self.reject([.projectSnapshot, .conversation, .resolvedContext], in: container)
             self = .workspaceSnapshot(
                 try container.decode([WireProjectSnapshot].self, forKey: .workspaceSnapshot).map {
@@ -136,17 +149,20 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
                 }
             )
         case .conversation:
+            try requireExactKeys(decoder, required: ["result", "conversation"])
             try Self.reject([.projectSnapshot, .workspaceSnapshot, .resolvedContext], in: container)
             self = .conversation(
                 try container.decode(WireConversation.self, forKey: .conversation).value
             )
         case .empty:
+            try requireExactKeys(decoder, required: ["result"])
             try Self.reject([.projectSnapshot, .workspaceSnapshot, .conversation, .resolvedContext], in: container)
             self = .empty
         case .resolvedContext:
+            try requireExactKeys(decoder, required: ["result", "resolvedContext"])
             try Self.reject([.projectSnapshot, .workspaceSnapshot, .conversation], in: container)
             self = .resolvedContext(
-                try container.decode(ResolvedWorkspaceContext.self, forKey: .resolvedContext)
+                try container.decode(WireResolvedWorkspaceContext.self, forKey: .resolvedContext).value
             )
         }
     }
@@ -167,7 +183,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
             try container.encode(Result.empty, forKey: .result)
         case let .resolvedContext(context):
             try container.encode(Result.resolvedContext, forKey: .result)
-            try container.encode(context, forKey: .resolvedContext)
+            try container.encode(WireResolvedWorkspaceContext(context), forKey: .resolvedContext)
         }
     }
 
@@ -222,11 +238,41 @@ private struct WireProjectSnapshot: Codable {
     let resolvedContext: ResolvedWorkspaceContext
     let conversations: [WireConversation]
 
+    private enum CodingKeys: String, CodingKey {
+        case projectID
+        case displayName
+        case resolvedContext
+        case conversations
+    }
+
     init(_ value: ProjectSnapshot) {
         projectID = value.projectID
         displayName = value.displayName
         resolvedContext = value.resolvedContext
         conversations = value.conversations.map(WireConversation.init)
+    }
+
+    init(from decoder: Decoder) throws {
+        try requireExactKeys(
+            decoder,
+            required: ["projectID", "displayName", "resolvedContext", "conversations"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projectID = try container.decode(ProjectID.self, forKey: .projectID)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        resolvedContext = try container.decode(
+            WireResolvedWorkspaceContext.self,
+            forKey: .resolvedContext
+        ).value
+        conversations = try container.decode([WireConversation].self, forKey: .conversations)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(projectID, forKey: .projectID)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(WireResolvedWorkspaceContext(resolvedContext), forKey: .resolvedContext)
+        try container.encode(conversations, forKey: .conversations)
     }
 
     var value: ProjectSnapshot {
@@ -251,6 +297,17 @@ private struct WireConversation: Codable {
     let deletionOperationID: DeletionOperationID?
     let createdAt: Date
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case projectID
+        case environmentID
+        case title
+        case lifecycle
+        case deletionPhase
+        case deletionOperationID
+        case createdAt
+    }
+
     init(_ value: Conversation) {
         id = value.id
         projectID = value.projectID
@@ -266,6 +323,38 @@ private struct WireConversation: Codable {
         }
         deletionOperationID = value.deletionOperationID
         createdAt = value.createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        try requireExactKeys(
+            decoder,
+            required: ["id", "projectID", "environmentID", "title", "lifecycle", "createdAt"],
+            optional: ["deletionPhase", "deletionOperationID"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(ConversationID.self, forKey: .id)
+        projectID = try container.decode(ProjectID.self, forKey: .projectID)
+        environmentID = try container.decode(EnvironmentID.self, forKey: .environmentID)
+        title = try container.decode(String.self, forKey: .title)
+        lifecycle = try container.decode(String.self, forKey: .lifecycle)
+        deletionPhase = try container.decodeIfPresent(String.self, forKey: .deletionPhase)
+        deletionOperationID = try container.decodeIfPresent(
+            DeletionOperationID.self,
+            forKey: .deletionOperationID
+        )
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(projectID, forKey: .projectID)
+        try container.encode(environmentID, forKey: .environmentID)
+        try container.encode(title, forKey: .title)
+        try container.encode(lifecycle, forKey: .lifecycle)
+        try container.encodeIfPresent(deletionPhase, forKey: .deletionPhase)
+        try container.encodeIfPresent(deletionOperationID, forKey: .deletionOperationID)
+        try container.encode(createdAt, forKey: .createdAt)
     }
 
     var value: Conversation {
@@ -295,5 +384,128 @@ private struct WireConversation: Codable {
                 createdAt: createdAt
             )
         }
+    }
+}
+
+private struct WireResolvedWorkspaceContext: Codable {
+    let value: ResolvedWorkspaceContext
+
+    private enum CodingKeys: String, CodingKey {
+        case contextID
+        case projectID
+        case conversationID
+        case environmentID
+        case workspaceRootIdentity
+    }
+
+    init(_ value: ResolvedWorkspaceContext) {
+        self.value = value
+    }
+
+    init(from decoder: Decoder) throws {
+        try requireExactKeys(
+            decoder,
+            required: ["contextID", "projectID", "environmentID", "workspaceRootIdentity"],
+            optional: ["conversationID"]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = try ResolvedWorkspaceContext(
+            validating: container.decode(WireWorkspaceContextID.self, forKey: .contextID).value,
+            projectID: container.decode(ProjectID.self, forKey: .projectID),
+            conversationID: container.decodeIfPresent(ConversationID.self, forKey: .conversationID),
+            environmentID: container.decode(EnvironmentID.self, forKey: .environmentID),
+            workspaceRootIdentity: container.decode(String.self, forKey: .workspaceRootIdentity)
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(WireWorkspaceContextID(value.contextID), forKey: .contextID)
+        try container.encode(value.projectID, forKey: .projectID)
+        try container.encodeIfPresent(value.conversationID, forKey: .conversationID)
+        try container.encode(value.environmentID, forKey: .environmentID)
+        try container.encode(value.workspaceRootIdentity, forKey: .workspaceRootIdentity)
+    }
+}
+
+private struct WireWorkspaceContextID: Codable {
+    let value: WorkspaceContextID
+
+    private enum CodingKeys: String, CodingKey {
+        case project
+        case conversation
+    }
+
+    init(_ value: WorkspaceContextID) {
+        self.value = value
+    }
+
+    init(from decoder: Decoder) throws {
+        let keys = try decodedKeySet(decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch keys {
+        case ["project"]:
+            value = .project(try container.decode(ProjectID.self, forKey: .project))
+        case ["conversation"]:
+            value = .conversation(
+                try container.decode(ConversationID.self, forKey: .conversation)
+            )
+        default:
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Workspace context ID requires exactly one approved key"
+                )
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch value {
+        case let .project(projectID):
+            try container.encode(projectID, forKey: .project)
+        case let .conversation(conversationID):
+            try container.encode(conversationID, forKey: .conversation)
+        }
+    }
+}
+
+private struct DynamicCodingKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(intValue: Int) {
+        stringValue = String(intValue)
+        self.intValue = intValue
+    }
+}
+
+private func decodedKeySet(_ decoder: Decoder) throws -> Set<String> {
+    Set(
+        try decoder.container(keyedBy: DynamicCodingKey.self)
+            .allKeys
+            .map(\.stringValue)
+    )
+}
+
+private func requireExactKeys(
+    _ decoder: Decoder,
+    required: Set<String>,
+    optional: Set<String> = []
+) throws {
+    let actual = try decodedKeySet(decoder)
+    guard required.isSubset(of: actual), actual.isSubset(of: required.union(optional)) else {
+        throw DecodingError.dataCorrupted(
+            .init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Wire keys do not match the approved schema"
+            )
+        )
     }
 }
