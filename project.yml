@@ -141,6 +141,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitTests
+        GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Cockpit.app/Contents/MacOS/Cockpit
         BUNDLE_LOADER: $(TEST_HOST)
     dependencies:
