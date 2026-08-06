@@ -78,6 +78,43 @@ public typealias DeletionOperationID = CockpitID<DeletionOperationScope>
 
 `CockpitID.description` 与全部 protobuf encoder 固定输出小写、带连字符的 UUID。Decoder 接受 Foundation `UUID(uuidString:)` 可解析的 UUID 字符串，拒绝空字符串与非法 UUID，并在领域层归一为 UUID 值。
 
+Task 2 的领域校验统一抛出以下公开错误；case 名是测试和后续消费者使用的稳定 Swift API，不把输入文本、paste 内容、路径或原始 payload 放入错误值：
+
+```swift
+public enum CockpitDomainValidationError: Error, Equatable, Sendable {
+    case inconsistentWorkspaceContext
+    case emptyWorkspaceRootIdentity
+    case zeroActiveContextGeneration
+    case invalidProtocolVersion
+    case protocolVersionMismatch
+    case zeroTextPosition
+    case invalidHorizontalScrollOffset
+    case invalidTabViewState
+    case duplicateTabID
+    case selectedTabNotFound
+    case invalidSplitViewWidth
+    case zeroInputSequence
+    case emptyTerminalText
+    case emptyTerminalPaste
+    case terminalTextOrPasteTooLarge
+    case invalidTerminalKeyIdentity
+    case invalidTerminalLogicalKey
+    case invalidTerminalModifiers
+    case invalidTerminalMouseButtons
+    case invalidTerminalMouseWheel
+    case invalidTerminalResize
+    case invalidSHA256DigestLength
+    case invalidTerminalArchiveChunkName
+    case invalidTerminalArchiveChunkRange
+    case invalidTerminalExitStatus
+    case invalidTerminalArchiveRange
+    case invalidTerminalArchiveChunks
+    case invalidTerminalArchiveCompletionDate
+}
+```
+
+下文所有 `Codable` 且带不变量的类型都实现显式 `init(from:)`：先解码字段，再调用同一个 `init(validating:...)` 或 validating factory；`encode(to:)` 先用同一 validation path 重建/校验值再写出。禁止 synthesized `Decodable` 绕过构造校验。
+
 ### 3.2 Workspace Context
 
 ```swift
@@ -92,6 +129,14 @@ public struct ResolvedWorkspaceContext: Hashable, Codable, Sendable {
     public let conversationID: ConversationID?
     public let environmentID: EnvironmentID
     public let workspaceRootIdentity: String
+
+    public init(
+        validating contextID: WorkspaceContextID,
+        projectID: ProjectID,
+        conversationID: ConversationID?,
+        environmentID: EnvironmentID,
+        workspaceRootIdentity: String
+    ) throws
 }
 
 public struct ActiveContext: Hashable, Codable, Sendable {
@@ -101,6 +146,15 @@ public struct ActiveContext: Hashable, Codable, Sendable {
     public let environmentID: EnvironmentID
     public let workspaceRootIdentity: String
     public let generation: UInt64
+
+    public init(
+        validating contextID: WorkspaceContextID,
+        projectID: ProjectID,
+        conversationID: ConversationID?,
+        environmentID: EnvironmentID,
+        workspaceRootIdentity: String,
+        generation: UInt64
+    ) throws
 }
 ```
 
@@ -124,6 +178,18 @@ public struct RequestContext: Hashable, Codable, Sendable {
     public let environmentID: EnvironmentID
     public let activeContextGeneration: UInt64
     public let requestID: RequestID
+
+    public init(
+        validating protocolVersion: ProtocolVersion,
+        clientInstanceID: ClientInstanceID,
+        windowID: WindowID,
+        workspaceContextID: WorkspaceContextID,
+        environmentID: EnvironmentID,
+        activeContextGeneration: UInt64,
+        requestID: RequestID
+    ) throws
+
+    public func validated(negotiatedVersion: ProtocolVersion) throws -> Self
 }
 ```
 
@@ -141,11 +207,15 @@ public struct RequestContext: Hashable, Codable, Sendable {
 public struct TextPosition: Hashable, Codable, Sendable {
     public let line: UInt64
     public let column: UInt64
+
+    public init(validatingLine line: UInt64, column: UInt64) throws
 }
 
 public struct TextRange: Hashable, Codable, Sendable {
     public let anchor: TextPosition
     public let active: TextPosition
+
+    public init(validatingAnchor anchor: TextPosition, active: TextPosition) throws
 }
 
 public struct DocumentViewState: Hashable, Codable, Sendable {
@@ -153,6 +223,16 @@ public struct DocumentViewState: Hashable, Codable, Sendable {
     public var selections: [TextRange]
     public var firstVisibleLine: UInt64
     public var horizontalScrollOffset: Double
+
+    public init(
+        validatingCursor cursor: TextPosition,
+        selections: [TextRange],
+        firstVisibleLine: UInt64,
+        horizontalScrollOffset: Double
+    ) throws
+
+    public static func initial() -> Self
+    public func validated() throws -> Self
 }
 
 public struct TabRecord: Hashable, Codable, Sendable {
@@ -165,6 +245,14 @@ public struct TabRecord: Hashable, Codable, Sendable {
     public let id: TabID
     public var resource: Resource
     public var fileViewState: DocumentViewState?
+
+    public init(
+        validatingID id: TabID,
+        resource: Resource,
+        fileViewState: DocumentViewState?
+    ) throws
+
+    public func validated() throws -> Self
 }
 ```
 
@@ -193,11 +281,128 @@ TabRecord 使用显式 tagged Codable，禁止依赖 Swift synthesized enum repr
 
 Decoder 拒绝未知 kind、缺少对应 ID、同时出现两个资源 ID，以及不符合 resource/view-state 组合的不合法持久数据。
 
-### 3.5 TerminalInput 领域值
+### 3.5 Task 5 客户端持久状态
+
+以下共享值在 Task 5 加入 `CockpitTypes/WorkspaceModels.swift`，不在 Task 2 提前实现。它们只表达 Phase 1 已批准的 Device + Window + WorkspaceContext 布局、三栏宽度/左栏折叠和 Context-local tabs；不进入 protobuf：
+
+```swift
+public struct ClientWorkspaceStateKey: Hashable, Codable, Sendable {
+    public let deviceID: DeviceID
+    public let windowID: WindowID
+    public let workspaceContextID: WorkspaceContextID
+
+    public init(
+        deviceID: DeviceID,
+        windowID: WindowID,
+        workspaceContextID: WorkspaceContextID
+    )
+}
+
+public struct SidebarState: Hashable, Codable, Sendable {
+    public var isCollapsed: Bool
+
+    public init(isCollapsed: Bool)
+}
+
+public struct SplitViewState: Hashable, Codable, Sendable {
+    public var leadingPaneWidth: Double
+    public var trailingPaneWidth: Double
+
+    public init(
+        validatingLeadingPaneWidth leadingPaneWidth: Double,
+        trailingPaneWidth: Double
+    ) throws
+
+    public func validated() throws -> Self
+}
+
+public struct ClientWorkspaceState: Hashable, Codable, Sendable {
+    public let key: ClientWorkspaceStateKey
+    public var tabs: [TabRecord]
+    public var selectedTabID: TabID?
+    public var sidebar: SidebarState
+    public var splitView: SplitViewState
+
+    public init(
+        validatingKey key: ClientWorkspaceStateKey,
+        tabs: [TabRecord],
+        selectedTabID: TabID?,
+        sidebar: SidebarState,
+        splitView: SplitViewState
+    ) throws
+
+    public func validated() throws -> Self
+}
+```
+
+`SplitViewState` 的两个宽度都必须是有限数且不小于 0。`ClientWorkspaceState` 拒绝重复 TabID；`selectedTabID` 非空时必须引用 `tabs` 中的记录。上述带不变量的 Codable 值同样使用本节开头冻结的显式 decode/encode validation path。
+
+### 3.6 TerminalInput 领域值
 
 Swift 领域值由一个 envelope 和一个 payload enum 组成：
 
 ```swift
+public enum TerminalKeyAction: UInt8, Hashable, Codable, Sendable {
+    case press = 1
+    case `repeat` = 2
+    case release = 3
+}
+
+public struct TerminalKeyEvent: Hashable, Codable, Sendable {
+    public let logicalKey: UInt32
+    public let physicalKey: UInt32
+    public let modifiers: UInt32
+    public let action: TerminalKeyAction
+
+    public init(
+        validatingLogicalKey logicalKey: UInt32,
+        physicalKey: UInt32,
+        modifiers: UInt32,
+        action: TerminalKeyAction
+    ) throws
+}
+
+public enum TerminalMouseAction: UInt8, Hashable, Codable, Sendable {
+    case press = 1
+    case release = 2
+    case motion = 3
+    case scroll = 4
+}
+
+public struct TerminalMouseEvent: Hashable, Codable, Sendable {
+    public let cellX: Int32
+    public let cellY: Int32
+    public let buttons: UInt32
+    public let wheelX: Int32
+    public let wheelY: Int32
+    public let modifiers: UInt32
+    public let action: TerminalMouseAction
+
+    public init(
+        validatingCellX cellX: Int32,
+        cellY: Int32,
+        buttons: UInt32,
+        wheelX: Int32,
+        wheelY: Int32,
+        modifiers: UInt32,
+        action: TerminalMouseAction
+    ) throws
+}
+
+public struct TerminalResize: Hashable, Codable, Sendable {
+    public let columns: UInt16
+    public let rows: UInt16
+
+    public init(validatingColumns columns: UInt32, rows: UInt32) throws
+}
+
+public enum TerminalSignal: UInt8, Hashable, Codable, Sendable {
+    case interrupt = 1
+    case quit = 2
+    case suspend = 3
+    case `continue` = 4
+}
+
 public struct TerminalInput: Hashable, Sendable {
     public let context: RequestContext
     public let terminalSessionID: TerminalSessionID
@@ -213,6 +418,18 @@ public struct TerminalInput: Hashable, Sendable {
         case resize(TerminalResize)
         case signal(TerminalSignal)
     }
+
+    public static let maximumTextOrPasteUTF8Bytes = 16 * 1_024 * 1_024
+
+    public init(
+        validatingContext context: RequestContext,
+        terminalSessionID: TerminalSessionID,
+        inputLeaseID: InputLeaseID,
+        inputSequence: UInt64,
+        payload: Payload
+    ) throws
+
+    public func validated() throws -> Self
 }
 
 public typealias TerminalInputFrame = TerminalInput
@@ -222,11 +439,15 @@ inputSequence 大于 0，并作为 Task 14 input lease ACK/retry 去重序号。
 
 text 与 paste 必须非空，并受现有 16 MiB Frame payload 上限约束。text 是已提交 UTF-8 文本；IME preedit 留在客户端，不进入 PTY 或通用协议。
 
-### 3.6 Terminal archive 领域值
+`TerminalInput` 构造器拒绝 text/paste UTF-8 byte count 大于 `maximumTextOrPasteUTF8Bytes`；`TerminalMessages.encode` 还必须对完整 protobuf `serializedData()` 执行 `FrameHeader.maximumPayloadLength` 检查，因为 envelope 与 protobuf tag 也占用 Frame payload。
+
+### 3.7 Terminal archive 领域值
 
 ```swift
 public struct SHA256Digest: Hashable, Codable, Sendable {
     public let bytes: Data
+
+    public init(validating bytes: Data) throws
 }
 
 public struct TerminalArchiveChunk: Hashable, Codable, Sendable {
@@ -234,11 +455,20 @@ public struct TerminalArchiveChunk: Hashable, Codable, Sendable {
     public let firstOutputSequence: UInt64
     public let lastOutputSequence: UInt64
     public let sha256: SHA256Digest
+
+    public init(
+        validatingName name: String,
+        firstOutputSequence: UInt64,
+        lastOutputSequence: UInt64,
+        sha256: SHA256Digest
+    ) throws
 }
 
 public enum TerminalExitStatus: Hashable, Codable, Sendable {
     case exited(UInt8)
     case signaled(Int32)
+
+    public func validated() throws -> Self
 }
 
 public struct TerminalArchiveManifest: Hashable, Codable, Sendable {
@@ -250,10 +480,23 @@ public struct TerminalArchiveManifest: Hashable, Codable, Sendable {
     public let finalSnapshotSHA256: SHA256Digest
     public let exitStatus: TerminalExitStatus
     public let completedAt: Date
+
+    public init(
+        validatingTerminalSessionID terminalSessionID: TerminalSessionID,
+        workerInstanceID: WorkerInstanceID,
+        firstOutputSequence: UInt64,
+        latestOutputSequence: UInt64,
+        chunks: [TerminalArchiveChunk],
+        finalSnapshotSHA256: SHA256Digest,
+        exitStatus: TerminalExitStatus,
+        completedAt: Date
+    ) throws
+
+    public func validated() throws -> Self
 }
 ```
 
-SHA256Digest 的构造器固定拒绝不是 32 bytes 的输入。TerminalExitStatus.signaled 固定接受 Darwin signal `1...31`；归档需要完整表达包括崩溃在内的自然退出结果，因此这里记录 Host 的原始 Darwin signal，而 TerminalInput 使用 Cockpit 语义 signal enum。
+`TerminalExitStatus` 的显式 Codable decoder 和 `TerminalArchiveManifest` validator 固定拒绝 `.signaled` 不在 Darwin signal `1...31` 的值；`.exited(UInt8)` 由类型范围固定为 `0...255`。SHA256Digest 的构造器固定拒绝不是 32 bytes 的输入。归档需要完整表达包括崩溃在内的自然退出结果，因此这里记录 Host 的原始 Darwin signal，而 TerminalInput 使用 Cockpit 语义 signal enum。
 
 ## 4. Protocol 1.1 protobuf ABI
 
@@ -376,7 +619,13 @@ message TerminalArchiveManifest {
 - logicalKey 与 physicalKey 不得同时为 0。
 - logicalKey 非 0 时必须小于等于 `0x10FFFF` 且不在 surrogate 区间 `0xD800...0xDFFF`。
 - modifiers bit `0...9` 固定为 Shift、Control、Alt、Super、Caps Lock、Num Lock、右 Shift、右 Control、右 Alt、右 Super；其他位在 Protocol 1.1 必须为 0。
-- Cockpit key action `1/2/3` 显式映射到 Ghostty 内部 release/press/repeat 枚举，不暴露 Ghostty enum ordinal。
+- Cockpit key action 与 Ghostty action 固定使用下表，转换必须显式实现，禁止直接使用 Ghostty ordinal：
+
+| Cockpit value | Ghostty action |
+|---|---|
+| Cockpit 1 PRESS | Ghostty press |
+| Cockpit 2 REPEAT | Ghostty repeat |
+| Cockpit 3 RELEASE | Ghostty release |
 - IME committed text 走 text payload；不传 NSEvent 或 IME preedit。
 
 ### 5.2 鼠标
@@ -403,7 +652,9 @@ TerminalInput signal 使用 Cockpit 语义值并固定映射：
 | SUSPEND = 3 | SIGTSTP |
 | CONTINUE = 4 | SIGCONT |
 
-signal 发送给 PTY 当前 foreground process group。SIGHUP、SIGTERM 与 SIGKILL 不属于 TerminalInput；终止固定走独立 terminate capability。
+signal capability 控制 PTY 当前 foreground job：把 SIGINT、SIGQUIT、SIGTSTP 或 SIGCONT 发送给当前 foreground process group，并明确允许这些 Darwin signal 按系统语义中断、退出、挂起或继续该 foreground job，其中 SIGINT/SIGQUIT 可以结束进程。input capability 写入 text/key/paste/mouse 所产生的 PTY bytes；它已经可以通过终端驱动的 Ctrl+C/Ctrl+\\ 行为向 foreground job 产生 SIGINT/SIGQUIT，不能把 input 描述为无法结束进程。
+
+terminate capability 控制整个 TerminalSession process group，并负责 TerminalSession lifecycle 与 archive state。SIGHUP、SIGTERM 与 SIGKILL 不属于 TerminalInput signal enum；正常/强制 terminate 分别通过独立 terminate policy 对整个 session process group 执行 SIGTERM/SIGKILL。signal capability 与 terminate capability 的区别是控制目标和生命周期职责，不是“signal 不能终止进程”。
 
 ChannelID 固定为：
 
@@ -460,9 +711,68 @@ public enum ProtocolMappingError: Error, Equatable, Sendable {
     case unknownEnum(field: String, rawValue: Int)
     case unknownFields(String)
 }
+
+public enum WorkspaceMessages {
+    public static func encode(
+        _ value: WorkspaceContextID
+    ) throws -> CPWorkspaceContextID
+
+    public static func decode(
+        _ message: CPWorkspaceContextID
+    ) throws -> WorkspaceContextID
+
+    public static func encode(
+        _ value: RequestContext,
+        negotiatedVersion: ProtocolVersion
+    ) throws -> CPRequestContext
+
+    public static func decode(
+        _ message: CPRequestContext,
+        negotiatedVersion: ProtocolVersion
+    ) throws -> RequestContext
+}
+
+public enum DocumentMessages {
+    public static func encode(_ value: DocumentID) -> String
+    public static func decode(_ value: String) throws -> DocumentID
+}
+
+public enum TerminalMessages {
+    public static func encode(
+        _ value: TerminalInput,
+        channelID: ChannelID,
+        negotiatedVersion: ProtocolVersion
+    ) throws -> CPTerminalInput
+
+    public static func decode(
+        _ message: CPTerminalInput,
+        channelID: ChannelID,
+        negotiatedVersion: ProtocolVersion
+    ) throws -> TerminalInput
+
+    public static func encode(
+        _ value: TerminalArchiveManifest,
+        negotiatedVersion: ProtocolVersion
+    ) throws -> CPTerminalArchiveManifest
+
+    public static func decode(
+        _ message: CPTerminalArchiveManifest,
+        negotiatedVersion: ProtocolVersion
+    ) throws -> TerminalArchiveManifest
+}
+
+extension ProtocolMappingError {
+    public func asWireProtocolError() -> CPProtocolError
+}
 ```
 
-所有错误对外统一映射到现有 `CPProtocolError.Code.malformedMessage`，即 wire code 3。诊断字符串只包含 message/field 名称，不包含原始 payload、文本输入、paste 内容或未过滤路径。
+`WorkspaceMessages` 是 `WorkspaceMessages.swift` 的唯一公开 mapper namespace；`DocumentMessages` 是 `DocumentMessages.swift` 的唯一公开 mapper namespace；`TerminalMessages` 是 `TerminalMessages.swift` 的唯一公开 mapper namespace。嵌套 key/mouse/resize/signal/chunk/exit-status helper 保持 internal，后续消费者只调用上述入口。
+
+Protocol 1.1 顶层 RequestContext、TerminalInput 与 TerminalArchiveManifest encode/decode 都要求 `negotiatedVersion.major == 1 && negotiatedVersion.minor >= 1`。RequestContext 还必须通过 `validated(negotiatedVersion:)`，即其 message 内版本与连接协商版本完全相等；这消除了“校验顺序要求 negotiated minor、mapper 却收不到 negotiated version”的矛盾。WorkspaceContextID 和 DocumentID 是被顶层 message 复用的无版本叶值，因此其公开 helper 不接收 negotiated version。
+
+TerminalInput encode/decode 都接收实际 Frame 的 `ChannelID`：signal payload 只接受 `.control`，其余 payload 只接受 `.terminalInput`。`TerminalMessages.encode` 在返回 `CPTerminalInput` 前校验其 `serializedData().count <= Int(FrameHeader.maximumPayloadLength)`；decode 前的 FrameCodec 已执行同一 Frame 上限，mapper 仍执行 text/paste 非空和领域 byte-count 校验。
+
+`asWireProtocolError()` 是从 `ProtocolMappingError` 到 wire error 的唯一公开转换入口。它总是构造 `CPProtocolError(code: .malformedMessage, ...)`，因此生成的 `CPProtocolError.Code.malformedMessage.rawValue` 固定为 wire code 3。message 固定为当前 case 对应的类别文本（`missing required field`、`invalid identifier`、`invalid value`、`unknown oneof`、`unknown enum` 或 `unknown fields`），不插入 associated String、raw enum value、原始 payload、text、paste 或路径；即使调用方用敏感字符串构造 `ProtocolMappingError`，wire message 也不会包含该字符串。
 
 映射顺序固定为：
 
@@ -485,11 +795,15 @@ Task 2 的 focused tests 固定覆盖：
 
 - 新增 ID 与 DocumentSessionID 完整迁移；
 - ResolvedWorkspaceContext project/conversation 不变量；
+- ResolvedWorkspaceContext/ActiveContext 的 `workspaceRootIdentity` 非空；
 - ActiveContext generation 非零；
+- RequestContext protocol major 非零，以及 `validated(negotiatedVersion:)` 的完全匹配/不匹配；
 - TextPosition 一基坐标；
 - TextRange anchor/active 方向保留；
+- DocumentViewState horizontalScrollOffset 拒绝负数、NaN 和正负 infinity；
 - TabRecord 三种 resource 与非法 fileViewState 组合；
-- tagged Codable round-trip 与未知 kind 拒绝。
+- tagged Codable round-trip 与未知 kind 拒绝；
+- 每个带不变量的 Codable 类型直接 decode 非法持久值时，与公开 validating initializer/factory 抛出相同的 `CockpitDomainValidationError`。
 
 ### 8.2 Protocol round-trip
 
@@ -500,6 +814,8 @@ Task 2 的 focused tests 固定覆盖：
 - key action/modifier/Unicode/USB 数值；
 - mouse action/button/wheel 数值；
 - inputSequence round-trip；
+- text/paste 非空、UTF-8 byte count 边界与完整 serialized protobuf 的 16 MiB Frame 上限；
+- signal 走 Channel 0、其他 TerminalInput payload 走 Channel 2，encoder 与 decoder 都拒绝错误 route；
 - archive normal exit、signal exit、空 output、带 chunk output 与合法 sequence gap。
 
 ### 8.3 失败路径
@@ -515,7 +831,9 @@ Task 2 的 focused tests 固定覆盖：
 - hash 长度不是 32；
 - 缺少 exit status/completedAt；
 - exitCode 超过 255、darwinSignal 越界、无效 Timestamp；
-- chunk name 不匹配、重复、倒序、重叠或越出全局 range。
+- chunk name 不匹配、重复、倒序、重叠或越出全局 range；
+- `ProtocolMappingError.asWireProtocolError()` 对全部 case 固定生成 malformed-message wire code 3，且 associated String、enum raw value、text、paste 和路径不出现在 wire message；
+- encoder 对 mutation 后的非法 DocumentViewState/TabRecord、非法 TerminalExitStatus、错误 channel 和超限 TerminalInput 执行与 decoder 相同的拒绝。
 
 ### 8.4 回归门槛
 

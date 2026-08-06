@@ -231,7 +231,7 @@ public struct ActiveContext: Hashable, Codable, Sendable {
 
 现有 `DocumentSessionID`/`DocumentSessionScope` 在本任务迁移为 `DocumentID`/`DocumentScope`；仓库内调用点和测试一起更新，不保留两套文档身份。`TextPosition`、`TextRange`、`DocumentViewState` 与 `TabRecord` 在本任务定义，供 Task 5 直接消费；Task 5 不再重复定义这些基础值。`TabRecord.Resource` 固定为 `.file(DocumentID)`、`.terminal(TerminalSessionID)`、`.newTabPicker`，并使用批准设计中的显式 tagged Codable 和 resource/view-state 组合校验。
 
-`TerminalInput` 固定为 RequestContext + TerminalSessionID + InputLeaseID + inputSequence envelope，并以 oneof 定义 text、key、paste、mouse、resize、signal。key 使用 Cockpit `1/2/3` action、Unicode logical key、USB HID physical key 与固定 modifier bits；mouse 使用 `1...4` action、固定 button bits 与 Q16.16 cell wheel；signal 只允许 interrupt/quit/suspend/continue，且只走 Channel 0。不得把 AppKit `NSEvent`、IME preedit 或本地路径放入协议。
+`TerminalInput` 固定为 RequestContext + TerminalSessionID + InputLeaseID + inputSequence envelope，并以 oneof 定义 text、key、paste、mouse、resize、signal。key 使用 Cockpit `1/2/3` action、Unicode logical key、USB HID physical key 与固定 modifier bits；Cockpit `1 PRESS`/`2 REPEAT`/`3 RELEASE` 分别显式转换为 Ghostty press/repeat/release，禁止使用 Ghostty ordinal。mouse 使用 `1...4` action、固定 button bits 与 Q16.16 cell wheel；signal 只允许 interrupt/quit/suspend/continue，且只走 Channel 0。signal capability 控制当前 foreground job，并允许 SIGINT/SIGQUIT/SIGTSTP/SIGCONT 按 Darwin 语义结束、中断、挂起或继续该 job；input capability 写入的 terminal-driver Ctrl+C/Ctrl+\\ 同样可以产生 SIGINT/SIGQUIT。terminate capability 独立控制整个 TerminalSession process group 及 lifecycle/archive state。不得把 AppKit `NSEvent`、IME preedit 或本地路径放入协议。
 
 协议版本从 `1.0` 升为 `1.1`。Channel 固定为：
 
@@ -255,10 +255,10 @@ extension ChannelID {
 先写且只写测试，不创建 production 类型或 mapper：
 
 - `IdentifiersTests.swift`：新增 ID、DocumentSessionID 完整迁移与 ChannelID `0...5`；
-- `WorkspaceModelsTests.swift`：project/conversation 不变量、ResolvedWorkspaceContext、RequestContext 和 `A(17) -> B(18) -> A(19)`；
-- `DocumentModelsTests.swift`：一基 TextPosition、anchor/active 方向、三种 Tab resource、tagged Codable 与非法 view-state 组合；
-- `TerminalModelsTests.swift`：key/mouse/resize/signal 数值和领域校验、SHA-256、exit status 与 archive range/name；
-- `Phase1MessageTests.swift`：批准 schema 的全部 round-trip、unknown field/oneof/enum、非法 UUID/scalar/hash/path/timestamp/sequence；
+- `WorkspaceModelsTests.swift`：project/conversation 不变量、`workspaceRootIdentity` 非空、ResolvedWorkspaceContext、RequestContext negotiated-version 完全匹配/不匹配和 `A(17) -> B(18) -> A(19)`；
+- `DocumentModelsTests.swift`：一基 TextPosition、anchor/active 方向、horizontal scroll finite/nonnegative、三种 Tab resource、tagged Codable 与非法 view-state 组合；
+- `TerminalModelsTests.swift`：key/mouse/resize/signal 数值和领域校验、text/paste 非空及 16 MiB byte-count 边界、SHA-256、exit status 与 archive range/name；
+- `Phase1MessageTests.swift`：批准 schema 的全部 round-trip、unknown field/oneof/enum、非法 UUID/scalar/hash/path/timestamp/sequence、signal Channel 0/其他 input Channel 2 的 encoder/decoder route、完整 protobuf Frame 上限、ProtocolMappingError redaction 与 malformed wire code 3、encoder 拒绝 mutation 后的非法领域值；
 - `ConnectionControllerTests.swift`：ProtocolVersion.current 与 handshake 从 1.0 更新为 1.1，并保留现有 negotiation 行为。
 
 - [ ] **Step 2: 运行失败测试**
@@ -274,9 +274,9 @@ Expected: 失败，原因是 Phase 1 类型、消息和 protocol 1.1 尚不存�
 严格按 normative design 实现：
 
 1. 在 `Identifiers.swift` 完成 ID 迁移与 ChannelID；在 `ProtocolVersion.swift` 把 current 改为 1.1。
-2. 在三个 CockpitTypes model 文件实现所有构造不变量与 TabRecord tagged Codable。
+2. 在三个 CockpitTypes model 文件实现 normative design 冻结的 `CockpitDomainValidationError`、全部 public validating initializer/factory、所有带不变量 Codable 类型的显式 decode/encode validation path，以及 TabRecord tagged Codable。
 3. 在 `cockpit.proto` 使用批准的固定 field number、enum value、oneof 与 Google Timestamp；不得添加额外业务 message。
-4. 在三个 message mapper 文件实现 encode/decode 双向校验与 `ProtocolMappingError`；所有 mapping error 映射到现有 malformed-message wire code 3。
+4. 在三个 message mapper 文件只暴露 normative design 冻结的 `WorkspaceMessages`、`DocumentMessages`、`TerminalMessages` 精确入口；需要版本校验的 decode/encode 接收 negotiatedVersion，TerminalInput decode/encode 同时接收 ChannelID；`ProtocolMappingError.asWireProtocolError()` 是唯一 wire 转换入口并固定映射 malformed-message wire code 3。
 5. Protocol 1.1 mapper 拒绝 SwiftProtobuf unknownFields、nil/unknown oneof 与 `.UNRECOGNIZED` enum；不得把 Swift Codable JSON 放入 protobuf bytes 字段。
 6. 保持现有 32-byte FrameHeader 不变，terminal output protobuf 不增加 sequence/ack。
 
@@ -315,16 +315,14 @@ public protocol WorkspaceRepository: Sendable {
     func createConversation(_ input: NewConversation) async throws -> Conversation
     func renameConversation(id: ConversationID, title: String) async throws
     func resolve(_ contextID: WorkspaceContextID) async throws -> ResolvedWorkspaceContext
-    func loadClientState(_ key: ClientWorkspaceStateKey) async throws -> ClientWorkspaceState?
-    func saveClientState(_ state: ClientWorkspaceState) async throws
 }
 ```
 
-Migration v1 一次创建 `projects`、`environments`、`conversations`、`documents`、`client_workspace_states`、`conversation_deletions` 和 `schema_migrations`。约束固定为：一个规范化 root identity 只能对应一个 Environment；Phase 1 一个数据库最多一个 Project；Conversation.environment_id 必须引用所属 Project.base_environment_id；每个 `(device_id, window_id, context_kind, context_id)` 只有一份布局。
+Migration v1 一次创建 `projects`、`environments`、`conversations`、`documents`、`conversation_deletions` 和 `schema_migrations`；本任务不创建 `client_workspace_states`。约束固定为：一个规范化 root identity 只能对应一个 Environment；Phase 1 一个数据库最多一个 Project；Conversation.environment_id 必须引用所属 Project.base_environment_id。
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖 WAL、foreign keys、busy timeout、迁移事务回滚、Project+Direct Environment 原子创建、第二个 Project 被 `phaseOneProjectLimit` 拒绝、多个 Conversation 共享 base Environment、关闭重开数据库后布局恢复。
+覆盖 WAL、foreign keys、busy timeout、migration v1 事务回滚、Project+Direct Environment 原子创建、第二个 Project 被 `phaseOneProjectLimit` 拒绝、多个 Conversation 共享 base Environment，以及关闭重开数据库后 Project/Conversation/Environment 解析结果不变；本任务不写布局持久化测试。
 
 - [ ] **Step 2: 运行失败测试**
 
@@ -413,14 +411,17 @@ git commit -m "feat: add direct workspace control plane"
 
 **Files:**
 
+- Modify: `Sources/CockpitTypes/WorkspaceModels.swift`
 - Create: `Sources/CockpitClientCore/ActiveContextController.swift`
 - Create: `Sources/CockpitClientCore/WorkspaceClientState.swift`
 - Create: `Sources/CockpitLocalTransport/ClientIdentityStore.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
+- Modify: `Sources/CockpitPersistence/WorkspaceMigrations.swift`
 - Modify: `Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift`
 - Create: `Tests/CockpitClientCoreTests/ActiveContextControllerTests.swift`
 - Create: `Tests/CockpitClientCoreTests/WorkspaceClientStateTests.swift`
 - Create: `Tests/CockpitLocalTransportTests/ClientIdentityStoreTests.swift`
+- Modify: `Tests/CockpitPersistenceTests/WorkspaceMigrationTests.swift`
 - Modify: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
 
 **Contract:**
@@ -432,41 +433,79 @@ public actor ActiveContextController {
     public func current() -> ActiveContext?
 }
 
-public struct ClientWorkspaceState: Codable, Hashable, Sendable {
+public struct ClientWorkspaceStateKey: Hashable, Codable, Sendable {
+    public let deviceID: DeviceID
+    public let windowID: WindowID
+    public let workspaceContextID: WorkspaceContextID
+
+    public init(deviceID: DeviceID,
+                windowID: WindowID,
+                workspaceContextID: WorkspaceContextID)
+}
+
+public struct SidebarState: Hashable, Codable, Sendable {
+    public var isCollapsed: Bool
+    public init(isCollapsed: Bool)
+}
+
+public struct SplitViewState: Hashable, Codable, Sendable {
+    public var leadingPaneWidth: Double
+    public var trailingPaneWidth: Double
+
+    public init(validatingLeadingPaneWidth leadingPaneWidth: Double,
+                trailingPaneWidth: Double) throws
+    public func validated() throws -> Self
+}
+
+public struct ClientWorkspaceState: Hashable, Codable, Sendable {
     public let key: ClientWorkspaceStateKey
     public var tabs: [TabRecord]
     public var selectedTabID: TabID?
     public var sidebar: SidebarState
     public var splitView: SplitViewState
+
+    public init(validatingKey key: ClientWorkspaceStateKey,
+                tabs: [TabRecord],
+                selectedTabID: TabID?,
+                sidebar: SidebarState,
+                splitView: SplitViewState) throws
+    public func validated() throws -> Self
 }
 ```
 
-`TabRecord`、`TextPosition`、`TextRange` 与 `DocumentViewState` 直接使用 Task 2 已批准并实现的 CockpitTypes 领域值，不在本任务重复定义。Generation 从进程内 1 单调递增，不写数据库。每个异步 UI response/event 必须先通过 `accepts(generation:)`，相同 Context 的旧 generation 也被拒绝。file `TabRecord` 按 WorkspaceContext 保存 `DocumentViewState`；文本仍由 Environment 级 DocumentID 共享。
+`ClientWorkspaceStateKey`、`ClientWorkspaceState`、`SidebarState` 与 `SplitViewState` 在本任务加入 `CockpitTypes/WorkspaceModels.swift`，供 HostCore 与 ClientCore 共同依赖；HostCore 永远不依赖 ClientCore。`SplitViewState` 的宽度必须有限且不小于 0；state 拒绝重复 TabID，非空 selectedTabID 必须引用 tabs。`WorkspaceClientState.swift` 只实现 ClientCore 的状态协调逻辑，不拥有这些共享类型。`TabRecord`、`TextPosition`、`TextRange` 与 `DocumentViewState` 直接使用 Task 2 已批准并实现的 CockpitTypes 领域值，不在本任务重复定义。Generation 从进程内 1 单调递增，不写数据库。每个异步 UI response/event 必须先通过 `accepts(generation:)`，相同 Context 的旧 generation 也被拒绝。file `TabRecord` 按 WorkspaceContext 保存 `DocumentViewState`；文本仍由 Environment 级 DocumentID 共享。
+
+Task 5 在 `WorkspaceMigrations` 新增 migration v2，且只创建 `client_workspace_states(device_id, window_id, context_kind, context_id, state_json)`；复合主键固定为 `(device_id, window_id, context_kind, context_id)`。`state_json` 是 `ClientWorkspaceState` 的 UTF-8 Codable JSON，写入前和读取后都执行批准设计中的 validation path。`WorkspaceRepository` 从本任务起增加：
+
+```swift
+func loadClientState(_ key: ClientWorkspaceStateKey) async throws -> ClientWorkspaceState?
+func saveClientState(_ state: ClientWorkspaceState) async throws
+```
 
 `ClientIdentityStore` 使用可注入的 Keychain/Preferences ports：DeviceID 以 service `dev.cockpit.client-identity`、account `device-id-v1` 持久化；Phase 1 主窗口的 WindowID 以 preferences key `main-window-id-v1` 持久化；ClientInstanceID 每次 App 启动重新生成。生产实现只在 App composition root 使用，测试使用 UUID 隔离的 service 与独立 `UserDefaults` suite。
 
 - [ ] **Step 1: 写失败测试**
 
-使用固定序列 `A(17) -> B(18) -> A(19)` 断言 17 的文件树、Document 与布局结果均不被应用；断言 Project Context 和两个 Conversation 各自恢复不同 tabs/selectedTab/sidebar/splitView/cursor/selection/scroll，同时引用同一个 DocumentID；重建 store 后 DeviceID 和主 WindowID 不变，ClientInstanceID 改变。
+使用固定序列 `A(17) -> B(18) -> A(19)` 断言 17 的文件树、Document 与布局结果均不被应用；断言 migration v1 数据库升级到 v2 后才出现 `client_workspace_states`，v2 事务回滚不留下表或版本记录；断言 Project Context 和两个 Conversation 各自恢复不同 tabs/selectedTab/sidebar/splitView/cursor/selection/scroll，同时引用同一个 DocumentID；覆盖非法 split width、重复 TabID、selectedTabID 不存在及非法 Codable JSON 拒绝；重建 store 后 DeviceID 和主 WindowID 不变，ClientInstanceID 改变。
 
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.WorkspaceMigrationTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
 ```
 
 Expected: 失败，原因是 ActiveContextController 与布局模型不存在。
 
 - [ ] **Step 3: 实现 actor 与 repository 映射**
 
-ClientCore 只保存稳定 ID 和值类型；不导入 AppKit、XPC 或 SQLite3。布局保存是 Host 的单条 upsert，Terminal tab 只保存 TerminalSessionID 引用。
+在 CockpitTypes 实现共享 client-state 值与显式 Codable validation；ClientCore 只保存稳定 ID 和值类型，不导入 AppKit、XPC 或 SQLite3。WorkspaceMigrations 实现 v2；SQLite repository 实现 load/save，布局保存是 Host 的单条 upsert，Terminal tab 只保存 TerminalSessionID 引用。HostCore 只依赖 CockpitTypes 中的共享值，不导入或依赖 ClientCore。
 
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitClientCoreTests|CockpitLocalTransportTests.ClientIdentityStoreTests|CockpitPersistenceTests.WorkspaceMigrationTests|CockpitPersistenceTests.SQLiteWorkspaceRepositoryTests'
 /usr/bin/git diff --check
-git add Sources/CockpitClientCore Sources/CockpitLocalTransport/ClientIdentityStore.swift Sources/CockpitHostCore/WorkspaceRepository.swift Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Tests/CockpitClientCoreTests Tests/CockpitLocalTransportTests/ClientIdentityStoreTests.swift Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift
+git add Sources/CockpitTypes/WorkspaceModels.swift Sources/CockpitClientCore Sources/CockpitLocalTransport/ClientIdentityStore.swift Sources/CockpitHostCore/WorkspaceRepository.swift Sources/CockpitPersistence/WorkspaceMigrations.swift Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Tests/CockpitClientCoreTests Tests/CockpitLocalTransportTests/ClientIdentityStoreTests.swift Tests/CockpitPersistenceTests/WorkspaceMigrationTests.swift Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift
 git commit -m "feat: isolate workspace context state"
 ```
 
@@ -1027,7 +1066,7 @@ public protocol TerminalSessionRepository: Sendable {
 
 Migration v1 创建 `terminal_sessions`、`terminal_idempotency`、`agent_executables` 与 `terminal_schema_migrations`；每条 Preparing record 同时持久化 cryptographically random 16-byte `start_nonce`，替代 Supervisor 必须复用该值。Core 只依赖可注入的 `InstallationMasterKeyProviding`、`WorkerSecretDeriving` 与 `AttachTicketPolicy`。Phase 1 production policy 固定：Keychain service `dev.cockpit.terminal.master-key`、account `installation-master-key-v1`、`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`、32 random bytes；worker secret 使用 HKDF-SHA256(master, salt = TerminalSessionID bytes, info = `cockpit-worker-v1` + WorkerInstanceID bytes) 派生 32 bytes。
 
-Attach ticket 固定为 30 秒有效、单次消费，并绑定 TerminalSessionID、WorkerInstanceID、ClientInstanceID 与 bitset：`view=1`、`input=2`、`resize=4`、`signal=8`、`terminate=16`。ticket 原文不写数据库；Supervisor 只在内存保存其 SHA-256、expiry 与未消费状态，并经 authenticated `supervisorControl` 把相同 hash/绑定/capability/expiry 注册给目标 Keeper。Keeper 消费成功后删除本地条目并报告 Supervisor；任一方重启后未消费 ticket 失效，由客户端重新申请。
+Attach ticket 固定为 30 秒有效、单次消费，并绑定 TerminalSessionID、WorkerInstanceID、ClientInstanceID 与 bitset：`view=1`、`input=2`、`resize=4`、`signal=8`、`terminate=16`。`input` 允许写 PTY bytes，包含经 terminal driver 产生 Ctrl+C/Ctrl+\\ 的路径；`signal` 允许直接控制当前 foreground job；`terminate` 允许控制整个 TerminalSession process group 及 lifecycle/archive state。ticket 原文不写数据库；Supervisor 只在内存保存其 SHA-256、expiry 与未消费状态，并经 authenticated `supervisorControl` 把相同 hash/绑定/capability/expiry 注册给目标 Keeper。Keeper 消费成功后删除本地条目并报告 Supervisor；任一方重启后未消费 ticket 失效，由客户端重新申请。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1221,11 +1260,11 @@ public actor TerminalStreamCoordinator {
 
 Supervisor 是输入租约唯一权威端，通过 control protocol 创建/转移/释放 `InputLeaseGrant(leaseID, holderViewerID, sequenceBase, capabilities)` 并注册给 Keeper；Keeper 只校验和执行。每个 viewer queue 固定为最多 2 个 screen frame；第三个 frame 到来时合并中间帧并保留最新权威 frame。输入 lease 单调 sequence，重复 sequence 返回原 ACK，不重复写 PTY；断开持有者时 Keeper 立即使本地 grant 失效并向 Supervisor 报告 revocation，Supervisor 不可用时不授予替代 lease。read-only viewer 无权 input/resize/signal/terminate。
 
-text 直接写 UTF-8；key/paste/mouse 必须调用 Task 11 基于当前 Ghostty VT mode 的 encoder 后再写 PTY；resize 在 Keeper 调用 `TIOCSWINSZ`；signal/terminate 经 Terminal control transport，不伪装成 PTY bytes。signal 只接受 Task 2 冻结的 interrupt/quit/suspend/continue，并发送给 PTY 当前 foreground process group；SIGHUP 被拒绝，SIGTERM/SIGKILL 只能走独立 terminate policy。所有输入只接受 Task 2 的结构化 `TerminalInput`，不传 AppKit `NSEvent`。
+text 直接写 UTF-8；key/paste/mouse 必须调用 Task 11 基于当前 Ghostty VT mode 的 encoder 后再写 PTY；resize 在 Keeper 调用 `TIOCSWINSZ`。input capability 已允许 key encoder 产生 terminal-driver Ctrl+C/Ctrl+\\ bytes，并可由终端驱动向 foreground job 产生 SIGINT/SIGQUIT。signal capability 只接受 Task 2 冻结的 interrupt/quit/suspend/continue，经 Channel 0 control transport 直接把 SIGINT/SIGQUIT/SIGTSTP/SIGCONT 发送给 PTY 当前 foreground process group；这些 signal 按 Darwin 语义可以结束、中断、挂起或继续 foreground job。terminate capability 使用独立 policy 对整个 TerminalSession process group 发送 SIGTERM/SIGKILL，并驱动 lifecycle 与 archive state。SIGHUP 被拒绝。signal/terminate 都不伪装成 PTY bytes，二者区别在控制目标与生命周期职责。所有输入只接受 Task 2 的结构化 `TerminalInput`，不传 AppKit `NSEvent`。
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖错 UID、未认证 payload、ticket 重放、跨 session ticket、过期 ticket、能力升级、Supervisor grant 之外无法取得写权、两个 viewer 单写多读、输入 ACK 丢失重试去重、key/paste/mouse mode-aware 编码、慢 viewer 合并且另一个 viewer 不受影响、关闭 viewer 后 PTY PID 不变。
+覆盖错 UID、未认证 payload、ticket 重放、跨 session ticket、过期 ticket、能力升级、Supervisor grant 之外无法取得写权、两个 viewer 单写多读、输入 ACK 丢失重试去重、key/paste/mouse mode-aware 编码、input capability 的 Ctrl+C/Ctrl+\\ terminal-driver 路径、signal capability 的 interrupt/quit/suspend/continue foreground-job 控制及可结束 foreground process、terminate capability 对整个 session process group 与 lifecycle/archive 的控制、慢 viewer 合并且另一个 viewer 不受影响、关闭 viewer 后 PTY PID 不变。
 
 - [ ] **Step 2: 运行失败测试**
 
@@ -1344,7 +1383,7 @@ git commit -m "feat: reconcile and archive terminal sessions"
 
 **Contract:**
 
-TerminalSupervisor XPC 只向 CockpitHost composition root 提供：`createResolved`、`list(contextID)`、`issueAttachTicket`、`acquire/transfer/releaseInputLease`、`signal`、`terminate`、`purgeFinishedRecords`、`reconcile` 和 `openArchive`。Host XPC 向客户端提供不含绝对路径的对应 typed commands。`WorkspaceTerminalService` 对每个请求解析 WorkspaceContext→Environment、校验 session/context 绑定，并通过注入的 `TerminalSupervisorControlling` 调用 Supervisor；只有该层把 resolved workspaceRoot 放入 `createResolved`。真实 screen/input bytes 不经过任何 XPC。
+TerminalSupervisor XPC 只向 CockpitHost composition root 提供：`createResolved`、`list(contextID)`、`issueAttachTicket`、`acquire/transfer/releaseInputLease`、`signal`、`terminate`、`purgeFinishedRecords`、`reconcile` 和 `openArchive`。`signal` 只控制当前 foreground job，允许批准的 Darwin signal 按系统语义结束、中断、挂起或继续该 job；`terminate` 控制整个 TerminalSession process group 并驱动 lifecycle/archive state。Host XPC 向客户端提供不含绝对路径的对应 typed commands。`WorkspaceTerminalService` 对每个请求解析 WorkspaceContext→Environment、校验 session/context 绑定，并通过注入的 `TerminalSupervisorControlling` 调用 Supervisor；只有该层把 resolved workspaceRoot 放入 `createResolved`。真实 screen/input bytes 不经过任何 XPC。
 
 ```swift
 public actor TerminalAttachmentController {
