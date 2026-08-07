@@ -1,5 +1,6 @@
 import Foundation
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 
 public actor HostXPCClient: WorkspaceServing {
@@ -95,6 +96,52 @@ public actor HostXPCClient: WorkspaceServing {
         return value
     }
 
+    public func issueHostDataPlaneTicket(
+        context: RequestContext
+    ) async throws -> CPHostDataPlaneTicketResponse {
+        connect()
+        guard let connection = activeConnection?.value else {
+            throw CocoaError(.xpcConnectionInvalid)
+        }
+        var request = CPHostDataPlaneTicketRequest()
+        request.context = try WorkspaceMessages.encode(context, negotiatedVersion: .current)
+        let requestData = try request.serializedData()
+        let reply = XPCReplyContinuation<Data>()
+        let responseData = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard reply.install(continuation) else { return }
+                let remote = connection.remoteObjectProxy { error in
+                    reply.resume(throwing: error)
+                }
+                guard let proxy = remote as? HostXPCProtocol else {
+                    reply.resume(throwing: CocoaError(.coderInvalidValue))
+                    return
+                }
+                proxy.issueHostDataPlaneTicket(requestData) { data, error in
+                    if let error {
+                        reply.resume(throwing: error)
+                    } else if let data {
+                        reply.resume(returning: data)
+                    } else {
+                        reply.resume(throwing: CocoaError(.coderInvalidValue))
+                    }
+                }
+            }
+        } onCancel: {
+            reply.cancel()
+        }
+        let response = try CPHostDataPlaneTicketResponse(serializedBytes: responseData)
+        guard response.unknownFields.data.isEmpty,
+              response.validForMilliseconds == 30_000,
+              !response.socketPath.isEmpty,
+              (try? UnixDomainSocketAddress(path: response.socketPath)) != nil,
+              canonicalHostDataPlaneTicket(response.ticket)
+        else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return response
+    }
+
     public func disconnect() {
         guard let connection = activeConnection else { return }
         activeConnection = nil
@@ -149,4 +196,22 @@ public actor HostXPCClient: WorkspaceServing {
         activeConnection = nil
         connection.value.invalidate()
     }
+}
+
+private func canonicalHostDataPlaneTicket(_ value: String) -> Bool {
+    let bytes = Array(value.utf8)
+    guard bytes.count == 43,
+          bytes.allSatisfy({
+              (65...90).contains($0) || (97...122).contains($0)
+                  || (48...57).contains($0) || $0 == 45 || $0 == 95
+          })
+    else { return false }
+    let base64 = value
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/") + "="
+    guard let raw = Data(base64Encoded: base64), raw.count == 32 else { return false }
+    return raw.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "") == value
 }

@@ -1,6 +1,7 @@
 import Foundation
 import CockpitHostCore
 import CockpitProtocol
+import CockpitTypes
 
 public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable {
     public typealias HandshakeHandler =
@@ -8,13 +9,51 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
 
     private let handshakeHandler: HandshakeHandler
     private let workspaceRouter: WorkspaceCommandRouter
+    private let hostDataPlaneTicketIssuer: HostDataPlaneTicketIssuer?
 
     public init(
         handshakeHandler: @escaping HandshakeHandler,
-        workspaceRouter: WorkspaceCommandRouter
+        workspaceRouter: WorkspaceCommandRouter,
+        hostDataPlaneTicketIssuer: HostDataPlaneTicketIssuer? = nil
     ) {
         self.handshakeHandler = handshakeHandler
         self.workspaceRouter = workspaceRouter
+        self.hostDataPlaneTicketIssuer = hostDataPlaneTicketIssuer
+    }
+
+    public func issueHostDataPlaneTicket(
+        _ request: Data,
+        withReply reply: @escaping (Data?, NSError?) -> Void
+    ) {
+        let reply = XPCWorkspaceReply(reply)
+        guard let issuer = hostDataPlaneTicketIssuer else {
+            reply.complete(data: nil, error: ticketError(code: 1))
+            return
+        }
+        let context: RequestContext
+        do {
+            let message = try CPHostDataPlaneTicketRequest(serializedBytes: request)
+            guard message.unknownFields.data.isEmpty, message.hasContext else {
+                throw CocoaError(.coderInvalidValue)
+            }
+            context = try WorkspaceMessages.decode(message.context, negotiatedVersion: .current)
+        } catch {
+            reply.complete(data: nil, error: ticketError(code: 2))
+            return
+        }
+        Task {
+            do {
+                try await issuer.issue(for: context) { response in
+                    reply.complete(data: try response.serializedData(), error: nil)
+                }
+            } catch is HostDataPlaneTicketIssueError {
+                reply.complete(data: nil, error: ticketError(code: 1))
+            } catch HostDataPlaneTicketError.randomGenerationFailed {
+                reply.complete(data: nil, error: ticketError(code: 3))
+            } catch {
+                reply.complete(data: nil, error: ticketError(code: 1))
+            }
+        }
     }
 
     public func exchangeHandshake(
@@ -42,6 +81,10 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
             }
         }
     }
+}
+
+private func ticketError(code: Int) -> NSError {
+    NSError(domain: "dev.cockpit.host-data-plane-ticket", code: code, userInfo: [:])
 }
 
 private final class XPCWorkspaceReply: @unchecked Sendable {

@@ -68,6 +68,10 @@ let package = Package(
                 "CockpitProtocol",
                 "CockpitTerminalCore",
                 "CockpitTerminalClient",
+            ],
+            linkerSettings: [
+                .linkedFramework("Security"),
+                .linkedFramework("CryptoKit"),
             ]
         ),
         .target(
@@ -101,6 +105,7 @@ let package = Package(
         .testTarget(
             name: "CockpitLocalTransportTests",
             dependencies: [
+                "CockpitClientCore",
                 "CockpitLocalTransport",
                 "CockpitHostCore",
                 "CockpitProtocol",
