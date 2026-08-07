@@ -2,8 +2,53 @@ import Darwin
 import Foundation
 import Testing
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 @testable import CockpitWorkspace
+
+@Test func workspaceRootDocumentReadsStableBytesAndAtomicallyWritesExpectedIdentity() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let target = fixture.root.appendingPathComponent("document.txt")
+    try Data("original\r\n".utf8).write(to: target)
+    let handle = WorkspaceRootHandle(rootURL: fixture.root)
+
+    let snapshot = try await handle.readDocument(at: RelativePath("document.txt"))
+    let saved = try await handle.atomicallyWriteDocument(
+        Data("saved\n".utf8),
+        to: RelativePath("document.txt"),
+        expectedFingerprint: snapshot.fingerprint
+    )
+
+    #expect(snapshot.data == Data("original\r\n".utf8))
+    #expect(saved.byteCount == 6)
+    #expect(try Data(contentsOf: target) == Data("saved\n".utf8))
+}
+
+@Test func workspaceRootDocumentRejectsDirectoriesAndSymlinkAncestors() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let manager = FileManager.default
+    let outside = fixture.base.appendingPathComponent("outside", isDirectory: true)
+    try manager.createDirectory(at: outside, withIntermediateDirectories: false)
+    try manager.createDirectory(
+        at: fixture.root.appendingPathComponent("directory"),
+        withIntermediateDirectories: false
+    )
+    try Data("secret".utf8).write(to: outside.appendingPathComponent("secret.txt"))
+    try manager.createSymbolicLink(
+        at: fixture.root.appendingPathComponent("link"),
+        withDestinationURL: outside
+    )
+    let handle = WorkspaceRootHandle(rootURL: fixture.root)
+
+    await #expect(throws: DocumentStorageError.unsupportedFileType) {
+        _ = try await handle.readDocument(at: RelativePath("directory"))
+    }
+    await #expect(throws: FileOperationError.symbolicLinkTraversal) {
+        _ = try await handle.readDocument(at: RelativePath("link/secret.txt"))
+    }
+}
 
 @Test func rootHandleCreatesFilesAndDirectoriesAtRootAndNestedParents() async throws {
     let fixture = try FileOperationFixture()

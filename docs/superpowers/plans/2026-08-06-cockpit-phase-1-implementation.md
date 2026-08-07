@@ -673,9 +673,11 @@ git commit -m "feat: manage files inside environment root"
 - Create: `Sources/CockpitWorkspace/DocumentCodec.swift`
 - Create: `Sources/CockpitWorkspace/DocumentRecoveryLog.swift`
 - Create: `Sources/CockpitWorkspace/AtomicFileWriter.swift`
+- Modify: `Sources/CockpitWorkspace/WorkspaceRootHandle.swift`
 - Create: `Tests/CockpitWorkspaceTests/DocumentCodecTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/DocumentRecoveryLogTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/AtomicFileWriterTests.swift`
+- Modify: `Tests/CockpitWorkspaceTests/WorkspaceRootHandleTests.swift`
 - Modify: `Tests/CockpitProtocolTests/Phase1MessageTests.swift`
 
 **Contract:**
@@ -695,32 +697,153 @@ public struct DecodedDocument: Sendable {
     public let lineEndings: LineEndingProfile
     public let diskFingerprint: DiskFingerprint
 }
+
+public struct DiskFingerprint: Hashable, Codable, Sendable {
+    public let deviceID: UInt64
+    public let inode: UInt64
+    public let byteCount: UInt64
+    public let modificationTimeSeconds: Int64
+    public let modificationTimeNanoseconds: UInt32
+    public let contentSHA256: SHA256Digest
+}
+
+public struct DocumentTextBuffer: Sendable {
+    public private(set) var text: String
+    public private(set) var lineEndings: LineEndingProfile
+
+    public mutating func replaceUTF16(
+        range: Range<Int>,
+        with replacement: String
+    ) throws
+}
+
+public struct DocumentFileSnapshot: Sendable {
+    public let data: Data
+    public let fingerprint: DiskFingerprint
+}
+
+public enum DocumentWriteRecoveryState: Hashable, Sendable {
+    case staged(RelativePath)
+    case stagedLocationUnknown
+    case committedButDurabilityUnknown(DiskFingerprint)
+}
+
+public struct DocumentWriteRecoveryRequiredError: Error, @unchecked Sendable {
+    public let path: RelativePath
+    public let state: DocumentWriteRecoveryState
+    public let originalError: any Error
+}
+
+public enum DocumentStorageError: Error, Hashable, Sendable {
+    case fingerprintMismatch(expected: DiskFingerprint, actual: DiskFingerprint)
+    case unsupportedFileType
+    case unstableRead
+}
+
+public protocol DocumentServing: Sendable {
+    func readDocument(at path: RelativePath) async throws -> DocumentFileSnapshot
+    func atomicallyWriteDocument(
+        _ data: Data,
+        to path: RelativePath,
+        expectedFingerprint: DiskFingerprint
+    ) async throws -> DiskFingerprint
+}
 ```
 
-恢复日志格式固定为 length-delimited protobuf records：magic `CKDR`、format version 1、DocumentID、documentVersion、clientSequence、SHA-256、UTF-8 edit payload。每次 acknowledgement 前 `fsync` 日志；checkpoint 原子替换；恢复只重放完整且 hash 正确的 record，截断尾记录被忽略并保留诊断。
+`DiskFingerprint` 定义在 `CockpitProtocol/DocumentMessages.swift`，由打开文件的 FD 上两次稳定 `fstat` 与实际读取 bytes 生成；`modificationTimeNanoseconds` 只允许 `0..<1_000_000_000`，SHA-256 固定 32 bytes。Task 9 的 Host 与 ClientCore 都复用这一类型，不复制第二套 fingerprint。
+
+`DocumentTextBuffer` 只接受已经归一化为 LF 的文本。`replaceUTF16` 使用 Monaco 的 UTF-16 offset，拒绝越界或切开 surrogate pair；删除 edit range 内的换行类型，为 replacement 中每个新增 LF 插入 `preferred`，range 外换行类型及顺序保持不变。由此任意位置插入或删除换行都不会把原始 CRLF/LF 样式按数组下标错误平移。Task 9 的 `DocumentActor.apply` 必须通过该 API 更新文本和换行映射。
+
+恢复日志使用 SwiftProtobuf 的 unsigned-varint length prefix 加精确 message body，不使用 JSON 或固定宽度 length。`cockpit.proto` 新增以下冻结字段；mapper 拒绝 unknown fields、非 canonical DocumentID、零 documentVersion/clientSequence、非 32-byte hash、空/无效 UTF-8/含 NUL payload：
+
+```protobuf
+message DocumentRecoveryRecord {
+  bytes magic = 1;                 // exact ASCII "CKDR"
+  uint32 format_version = 2;       // exact 1
+  string document_id = 3;
+  uint64 document_version = 4;
+  uint64 client_sequence = 5;
+  bytes record_sha256 = 6;
+  bytes utf8_edit_payload = 7;
+}
+
+message DocumentRecoveryCheckpoint {
+  bytes magic = 1;                 // exact ASCII "CKDR"
+  uint32 format_version = 2;       // exact 1
+  string document_id = 3;
+  uint64 persisted_document_version = 4;
+  uint64 persisted_client_sequence = 5;
+  uint64 device_id = 6;
+  uint64 inode = 7;
+  uint64 byte_count = 8;
+  sint64 modification_time_seconds = 9;
+  uint32 modification_time_nanoseconds = 10;
+  bytes content_sha256 = 11;
+  bytes checkpoint_sha256 = 12;
+}
+```
+
+record hash 覆盖 ASCII `CKDR-RECORD\0`、big-endian UInt32 format version、DocumentID 的 16 个 UUID bytes、big-endian UInt64 documentVersion/clientSequence/payload byte count 和原始 payload。checkpoint hash 使用独立 ASCII `CKDR-CHECKPOINT\0` domain separator，并按字段号顺序覆盖 version、DocumentID、persisted versions 与完整 fingerprint；hash 不依赖 protobuf serialization order。
+
+`DocumentMessages.swift` 同时提供经验证的 `DocumentRecoveryRecord`、`DocumentRecoveryCheckpoint`、encode/decode/delimited framing mapper；`DocumentRecoveryLog.swift` 的公开边界固定为：
+
+```swift
+public enum DocumentRecoveryDiagnostic: Hashable, Sendable {
+    case truncatedTail(byteOffset: UInt64)
+    case corruptRecord(byteOffset: UInt64)
+    case compactionDeferred
+}
+
+public struct DocumentRecoveryResult: Sendable {
+    public let checkpoint: DocumentRecoveryCheckpoint?
+    public let records: [DocumentRecoveryRecord]
+    public let diagnostics: [DocumentRecoveryDiagnostic]
+}
+
+public final class DocumentRecoveryLog: @unchecked Sendable {
+    public init(rootURL: URL, documentID: DocumentID)
+    public func append(
+        documentVersion: UInt64,
+        clientSequence: UInt64,
+        utf8EditPayload: Data
+    ) async throws
+    public func recover() async throws -> DocumentRecoveryResult
+    public func checkpoint(
+        persistedDocumentVersion: UInt64,
+        persistedClientSequence: UInt64,
+        diskFingerprint: DiskFingerprint
+    ) async throws -> DocumentRecoveryDiagnostic?
+}
+```
+
+每个 DocumentID 使用独立的 `<lowercase-uuid>.records.ckdr` 与 `<lowercase-uuid>.checkpoint.ckdr`，文件权限 `0600`。每次 acknowledgement 前必须完整追加 record 并 `fsync`；短写、`fsync` 失败均不得 acknowledgement。恢复从有效 checkpoint 开始，只按严格递增 documentVersion/clientSequence 重放完整且 hash 正确的同一 DocumentID record。clean EOF 正常结束；截断尾 record 不重放并返回带 byte offset 的 `truncatedTail` 诊断；完整 malformed/hash/identity/sequence 错误在首个坏 record 处停止并保留诊断，不跳过坏 record 继续重放。
+
+checkpoint/compaction 顺序固定为：同目录唯一 temp 写完整 checkpoint、`fsync` temp、atomic rename、`fsync` recovery root；checkpoint 成为恢复基线后，再以同样的 temp + `fsync` + rename + parent `fsync` 原子发布只含 checkpoint 之后 records 的 compacted log。checkpoint 已提交而 compaction 失败时，旧 log 仍由 checkpoint 过滤，恢复结果不重复 edit，并返回 maintenance diagnostic；不得回滚 checkpoint。Task 8 只保证 checkpoint/compaction 自身所有崩溃点可恢复；磁盘保存成功但 Task 9 尚未调用 checkpoint 的跨组件窗口由 Task 9 作为 fingerprint conflict 处理，禁止静默重复重放。
+
+`DocumentServing.swift` 定义 HostCore port，`WorkspaceRootHandle` 在现有串行 I/O queue 上实现 secure read/write；App 不取得 URL/FD。读写完整相对路径都从 retained root FD 使用 `O_RESOLVE_BENEATH`/`O_NOFOLLOW_ANY`，符号链接祖先不得被跟随。写 temp 前先从仍持有的目标 FD 生成当前 fingerprint；与 `expectedFingerprint` 不同则抛 `fingerprintMismatch`，不得创建 temp 或改写目标。`AtomicFileWriter` 在目标同目录创建唯一 `.cockpit-save-<UUID>`，继承目标 POSIX permissions，写完整 bytes 并 `fsync` temp 后，使用 root-FD-relative `renameatx_np(..., RENAME_RESOLVE_BENEATH | RENAME_NOFOLLOW_ANY)` 原子替换，随后 `fsync` 目标 parent directory。写入、temp fsync 或 rename 失败时原文件保持不变；已创建 temp 不做 identity-check-then-unlink，返回携带真实 staged path 或 location-unknown 的 recovery-required error。rename 成功后 parent `fsync` 失败时返回携带新 fingerprint 的 committed-but-durability-unknown error，不得报告普通未写入失败或回滚。保存前后 fingerprint 都从仍持有的 FD 生成；保存成功返回新 fingerprint。
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖 UTF-8、UTF-8 BOM、LF、CRLF、混合换行打开与逐换行 round-trip、NUL/无效 UTF-8 拒绝、BOM round-trip、临时文件与目标同目录、fsync 后 atomic rename、写入失败保留原文件、日志尾部截断恢复到最后确认版本。
+覆盖 UTF-8、UTF-8 BOM、LF、CRLF、混合换行打开与逐换行 round-trip、孤立 CR/NUL/无效 UTF-8 拒绝、BOM round-trip；在首部/中部/尾部插入和删除换行后，未触及 CRLF/LF 保持且新增换行使用 preferred，UTF-16 range 切开 surrogate pair 被拒绝。覆盖 fingerprint FD identity/hash/validation、临时文件与目标同目录、原权限保留、temp `fsync` 后 atomic rename、parent directory `fsync`、写入失败保留原文件与 staged recovery、rename 后 parent-fsync 失败报告 committed fingerprint。恢复日志测试使用手写 protobuf fixtures 覆盖 exact magic/version/hash/unknown field、严格 sequence、每次 append fsync、clean EOF、尾部截断恢复到最后完整 record、完整坏 record 停止、checkpoint-first compaction 及 checkpoint 已提交而 compaction 失败不重复重放。每个测试名称分别使用 `documentRecovery`、`documentCodec`、`documentTextBuffer`、`atomicFileWriter` 或 `workspaceRootDocument` 前缀。
 
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.DocumentCodecTests|CockpitWorkspaceTests.DocumentRecoveryLogTests|CockpitWorkspaceTests.AtomicFileWriterTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'documentRecovery|documentCodec|documentTextBuffer|atomicFileWriter|workspaceRootDocument'
 ```
 
-Expected: 失败，原因是 codec、recovery log 和 atomic writer 不存在。
+Expected: 失败，原因是 codec、recovery log、root document port 和 atomic writer 不存在。当前 Swift Testing test ID 不包含 source filename；原 `CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.*Tests` filter 本地实测为 `No matching test cases were run` / 0 tests，因此禁止继续使用。GREEN 前后都必须用 `swift test list --skip-build` 对同一 regex 证明匹配集合非空，并让列表匹配数等于实际执行数。
 
 - [ ] **Step 3: 实现无自动保存的持久层**
 
-`DocumentCodec` 给 Monaco 的文本统一为 LF，同时保存每个原始换行的类型；未触及的换行逐个保留，编辑新增的换行使用 `preferred`（LF/CRLF 数量多者，数量相同时取文件首个换行，无换行时取 LF）。`AtomicFileWriter` 保留原文件 POSIX permissions；保存成功后更新 fingerprint；恢复日志与磁盘文件分离，保存成功后写 checkpoint 并压缩已持久化 records。
+`DocumentCodec` 给 Monaco 的文本统一为 LF，同时保存每个原始换行的类型；未触及的换行通过 `DocumentTextBuffer.replaceUTF16` 逐个保留，编辑新增的换行使用 `preferred`（LF/CRLF 数量多者，数量相同时取文件首个换行，无换行时取 LF）。`AtomicFileWriter`、`WorkspaceRootHandle`、recovery log 与 checkpoint 严格使用上述 commit point 和 recovery state；保存成功后返回新 fingerprint，Task 9 再写 checkpoint 并压缩已持久化 records。
 
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitProtocolTests.Phase1MessageTests|CockpitWorkspaceTests.DocumentCodecTests|CockpitWorkspaceTests.DocumentRecoveryLogTests|CockpitWorkspaceTests.AtomicFileWriterTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'documentRecovery|documentCodec|documentTextBuffer|atomicFileWriter|workspaceRootDocument'
 /usr/bin/git diff --check
-git add Sources/CockpitProtocol/Proto/cockpit.proto Sources/CockpitProtocol/DocumentMessages.swift Sources/CockpitHostCore/DocumentServing.swift Sources/CockpitWorkspace Tests/CockpitProtocolTests/Phase1MessageTests.swift Tests/CockpitWorkspaceTests
+git add Sources/CockpitProtocol/Proto/cockpit.proto Sources/CockpitProtocol/DocumentMessages.swift Sources/CockpitHostCore/DocumentServing.swift Sources/CockpitWorkspace Tests/CockpitProtocolTests/Phase1MessageTests.swift Tests/CockpitWorkspaceTests docs/superpowers/plans/2026-08-06-cockpit-phase-1-implementation.md
 git commit -m "feat: add recoverable utf8 document storage"
 ```
 
@@ -760,7 +883,7 @@ public actor DocumentActor {
 }
 ```
 
-一个 `(EnvironmentID, RelativePath)` 对应一个稳定 DocumentID。Cockpit rename/move 原子更新 locator 并保持 DocumentID；同一文档跨 Context 共享 actor。一个 lease 可写，其他 viewer 只读。
+一个 `(EnvironmentID, RelativePath)` 对应一个稳定 DocumentID。Cockpit rename/move 原子更新 locator 并保持 DocumentID；同一文档跨 Context 共享 actor。一个 lease 可写，其他 viewer 只读。`DocumentActor` 持有 Task 8 的 `DocumentTextBuffer`，每个 accepted edit 必须通过 `replaceUTF16` 同步更新文本与逐换行样式；直接只改 `String` 属于合同错误。恢复时磁盘 fingerprint 已等于 checkpoint 时只重放 checkpoint 之后 records；磁盘 fingerprint 与 checkpoint、未 checkpoint records 均不一致时进入 external conflict，禁止猜测或重复应用。
 
 `DocumentClientController` 只依赖 `DocumentDataTransport` port，不引用 DocumentActor、XPC 或 UDS。`FileTreeReconciler` 每次磁盘重扫把受影响 RelativePath 集合交给 `DocumentRegistry`; registry 只通知已经打开的 DocumentActor，并读取真实磁盘状态生成 `ExternalDocumentChange`。
 

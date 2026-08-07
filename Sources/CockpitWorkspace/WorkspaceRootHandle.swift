@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 
 struct PhysicalFileOperationResult: Sendable {
@@ -23,7 +24,7 @@ protocol FileOperationPhysicallyPerforming: Sendable {
     func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult
 }
 
-final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked Sendable {
+final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, DocumentServing, @unchecked Sendable {
     private let rootURL: URL
     private let queue = DispatchQueue(label: "com.openai.cockpit.file-operation-io")
     private let queueKey = DispatchSpecificKey<UInt8>()
@@ -57,6 +58,34 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
         try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(with: Result { try performSynchronously(operation) })
+            }
+        }
+    }
+
+    func readDocument(at path: RelativePath) async throws -> DocumentFileSnapshot {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                continuation.resume(with: Result {
+                    try AtomicFileWriter.snapshot(rootFD: openedRootFD(), path: path)
+                })
+            }
+        }
+    }
+
+    func atomicallyWriteDocument(
+        _ data: Data,
+        to path: RelativePath,
+        expectedFingerprint: DiskFingerprint
+    ) async throws -> DiskFingerprint {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                continuation.resume(with: Result {
+                    try AtomicFileWriter(rootFD: openedRootFD()).write(
+                        data,
+                        to: path,
+                        expectedFingerprint: expectedFingerprint
+                    )
+                })
             }
         }
     }

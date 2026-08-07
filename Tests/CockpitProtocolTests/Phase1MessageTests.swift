@@ -3,6 +3,72 @@ import Testing
 import CockpitTypes
 @testable import CockpitProtocol
 
+@Test func documentRecoveryRecordUsesFrozenHashAndDelimitedProtobufFraming() throws {
+    let documentID = DocumentID(try protocolUUID(12))
+    let record = try DocumentRecoveryRecord(
+        documentID: documentID,
+        documentVersion: 1,
+        clientSequence: 1,
+        utf8EditPayload: Data(#"{"edit":"x"}"#.utf8)
+    )
+    #expect(record.recordSHA256.bytes.map { String(format: "%02x", $0) }.joined() == "03396d54c8480d4b1302b80c8d9f37ce88b14244581b020c3ade292b4196a4c5")
+
+    let framed = try DocumentMessages.encodeDelimited(record)
+    let decoded = try DocumentMessages.decodeDelimitedRecord(framed)
+    #expect(decoded.value == record)
+    #expect(decoded.consumedBytes == framed.count)
+}
+
+@Test func documentRecoveryCheckpointUsesIndependentFrozenHashDomain() throws {
+    let checkpoint = try DocumentRecoveryCheckpoint(
+        documentID: DocumentID(try protocolUUID(12)),
+        persistedDocumentVersion: 7,
+        persistedClientSequence: 8,
+        diskFingerprint: DiskFingerprint(
+            deviceID: 9,
+            inode: 10,
+            byteCount: 11,
+            modificationTimeSeconds: -12,
+            modificationTimeNanoseconds: 13,
+            contentSHA256: SHA256Digest(validating: Data(0..<32))
+        )
+    )
+    #expect(checkpoint.checkpointSHA256.bytes.map { String(format: "%02x", $0) }.joined() == "402bb3b4792238087cfff167a3eb46481ab04f6df84873928d2b64560edde030")
+    #expect(try DocumentMessages.decodeDelimitedCheckpoint(DocumentMessages.encodeDelimited(checkpoint)).value == checkpoint)
+}
+
+@Test func documentRecoveryMapperRejectsFrozenMalformedFieldsAndUnknownFields() throws {
+    let record = try DocumentRecoveryRecord(
+        documentID: DocumentID(try #require(UUID(uuidString: "00000000-0000-0000-0000-abcdefabcdef"))),
+        documentVersion: 1,
+        clientSequence: 1,
+        utf8EditPayload: Data("valid".utf8)
+    )
+    var message = try DocumentMessages.encode(record)
+    let validHash = message.recordSha256
+    let mutations: [(inout CPDocumentRecoveryRecord) -> Void] = [
+        { $0.magic = Data("BAD!".utf8) },
+        { $0.formatVersion = 2 },
+        { $0.documentID = $0.documentID.uppercased() },
+        { $0.documentVersion = 0 },
+        { $0.clientSequence = 0 },
+        { $0.recordSha256 = Data(repeating: 0, count: 31) },
+        { $0.utf8EditPayload = Data() },
+        { $0.utf8EditPayload = Data([0xC3, 0x28]) },
+        { $0.utf8EditPayload = Data("bad\0payload".utf8) },
+    ]
+    for mutate in mutations {
+        message = try DocumentMessages.encode(record)
+        mutate(&message)
+        #expect(throws: ProtocolMappingError.self) { _ = try DocumentMessages.decode(message) }
+    }
+    message = try CPDocumentRecoveryRecord(serializedBytes: try message.serializedData() + Data([0x98, 0x06, 0x01]))
+    message.recordSha256 = validHash
+    #expect(throws: ProtocolMappingError.unknownFields("document_recovery_record")) {
+        _ = try DocumentMessages.decode(message)
+    }
+}
+
 private let protocol11 = ProtocolVersion(major: 1, minor: 1)
 
 private func protocolUUID(_ suffix: Int) throws -> UUID {
