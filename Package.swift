@@ -92,7 +92,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CockpitWorkspaceTests",
-            dependencies: ["CockpitWorkspace"]
+            dependencies: ["CockpitWorkspace", "CockpitClientCore"]
         ),
         .testTarget(
             name: "CockpitTerminalClientTests",

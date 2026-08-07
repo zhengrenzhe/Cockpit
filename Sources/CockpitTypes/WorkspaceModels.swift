@@ -1,5 +1,83 @@
 import Foundation
 
+public enum WorkspaceDirectory: Hashable, Codable, Sendable {
+    case root
+    case relative(RelativePath)
+}
+
+public struct FileTreeEntryIdentity: Hashable, Codable, Sendable {
+    public let environmentID: EnvironmentID
+    public let path: RelativePath
+
+    public init(environmentID: EnvironmentID, path: RelativePath) {
+        self.environmentID = environmentID
+        self.path = path
+    }
+}
+
+public enum FileTreeEntryKind: Hashable, Codable, Sendable {
+    case directory
+    case file
+    case symbolicLink
+}
+
+public struct FileTreeEntry: Hashable, Codable, Sendable {
+    public let identity: FileTreeEntryIdentity
+    public let kind: FileTreeEntryKind
+
+    public init(identity: FileTreeEntryIdentity, kind: FileTreeEntryKind) {
+        self.identity = identity
+        self.kind = kind
+    }
+}
+
+public struct FileTreeSnapshot: Hashable, Codable, Sendable {
+    public let environmentID: EnvironmentID
+    public let directory: WorkspaceDirectory
+    public let generation: UInt64
+    public let revision: UInt64
+    public let children: [FileTreeEntry]
+
+    public init(
+        environmentID: EnvironmentID,
+        directory: WorkspaceDirectory,
+        generation: UInt64,
+        revision: UInt64,
+        children: [FileTreeEntry]
+    ) {
+        self.environmentID = environmentID
+        self.directory = directory
+        self.generation = generation
+        self.revision = revision
+        self.children = children
+    }
+}
+
+public enum FileTreeMutation: Hashable, Codable, Sendable {
+    case insert(FileTreeEntry)
+    case remove(FileTreeEntryIdentity)
+    case update(FileTreeEntry)
+}
+
+public struct FileTreeDelta: Hashable, Codable, Sendable {
+    public let environmentID: EnvironmentID
+    public let directory: WorkspaceDirectory
+    public let revision: UInt64
+    public let mutations: [FileTreeMutation]
+
+    public init(
+        environmentID: EnvironmentID,
+        directory: WorkspaceDirectory,
+        revision: UInt64,
+        mutations: [FileTreeMutation]
+    ) {
+        self.environmentID = environmentID
+        self.directory = directory
+        self.revision = revision
+        self.mutations = mutations
+    }
+}
+
 public enum CockpitDomainValidationError: Error, Equatable, Sendable {
     case inconsistentWorkspaceContext
     case emptyWorkspaceRootIdentity

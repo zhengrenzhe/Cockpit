@@ -522,11 +522,13 @@ git commit -m "feat: isolate workspace context state"
 
 **Files:**
 
+- Modify: `Package.swift`
 - Modify: `Sources/CockpitTypes/WorkspaceModels.swift`
 - Create: `Sources/CockpitHostCore/FileTreeProviding.swift`
 - Create: `Sources/CockpitWorkspace/FileTreeProvider.swift`
 - Create: `Sources/CockpitWorkspace/FileSystemEventSource.swift`
 - Create: `Sources/CockpitWorkspace/FileTreeReconciler.swift`
+- Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
 - Create: `Tests/CockpitWorkspaceTests/FileTreeProviderTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/FileTreeReconcilerTests.swift`
 
@@ -556,7 +558,7 @@ public protocol FileTreeProviding: Sendable {
 
 - [ ] **Step 1: 写失败测试**
 
-用记录访问路径的 fake filesystem 断言展开根目录不访问孙目录；同一 Environment 的两个 Context 返回相同 provider identity；FSEvents drop/root-changed 触发已展开目录的定向重扫；旧 generation 的结果被客户端拒绝；符号链接以叶节点展示且不跟随扫描。
+用记录访问路径的 fake filesystem 断言展开根目录不访问孙目录；同一 Environment 的两个 Context 返回相同 provider identity；FSEvents drop/root-changed 触发已展开目录的定向重扫；旧 generation 的结果被客户端拒绝；符号链接以叶节点展示且不跟随扫描。`CockpitWorkspaceTests` 仅增加对 `CockpitClientCore` 测试依赖，以复用 Task 5 的 `ActiveContextController` 验证 generation 门禁；生产 target 依赖图不变。`WorkspaceKernelRegistry` 把同一个 Environment 的唯一 `FileTreeProvider` 挂在既有 `WorkspaceKernel` 上，以满足既定的 Environment 级复用合同。
 
 - [ ] **Step 2: 运行失败测试**
 
@@ -575,7 +577,7 @@ Expected: 失败，原因是 FileTree provider、event source 和 reconciler 不
 ```bash
 /usr/bin/swift test --disable-automatic-resolution --filter CockpitWorkspaceTests
 /usr/bin/git diff --check
-git add Sources/CockpitTypes/WorkspaceModels.swift Sources/CockpitHostCore/FileTreeProviding.swift Sources/CockpitWorkspace Tests/CockpitWorkspaceTests
+git add Package.swift Sources/CockpitTypes/WorkspaceModels.swift Sources/CockpitHostCore/FileTreeProviding.swift Sources/CockpitWorkspace Tests/CockpitWorkspaceTests
 git commit -m "feat: add lazy environment file tree"
 ```
 
