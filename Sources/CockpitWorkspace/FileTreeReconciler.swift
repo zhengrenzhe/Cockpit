@@ -4,6 +4,7 @@ final class FileTreeReconciler: @unchecked Sendable {
     private final class Completion: @unchecked Sendable {
         private let condition = NSCondition()
         private var isFinished = false
+        private var waiterCount = 0
 
         func finish() {
             condition.lock()
@@ -15,6 +16,17 @@ final class FileTreeReconciler: @unchecked Sendable {
         func wait() {
             condition.lock()
             while !isFinished {
+                waiterCount += 1
+                condition.broadcast()
+                condition.wait()
+                waiterCount -= 1
+            }
+            condition.unlock()
+        }
+
+        func waitUntilWaiterIsBlocked() {
+            condition.lock()
+            while waiterCount == 0 {
                 condition.wait()
             }
             condition.unlock()
@@ -69,5 +81,9 @@ final class FileTreeReconciler: @unchecked Sendable {
         lock.unlock()
         task?.cancel()
         completion.wait()
+    }
+
+    func waitUntilJoinIsBlocked() {
+        completion.waitUntilWaiterIsBlocked()
     }
 }

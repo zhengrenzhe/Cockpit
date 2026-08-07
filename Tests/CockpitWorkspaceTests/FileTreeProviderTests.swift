@@ -355,7 +355,7 @@ import CockpitTypes
         _ = await fileSystem.nextStarted()
         let join = BlockingJoinProbe { reconciler.cancelAndWait() }
         join.start()
-        await join.waitUntilStarted()
+        reconciler.waitUntilJoinIsBlocked()
         #expect(join.hasCompleted == false)
         await fileSystem.releaseNext()
         await join.waitUntilCompleted()
@@ -434,26 +434,22 @@ private final class RecordingDirectoryStreamAPI: DirectoryStreamAPI, @unchecked 
 
 private final class BlockingJoinProbe: @unchecked Sendable {
     private let operation: @Sendable () -> Void
-    private let started = AsyncStream<Void>.makeStream()
     private let completed = AsyncStream<Void>.makeStream()
     private let lock = NSLock()
-    private var startedIterator: AsyncStream<Void>.Iterator
     private var completedIterator: AsyncStream<Void>.Iterator
-    private(set) var hasCompleted = false
+    private var completedState = false
+    var hasCompleted: Bool { lock.withLock { completedState } }
     init(operation: @escaping @Sendable () -> Void) {
         self.operation = operation
-        startedIterator = started.stream.makeAsyncIterator()
         completedIterator = completed.stream.makeAsyncIterator()
     }
     func start() {
         DispatchQueue.global().async { [self] in
-            started.continuation.yield()
             operation()
-            lock.withLock { hasCompleted = true }
+            lock.withLock { completedState = true }
             completed.continuation.yield()
         }
     }
-    func waitUntilStarted() async { _ = await startedIterator.next() }
     func waitUntilCompleted() async { _ = await completedIterator.next() }
 }
 
