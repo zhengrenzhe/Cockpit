@@ -481,6 +481,90 @@ import CockpitTypes
     }
 }
 
+@Test func documentPersistenceFindOrCreateKeepsStableIdentityAndValidatesLocator() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let path = try RelativePath("Sources/App.swift")
+
+        let first = try await repository.findOrCreateDocument(
+            in: project.baseEnvironmentID,
+            at: path
+        )
+        let second = try await repository.findOrCreateDocument(
+            in: project.baseEnvironmentID,
+            at: path
+        )
+
+        #expect(first == second)
+        #expect(first.documentVersion == 0)
+        #expect(first.persistedVersion == 0)
+        #expect(first.dirtyState == .clean)
+        #expect(first.editLeaseID == nil)
+        #expect(try await repository.loadDocument(id: first.documentID) == first)
+    }
+}
+
+@Test func documentPersistenceCompareAndSetRejectsStaleStateAndRepairsCrashLag() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let initial = try await repository.findOrCreateDocument(
+            in: project.baseEnvironmentID,
+            at: RelativePath("document.txt")
+        )
+        let leaseID = EditLeaseID()
+        let advanced = try DocumentMetadata(
+            validatingDocumentID: initial.documentID,
+            environmentID: initial.environmentID,
+            relativePath: initial.relativePath,
+            documentVersion: 3,
+            persistedVersion: 1,
+            dirtyState: .dirty,
+            editLeaseID: leaseID
+        )
+        try await repository.compareAndSetDocumentMetadata(
+            advanced,
+            expectedDocumentVersion: 0,
+            expectedEditLeaseID: nil
+        )
+        #expect(try await repository.loadDocument(id: initial.documentID) == advanced)
+
+        await #expect(throws: DocumentMetadataRepositoryError.stale) {
+            try await repository.compareAndSetDocumentMetadata(
+                initial,
+                expectedDocumentVersion: 0,
+                expectedEditLeaseID: nil
+            )
+        }
+
+        let repaired = try DocumentMetadata(
+            validatingDocumentID: initial.documentID,
+            environmentID: initial.environmentID,
+            relativePath: initial.relativePath,
+            documentVersion: 4,
+            persistedVersion: 1,
+            dirtyState: .dirty,
+            editLeaseID: nil
+        )
+        try await repository.repairDocumentMetadata(repaired)
+        #expect(try await repository.loadDocument(id: initial.documentID) == repaired)
+
+        let overflow = try DocumentMetadata(
+            validatingDocumentID: initial.documentID,
+            environmentID: initial.environmentID,
+            relativePath: initial.relativePath,
+            documentVersion: UInt64(Int64.max) + 1,
+            persistedVersion: 1,
+            dirtyState: .dirty,
+            editLeaseID: nil
+        )
+        await #expect(throws: DocumentMetadataRepositoryError.counterOverflow) {
+            try await repository.repairDocumentMetadata(overflow)
+        }
+    }
+}
+
 private func makeProjectInput() -> NewProject {
     NewProject(
         displayName: "Cockpit",

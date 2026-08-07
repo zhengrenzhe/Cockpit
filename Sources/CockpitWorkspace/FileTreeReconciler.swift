@@ -39,7 +39,8 @@ final class FileTreeReconciler: @unchecked Sendable {
 
     init(
         provider: FileTreeProvider,
-        invalidations: AsyncThrowingStream<FileSystemInvalidation, Error>
+        invalidations: AsyncThrowingStream<FileSystemInvalidation, Error>,
+        documentRegistry: DocumentRegistry? = nil
     ) {
         let completion = completion
         reconciliationTask = Task { [weak provider] in
@@ -47,6 +48,14 @@ final class FileTreeReconciler: @unchecked Sendable {
             do {
                 for try await invalidation in invalidations {
                     guard !Task.isCancelled, let provider else { return }
+                    if let documentRegistry {
+                        switch invalidation {
+                        case let .targeted(scopes):
+                            await documentRegistry.handleExternalChanges(in: Set(scopes))
+                        case .allExpanded:
+                            await documentRegistry.handleExternalChanges(in: [.root])
+                        }
+                    }
                     let directories = await provider.expandedDirectories(affectedBy: invalidation)
                     for directory in directories {
                         guard !Task.isCancelled else { return }

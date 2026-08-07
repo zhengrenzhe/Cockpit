@@ -76,7 +76,8 @@ import CockpitTypes
     let diagnostic = try await log.checkpoint(
         persistedDocumentVersion: 1,
         persistedClientSequence: 1,
-        diskFingerprint: try recoveryFingerprint()
+        diskFingerprint: try recoveryFingerprint(),
+        persistedDocumentBytes: Data("checkpoint".utf8)
     )
 
     #expect(diagnostic == nil)
@@ -186,7 +187,8 @@ import CockpitTypes
     let diagnostic = try await log.checkpoint(
         persistedDocumentVersion: 2,
         persistedClientSequence: 2,
-        diskFingerprint: try recoveryFingerprint()
+        diskFingerprint: try recoveryFingerprint(),
+        persistedDocumentBytes: Data("checkpoint".utf8)
     )
     let recovered = try await log.recover()
 
@@ -214,7 +216,8 @@ import CockpitTypes
     let diagnostic = try await failing.checkpoint(
         persistedDocumentVersion: 1,
         persistedClientSequence: 1,
-        diskFingerprint: try recoveryFingerprint()
+        diskFingerprint: try recoveryFingerprint(),
+        persistedDocumentBytes: Data("checkpoint".utf8)
     )
     let recovered = try await initial.recover()
 
@@ -235,7 +238,8 @@ import CockpitTypes
     let diagnostic = try await log.checkpoint(
         persistedDocumentVersion: 1,
         persistedClientSequence: 1,
-        diskFingerprint: try recoveryFingerprint()
+        diskFingerprint: try recoveryFingerprint(),
+        persistedDocumentBytes: Data("checkpoint".utf8)
     )
     let recovered = try await log.recover()
 
@@ -262,10 +266,12 @@ private func recoveryFingerprint() throws -> DiskFingerprint {
     DiskFingerprint(
         deviceID: 9,
         inode: 10,
-        byteCount: 11,
+        byteCount: 10,
         modificationTimeSeconds: -12,
         modificationTimeNanoseconds: 13,
-        contentSHA256: try SHA256Digest(validating: Data(0..<32))
+        contentSHA256: try SHA256Digest(
+            validating: hexData("47320987f9a49d5b00119b960f247a956773f57543982b8bfcb6da5bb3afd9ef")
+        )
     )
 }
 

@@ -754,7 +754,7 @@ public protocol DocumentServing: Sendable {
 
 `DocumentTextBuffer` 只接受已经归一化为 LF 的文本。`replaceUTF16` 使用 Monaco 的 UTF-16 offset，拒绝越界或切开 surrogate pair；删除 edit range 内的换行类型，为 replacement 中每个新增 LF 插入 `preferred`，range 外换行类型及顺序保持不变。由此任意位置插入或删除换行都不会把原始 CRLF/LF 样式按数组下标错误平移。Task 9 的 `DocumentActor.apply` 必须通过该 API 更新文本和换行映射。
 
-恢复日志使用 SwiftProtobuf 的 unsigned-varint length prefix 加精确 message body，不使用 JSON 或固定宽度 length。`cockpit.proto` 新增以下冻结字段；mapper 拒绝 unknown fields、非 canonical DocumentID、零 documentVersion/clientSequence、非 32-byte hash、空/无效 UTF-8/含 NUL payload：
+恢复日志使用 SwiftProtobuf 的 unsigned-varint length prefix 加精确 message body，不使用固定宽度 length。record 的 `utf8_edit_payload` 由 Task 9 冻结为 exact-schema canonical UTF-8 JSON；mapper 拒绝 unknown fields、非 canonical DocumentID、零 record documentVersion/clientSequence、非 32-byte hash、空/无效 UTF-8/含 NUL payload：
 
 ```protobuf
 message DocumentRecoveryRecord {
@@ -769,7 +769,7 @@ message DocumentRecoveryRecord {
 
 message DocumentRecoveryCheckpoint {
   bytes magic = 1;                 // exact ASCII "CKDR"
-  uint32 format_version = 2;       // exact 1
+  uint32 format_version = 2;       // exact 2
   string document_id = 3;
   uint64 persisted_document_version = 4;
   uint64 persisted_client_sequence = 5;
@@ -780,10 +780,11 @@ message DocumentRecoveryCheckpoint {
   uint32 modification_time_nanoseconds = 10;
   bytes content_sha256 = 11;
   bytes checkpoint_sha256 = 12;
+  bytes persisted_document_bytes = 13;
 }
 ```
 
-record hash 覆盖 ASCII `CKDR-RECORD\0`、big-endian UInt32 format version、DocumentID 的 16 个 UUID bytes、big-endian UInt64 documentVersion/clientSequence/payload byte count 和原始 payload。checkpoint hash 使用独立 ASCII `CKDR-CHECKPOINT\0` domain separator，并按字段号顺序覆盖 version、DocumentID、persisted versions 与完整 fingerprint；hash 不依赖 protobuf serialization order。
+record format version 保持 1；checkpoint format version 从本补充起固定为 2。record hash 覆盖 ASCII `CKDR-RECORD\0`、big-endian UInt32 record format version、DocumentID 的 16 个 UUID bytes、big-endian UInt64 documentVersion/clientSequence/payload byte count 和原始 payload。checkpoint hash 使用独立 ASCII `CKDR-CHECKPOINT\0` domain separator，并按冻结顺序覆盖 checkpoint format version、DocumentID、persisted versions、完整 fingerprint、persisted bytes 长度与完整 persisted bytes；hash 不依赖 protobuf serialization order。checkpoint mapper 同时验证 `persistedClientSequence <= persistedDocumentVersion`、fingerprint byte count/SHA-256 与 persisted bytes 完全一致；这允许初始 `(0, 0)` baseline，也允许外部 clean reload 后 documentVersion 前进而 clientSequence 保持不变。
 
 `DocumentMessages.swift` 同时提供经验证的 `DocumentRecoveryRecord`、`DocumentRecoveryCheckpoint`、encode/decode/delimited framing mapper；`DocumentRecoveryLog.swift` 的公开边界固定为：
 
@@ -811,12 +812,15 @@ public final class DocumentRecoveryLog: @unchecked Sendable {
     public func checkpoint(
         persistedDocumentVersion: UInt64,
         persistedClientSequence: UInt64,
-        diskFingerprint: DiskFingerprint
+        diskFingerprint: DiskFingerprint,
+        persistedDocumentBytes: Data
     ) async throws -> DocumentRecoveryDiagnostic?
 }
 ```
 
 每个 DocumentID 使用独立的 `<lowercase-uuid>.records.ckdr` 与 `<lowercase-uuid>.checkpoint.ckdr`，文件权限 `0600`。每次 acknowledgement 前必须完整追加 record 并 `fsync`；短写、`fsync` 失败均不得 acknowledgement。恢复从有效 checkpoint 开始，只按严格递增 documentVersion/clientSequence 重放完整且 hash 正确的同一 DocumentID record。clean EOF 正常结束；截断尾 record 不重放并返回带 byte offset 的 `truncatedTail` 诊断；完整 malformed/hash/identity/sequence 错误在首个坏 record 处停止并保留诊断，不跳过坏 record 继续重放。
+
+checkpoint 的 persisted bytes 是该 fingerprint 对应的精确磁盘 bytes（包括 UTF-8 BOM 与原始 LF/CRLF），不是 Monaco 的 LF-normalized text。Task 9 在首次发放 edit lease 前保证 baseline checkpoint 已持久化；后续恢复即使发现磁盘已被外部改写或删除，也从 checkpoint bytes 加完整 records 重建 Host 已确认文本，再进入 conflict/missing，禁止丢弃已确认 edit 或把增量 edit 猜测性应用到外部新文本。
 
 checkpoint/compaction 顺序固定为：同目录唯一 temp 写完整 checkpoint、`fsync` temp、atomic rename、`fsync` recovery root；checkpoint 成为恢复基线后，再以同样的 temp + `fsync` + rename + parent `fsync` 原子发布只含 checkpoint 之后 records 的 compacted log。checkpoint 已提交而 compaction 失败时，旧 log 仍由 checkpoint 过滤，恢复结果不重复 edit，并返回 maintenance diagnostic；不得回滚 checkpoint。Task 8 只保证 checkpoint/compaction 自身所有崩溃点可恢复；磁盘保存成功但 Task 9 尚未调用 checkpoint 的跨组件窗口由 Task 9 作为 fingerprint conflict 处理，禁止静默重复重放。
 
@@ -855,14 +859,23 @@ git commit -m "feat: add recoverable utf8 document storage"
 
 **Files:**
 
+- Create: `Sources/CockpitProtocol/DocumentEditing.swift`
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/DocumentMessages.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
 - Create: `Sources/CockpitWorkspace/DocumentActor.swift`
 - Create: `Sources/CockpitWorkspace/DocumentRegistry.swift`
+- Modify: `Sources/CockpitWorkspace/DocumentRecoveryLog.swift`
 - Modify: `Sources/CockpitWorkspace/FileOperationCoordinator.swift`
 - Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
 - Modify: `Sources/CockpitWorkspace/FileTreeReconciler.swift`
 - Create: `Sources/CockpitClientCore/DocumentDataTransport.swift`
 - Create: `Sources/CockpitClientCore/DocumentClientController.swift`
 - Modify: `Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift`
+- Modify: `Applications/CockpitHost/main.swift`
+- Modify: `Tests/CockpitProtocolTests/Phase1MessageTests.swift`
+- Modify: `Tests/CockpitWorkspaceTests/DocumentRecoveryLogTests.swift`
+- Modify: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/DocumentActorTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/DocumentRegistryTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/DocumentExternalChangeTests.swift`
@@ -883,32 +896,74 @@ public actor DocumentActor {
 }
 ```
 
-一个 `(EnvironmentID, RelativePath)` 对应一个稳定 DocumentID。Cockpit rename/move 原子更新 locator 并保持 DocumentID；同一文档跨 Context 共享 actor。一个 lease 可写，其他 viewer 只读。`DocumentActor` 持有 Task 8 的 `DocumentTextBuffer`，每个 accepted edit 必须通过 `replaceUTF16` 同步更新文本与逐换行样式；直接只改 `String` 属于合同错误。恢复时磁盘 fingerprint 已等于 checkpoint 时只重放 checkpoint 之后 records；磁盘 fingerprint 与 checkpoint、未 checkpoint records 均不一致时进入 external conflict，禁止猜测或重复应用。
+#### 共享文档值与冻结编辑格式
 
-`DocumentClientController` 只依赖 `DocumentDataTransport` port，不引用 DocumentActor、XPC 或 UDS。`FileTreeReconciler` 每次磁盘重扫把受影响 RelativePath 集合交给 `DocumentRegistry`; registry 只通知已经打开的 DocumentActor，并读取真实磁盘状态生成 `ExternalDocumentChange`。
+`CockpitProtocol/DocumentEditing.swift` 是 Workspace 与 ClientCore 共享值的唯一归属，至少定义并完整验证：`DocumentDirtyState(clean/dirty/conflict/missing)`、`UTF16TextEdit`、`DocumentSnapshot`、`EditLease`、`EditTransaction`、`EditAcknowledgement`、maintenance state 与 typed document errors。`DocumentSnapshot` 固定携带 DocumentID、EnvironmentID、RelativePath、LF-normalized text、documentVersion、persistedVersion、last accepted clientSequence、dirty state、当前 observed disk fingerprint（missing 时为 nil）与当前 lease。所有传给 JavaScript 的 counter/offset 都限制在 `0...9_007_199_254_740_991`；public initializer 与 decoder 走同一 validation path。
+
+一个 transaction 含非空 `changes`；所有 change 使用 transaction 前同一文本的 UTF-16 offset/length，按 offset 严格升序且互不重叠。Actor 在 buffer copy 上逆序逐项调用 `DocumentTextBuffer.replaceUTF16`，禁止直接改 `String`。恢复 payload 固定为该 validated transaction 的 sorted-key、exact-schema UTF-8 JSON，包含 canonical DocumentID、EditLeaseID、baseVersion、clientSequence 和 changes；decoder 拒绝 unknown/missing key、非 canonical ID、空 changes、CR/NUL replacement、越界 counter 及非升序/重叠 change。raw canonical JSON 是 recovery record hash 的 payload；不再创建第二种 recovery edit 格式。
+
+#### 身份、持久化与恢复
+
+一个 `(EnvironmentID, RelativePath)` 对应一个稳定 DocumentID。Cockpit rename/move 原子更新 locator 并保持 DocumentID；同一 Environment 中跨 Project/Conversation Context 打开的同一文件共享一个 actor。`WorkspaceRepository.swift` 新增独立 `DocumentMetadataRepository` port 与 validated metadata value：atomic find-or-create by locator、load by DocumentID、compare-and-set persist documentVersion/persistedVersion/dirtyState/editLease。SQLite 实现复用现有 `documents` 表，不新增 migration；UInt64 写 SQLite 前拒绝超过 `Int64.max` 的值。recovery checkpoint/records 是已接受文本与版本的恢复权威，SQLite 是 DocumentID/locator/query state；open 时使用恢复结果校正 SQLite 中因 crash 落后的 metadata。
+
+首次 open 的新文档从 version 0、persistedVersion 0、clientSequence 0 开始。Registry 在发放首个 edit lease 或接受 edit 前持久化 Task 8 exact-bytes baseline checkpoint。恢复规则固定为：
+
+1. checkpoint fingerprint 等于当前磁盘时，从 checkpoint bytes decode baseline 并只重放 checkpoint 后完整、hash 正确、严格递增 records；
+2. checkpoint 存在且磁盘已改写时，仍从 checkpoint bytes 加 records 重建 Host 文本并进入 conflict；磁盘已删除则以同一 Host 文本进入 missing；
+3. 没有 checkpoint 且没有 records、metadata 为 clean 时，以真实磁盘建立 baseline；没有 checkpoint 但存在 records，或 metadata 表示未持久化状态时，返回 recovery-unavailable，禁止猜测；
+4. truncated tail 只忽略未完整 record；完整 corrupt record 在首个坏 record 停止。只重放此点之前完整且 durable 的 records，并保留 diagnostic。
+
+每次 Host 重启都清除旧 edit lease；远端/客户端必须重新获取 lease。一个 lease 可写，其他 viewer 只读。
+
+#### Lease、sequence 与 Actor commit point
+
+`clientSequence` 是 document-global sequence，首个 edit 为 1，每次 accepted transaction 精确加 1，跨 client 和 lease transfer 永不重置。`documentVersion` 每次 accepted edit 或替换 Host 文本的 reload/discard 精确加 1，因此始终满足 `clientSequence <= documentVersion`。transfer 校验当前 lease ID，生成新 lease ID、保留 last accepted sequence；同一 owner 重复 acquire 返回当前 lease，其他 client acquire 返回 typed lease-held。
+
+`apply` 固定顺序：校验 document/lease/baseVersion/next clientSequence 与 normalized changes → 在 `DocumentTextBuffer` copy 上逆序 apply → canonical encode → append recovery record 并 `fsync` → 原子提交 Actor text/version/dirty/last transaction → compare-and-set 持久化 metadata → acknowledgement。metadata 在 durable record 后失败时 Actor 进入 fail-closed recovery-required，返回携带 committed acknowledgement 的 typed error，不发送普通 ack；restart 从 log 修复 SQLite 后，同一 last sequence + 同一 canonical payload 返回原 acknowledgement 且不追加 record。同一 last sequence + 不同 payload 返回 duplicate-mismatch；更旧 sequence 返回 stale；大于 next sequence 返回 gap。只保证最后一个 accepted transaction 的 retry 幂等，ClientController 使用 stop-and-wait 保证不会需要更早 transaction 的 retry。
+
+Actor 所有会 `await` 的 mutating operation 使用同一 non-reentrant operation gate；save/discard/external reload/lease transfer 期间不得由 actor reentrancy 插入 apply。`flush(through:)` 在 `through <= lastAcceptedClientSequence` 时返回当前 authoritative documentVersion；大于 last accepted 时返回 sequence-gap，不无限等待。ClientController 先排空本地有序发送队列，再调用 Host flush。
+
+#### Save、discard 与外部修改
+
+save 固定顺序：确认 flush barrier 与 expected fingerprint 等于 Actor 当前 observed fingerprint → encode exact BOM/line endings bytes → Task 8 root-capability atomic write → checkpoint(new fingerprint + exact saved bytes + current version/sequence) → compare-and-set metadata persistedVersion/clean → 更新 Actor 并返回 snapshot。checkpoint 的 `.compactionDeferred` 不回滚已提交 checkpoint，snapshot maintenance state 暴露该 diagnostic。atomic write 的 `committedButDurabilityUnknown` 不写 checkpoint，Actor 进入 conflict/recovery-required；磁盘已提交但 checkpoint/metadata 失败同样不得报告 clean，restart 按 fingerprint mismatch 重建 Host 文本并进入 conflict。
+
+discard 读取并 decode 当前真实磁盘，Host 文本替换后 documentVersion +1、persistedVersion 同步、写 exact-bytes checkpoint、持久化 clean；missing 时返回 typed file-missing。外部 fingerprint 未变化时 no-op；clean 文档被改写时 reload、version +1、checkpoint 并保持 clean；dirty/conflict 文档被改写时保留 Host 文本、更新 observed fingerprint 并进入 conflict；外部删除始终保留 Host 文本、observed fingerprint 置 nil 并标记 missing。missing 文件重新出现时，原本 clean（documentVersion == persistedVersion）则 reload；原本 dirty 则进入 conflict。conflict 可在显式使用最新 observed fingerprint 的 save 中覆盖外部版本，或通过 discard 接受外部版本；missing 不在 Task 9 中自动重建文件。
+
+#### Registry、文件操作与 production wiring
+
+`DocumentRegistry` 同时按 locator 与 DocumentID 索引，只保留已打开 actor；open 通过 metadata repository atomic find-or-create，确保同一 locator 返回同一 actor。`WorkspaceKernel` 只创建一个共享 `WorkspaceRootHandle`，同时供 file operations 与 document serving 使用，并持有 DocumentRegistry。`WorkspaceKernelRegistry` 明确注入 metadata repository 与 `documentRecoveryRoot`；`CockpitHost/main.swift` 传入 `storage.documentRecoveryRoot` 和 SQLite repository，禁止只在测试中 wiring。
+
+`FileTreeReconciler` 对每次 invalidation 都通知 Registry，通知不依赖目录是否展开，也不依赖 `FileTreeDelta` 是否为 nil。targeted directory scope 通知该目录直接文件及子树内匹配的全部 open actor；`allExpanded` 对 Registry 的语义是全部 open actor。Registry 对每个匹配 actor 经 `DocumentServing` 读取真实磁盘并生成 `ExternalDocumentChange`，只通知 open actor，不扫描整个项目。
+
+为避免 Cockpit 内部 rename/move 的 FSEvent 在物理提交与 locator 提交之间被误判成 external delete，FileOperationCoordinator 在物理 mutation 前取得 Registry internal-mutation lease；期间 invalidation 只排队。成功顺序固定为 repository preflight → physical mutation → stage tree → repository locator transaction → nonthrowing live-registry relocation → tree commit → release Registry lease and reconcile queued invalidations。repository 失败沿用 Task 7 committed recovery-required；Registry 不得先于 DB 改 locator。
+
+#### ClientCore port 与状态机
+
+`DocumentDataTransport` 固定提供 open/snapshot/acquire lease/transfer/apply/flush/save/discard，方法只使用 CockpitProtocol shared values。`DocumentClientController` 只依赖该 port，不引用 DocumentActor、XPC、UDS、AppKit 或 WebKit；状态固定为 `.closed`、`.ready`、`.readOnly`、`.resynchronizing`。Controller 为每个 document 维护有序 stop-and-wait queue 与 document-global next clientSequence；本地可继续排队，网络只发送一个 transaction。lease/baseVersion/stale/gap/duplicate-mismatch/recovery-required 任一错误立即进入 `.resynchronizing`，停止 dequeue；完整 snapshot（及可写时的新 lease）replace 完成前禁止继续发送。flush 等待 through sequence 的全部 queued transaction 得到 acknowledgement 后再调用 transport flush。
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖 baseVersion/clientSequence 单调校验、重复 edit 幂等确认、sequence 缺口触发 resync、错误 lease 拒绝、flush barrier、保存清 dirty、rename/move 后 DocumentID 不变、崩溃恢复只包含已确认 edit；用真实临时目录分别改写和删除磁盘文件，触发 reconciler 后断言干净文档重载、脏文档进入 conflict、外部删除保留 Host 文本并标记 missing。
+所有新 Swift Testing 函数强制使用 `documentEditing`、`documentPersistence`、`documentActor`、`documentRegistry`、`documentExternalChange` 或 `documentClientController` lowerCamel 前缀；Task 8 checkpoint compatibility test 使用 `documentRecovery` 前缀。覆盖 exact canonical recovery JSON、checkpoint v2 exact bytes/hash/0 baseline/`clientSequence <= documentVersion`、SQLite find-or-create/CAS/stale repair；覆盖 baseVersion/clientSequence 单调校验、最后一个重复 edit 幂等确认、same-sequence different-payload、sequence gap、错误 lease、lease transfer sequence 不重置、actor await reentrancy gate、metadata-after-log failure fail-closed、flush barrier、save/checkpoint/metadata commit points、compaction diagnostic、discard、rename/move 后 DocumentID 不变、崩溃恢复只包含 durable accepted edit。用真实临时目录分别改写和删除磁盘文件，触发未展开目录/content-only/allExpanded invalidation，断言干净文档重载、脏文档 conflict、外部删除保留 Host 文本并 missing，以及内部 rename invalidation 不产生瞬时 missing。
 
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'documentRecovery|documentEditing|documentPersistence|documentActor|documentRegistry|documentExternalChange|documentClientController'
 ```
 
-Expected: 失败，原因是 DocumentActor、registry 与 client controller 不存在。
+Expected: 失败，原因是 checkpoint v2/shared document values、DocumentActor、registry、metadata repository 与 client controller 不存在。原计划 regex `CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests` 已在 Task 9 preflight 通过 `swift test list --skip-build` 实测为 0 matches，禁止继续使用。写测试前用新 regex 验证现有 `documentRecovery` compatibility 集合非空；GREEN 后必须再次用 `swift test list --skip-build | grep -E` 证明匹配 ID 数量非零且等于实际执行数。
 
 - [ ] **Step 3: 实现 actor 与客户端停止/重同步状态机**
 
-Monaco 本地 edit 在 Host acknowledgement 前只存在于客户端副本；Host 每次接受 edit 后先写恢复日志，再返回新 documentVersion。版本或 lease 错误使 client controller 进入 `.resynchronizing`，在完整 snapshot 应用前不继续发送。
+严格实现上述 shared model、baseline recovery、metadata、Actor/Registry 与 ClientController 合同。Monaco 本地 edit 在 Host acknowledgement 前只存在于客户端副本；Host 每次接受 edit 后先 durable 写恢复日志，再返回新 documentVersion。版本、sequence、lease 或 recovery-required 错误使 client controller 进入 `.resynchronizing`，在完整 snapshot 应用前不继续发送。
 
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.Document|CockpitClientCoreTests.DocumentClientControllerTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'documentRecovery|documentEditing|documentPersistence|documentActor|documentRegistry|documentExternalChange|documentClientController'
+/usr/bin/swift test list --skip-build | grep -E 'documentRecovery|documentEditing|documentPersistence|documentActor|documentRegistry|documentExternalChange|documentClientController'
 /usr/bin/git diff --check
-git add Sources/CockpitWorkspace Sources/CockpitClientCore Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Tests/CockpitWorkspaceTests Tests/CockpitClientCoreTests
+git add docs/superpowers/plans/2026-08-06-cockpit-phase-1-implementation.md Sources/CockpitProtocol Sources/CockpitHostCore/WorkspaceRepository.swift Sources/CockpitWorkspace Sources/CockpitClientCore Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Applications/CockpitHost/main.swift Tests/CockpitProtocolTests/Phase1MessageTests.swift Tests/CockpitWorkspaceTests Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift Tests/CockpitClientCoreTests
 git commit -m "feat: coordinate authoritative documents"
 ```
 

@@ -104,14 +104,16 @@ public final class DocumentRecoveryLog: @unchecked Sendable {
     public func checkpoint(
         persistedDocumentVersion: UInt64,
         persistedClientSequence: UInt64,
-        diskFingerprint: DiskFingerprint
+        diskFingerprint: DiskFingerprint,
+        persistedDocumentBytes: Data
     ) async throws -> DocumentRecoveryDiagnostic? {
         try await onQueue {
             let checkpoint = try DocumentRecoveryCheckpoint(
                 documentID: self.documentID,
                 persistedDocumentVersion: persistedDocumentVersion,
                 persistedClientSequence: persistedClientSequence,
-                diskFingerprint: diskFingerprint
+                diskFingerprint: diskFingerprint,
+                persistedDocumentBytes: persistedDocumentBytes
             )
             let checkpointFrame = try DocumentMessages.encodeDelimited(checkpoint)
             try self.publishAtomically(checkpointFrame, to: self.checkpointURL)

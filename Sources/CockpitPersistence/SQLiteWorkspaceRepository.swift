@@ -1,8 +1,9 @@
 import Foundation
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 
-public actor SQLiteWorkspaceRepository: WorkspaceRepository {
+public actor SQLiteWorkspaceRepository: WorkspaceRepository, DocumentMetadataRepository {
     private let connection: SQLiteConnection
 
     public init(databaseURL: URL) async throws {
@@ -277,6 +278,101 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         }
     }
 
+    public func findOrCreateDocument(
+        in environmentID: EnvironmentID,
+        at path: RelativePath
+    ) async throws -> DocumentMetadata {
+        let path = try validatedLocatorPath(path)
+        return try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                """
+                SELECT id, environment_id, relative_path, document_version,
+                       persisted_version, dirty_state, edit_lease_id
+                FROM documents WHERE environment_id = ? AND relative_path = ?
+                """,
+                bindings: [.text(environmentID.description), .text(path.string)]
+            )
+            if let row = rows.first { return try Self.documentMetadata(from: row) }
+            let metadata = try DocumentMetadata(
+                validatingDocumentID: DocumentID(),
+                environmentID: environmentID,
+                relativePath: path,
+                documentVersion: 0,
+                persistedVersion: 0,
+                dirtyState: .clean,
+                editLeaseID: nil
+            )
+            try connection.execute(
+                """
+                INSERT INTO documents (
+                    id, environment_id, relative_path, document_version,
+                    persisted_version, dirty_state, edit_lease_id
+                ) VALUES (?, ?, ?, 0, 0, 'clean', NULL)
+                """,
+                bindings: [
+                    .text(metadata.documentID.description),
+                    .text(environmentID.description),
+                    .text(path.string),
+                ]
+            )
+            return metadata
+        }
+    }
+
+    public func loadDocument(id: DocumentID) async throws -> DocumentMetadata? {
+        let rows = try await connection.query(
+            """
+            SELECT id, environment_id, relative_path, document_version,
+                   persisted_version, dirty_state, edit_lease_id
+            FROM documents WHERE id = ?
+            """,
+            bindings: [.text(id.description)]
+        )
+        guard let row = rows.first else { return nil }
+        return try Self.documentMetadata(from: row)
+    }
+
+    public func compareAndSetDocumentMetadata(
+        _ metadata: DocumentMetadata,
+        expectedDocumentVersion: UInt64,
+        expectedEditLeaseID: EditLeaseID?
+    ) async throws {
+        try Self.validateCounters(metadata)
+        try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                """
+                SELECT id, environment_id, relative_path, document_version,
+                       persisted_version, dirty_state, edit_lease_id
+                FROM documents WHERE id = ?
+                """,
+                bindings: [.text(metadata.documentID.description)]
+            )
+            guard let row = rows.first else { throw DocumentMetadataRepositoryError.stale }
+            let current = try Self.documentMetadata(from: row)
+            guard current.documentVersion == expectedDocumentVersion,
+                  current.editLeaseID == expectedEditLeaseID,
+                  current.environmentID == metadata.environmentID,
+                  current.relativePath == metadata.relativePath
+            else { throw DocumentMetadataRepositoryError.stale }
+            try Self.updateDocumentMetadata(metadata, connection: connection)
+        }
+    }
+
+    public func repairDocumentMetadata(_ metadata: DocumentMetadata) async throws {
+        try Self.validateCounters(metadata)
+        try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                "SELECT environment_id, relative_path FROM documents WHERE id = ?",
+                bindings: [.text(metadata.documentID.description)]
+            )
+            guard rows.count == 1,
+                  rows[0][safe: 0]?.text == metadata.environmentID.description,
+                  rows[0][safe: 1]?.text == metadata.relativePath.string
+            else { throw DocumentMetadataRepositoryError.stale }
+            try Self.updateDocumentMetadata(metadata, connection: connection)
+        }
+    }
+
     public func relocateDocumentLocators(
         in environmentID: EnvironmentID,
         from source: RelativePath,
@@ -450,6 +546,67 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
             lifecycleState: lifecycleState,
             deletionOperationID: deletionOperationID,
             createdAt: Date(timeIntervalSince1970: createdAt)
+        )
+    }
+
+    private static func documentMetadata(from row: [SQLiteColumn]) throws -> DocumentMetadata {
+        guard let idText = row[safe: 0]?.text,
+              let idUUID = UUID(uuidString: idText),
+              DocumentID(idUUID).description == idText,
+              let environmentText = row[safe: 1]?.text,
+              let environmentUUID = UUID(uuidString: environmentText),
+              EnvironmentID(environmentUUID).description == environmentText,
+              let pathText = row[safe: 2]?.text,
+              let path = try? RelativePath(pathText),
+              let version = row[safe: 3]?.integer,
+              let persisted = row[safe: 4]?.integer,
+              version >= 0, persisted >= 0,
+              let dirtyText = row[safe: 5]?.text,
+              let dirty = DocumentDirtyState(rawValue: dirtyText)
+        else { throw WorkspaceRepositoryError.invalidStoredValue }
+        let lease: EditLeaseID?
+        if row[safe: 6]?.isNull == true {
+            lease = nil
+        } else {
+            guard let leaseText = row[safe: 6]?.text,
+                  let leaseUUID = UUID(uuidString: leaseText),
+                  EditLeaseID(leaseUUID).description == leaseText
+            else { throw WorkspaceRepositoryError.invalidStoredValue }
+            lease = EditLeaseID(leaseUUID)
+        }
+        return try DocumentMetadata(
+            validatingDocumentID: DocumentID(idUUID),
+            environmentID: EnvironmentID(environmentUUID),
+            relativePath: path,
+            documentVersion: UInt64(version),
+            persistedVersion: UInt64(persisted),
+            dirtyState: dirty,
+            editLeaseID: lease
+        )
+    }
+
+    private static func validateCounters(_ metadata: DocumentMetadata) throws {
+        guard metadata.documentVersion <= UInt64(Int64.max),
+              metadata.persistedVersion <= UInt64(Int64.max)
+        else { throw DocumentMetadataRepositoryError.counterOverflow }
+    }
+
+    private static func updateDocumentMetadata(
+        _ metadata: DocumentMetadata,
+        connection: isolated SQLiteConnection
+    ) throws {
+        try connection.execute(
+            """
+            UPDATE documents SET document_version = ?, persisted_version = ?,
+                dirty_state = ?, edit_lease_id = ? WHERE id = ?
+            """,
+            bindings: [
+                .integer(Int64(metadata.documentVersion)),
+                .integer(Int64(metadata.persistedVersion)),
+                .text(metadata.dirtyState.rawValue),
+                metadata.editLeaseID.map { .text($0.description) } ?? .null,
+                .text(metadata.documentID.description),
+            ]
         )
     }
 

@@ -6,6 +6,7 @@ actor FileOperationCoordinator {
     private let rootHandle: any FileOperationPhysicallyPerforming
     private let documentLocatorUpdater: any DocumentLocatorUpdating
     private let fileTreeProvider: FileTreeProvider
+    private let documentRegistry: DocumentRegistry?
     private let operationGate = FileTreeOperationGate()
     private var recoveryRequired: FileOperationRecoveryRequiredError?
 
@@ -13,12 +14,14 @@ actor FileOperationCoordinator {
         environmentID: EnvironmentID,
         rootHandle: any FileOperationPhysicallyPerforming,
         documentLocatorUpdater: any DocumentLocatorUpdating,
-        fileTreeProvider: FileTreeProvider
+        fileTreeProvider: FileTreeProvider,
+        documentRegistry: DocumentRegistry? = nil
     ) {
         self.environmentID = environmentID
         self.rootHandle = rootHandle
         self.documentLocatorUpdater = documentLocatorUpdater
         self.fileTreeProvider = fileTreeProvider
+        self.documentRegistry = documentRegistry
     }
 
     func perform(_ operation: FileOperation) async throws -> FileOperationResult {
@@ -37,10 +40,11 @@ actor FileOperationCoordinator {
                 try Task.checkCancellation()
             }
             let lease = try await fileTreeProvider.acquireExternalMutationLease()
+            let documentMutationLease = await documentRegistry?.acquireInternalMutationLease()
             do {
                 try Task.checkCancellation()
                 let physical = try await rootHandle.perform(operation)
-                let completion = Task { [documentLocatorUpdater, environmentID, fileTreeProvider] in
+                let completion = Task { [documentLocatorUpdater, environmentID, fileTreeProvider, documentRegistry] in
                     do {
                         let staged = try await fileTreeProvider.stageExternalMutation(
                             operation: operation,
@@ -53,6 +57,10 @@ actor FileOperationCoordinator {
                                 from: source,
                                 to: destination
                             )
+                            await documentRegistry?.relocateOpenDocuments(
+                                from: source,
+                                to: destination
+                            )
                         }
                         await fileTreeProvider.commitExternalMutation(staged, lease: lease)
                         return PostPhysicalCompletion.success
@@ -62,6 +70,9 @@ actor FileOperationCoordinator {
                 }
                 switch await completion.value {
                 case .success:
+                    if let documentMutationLease {
+                        await documentRegistry?.releaseInternalMutationLease(documentMutationLease)
+                    }
                     await operationGate.release()
                     return physical.result
                 case let .failed(originalError):
@@ -71,12 +82,18 @@ actor FileOperationCoordinator {
                         originalError: originalError
                     )
                     recoveryRequired = fatal
+                    if let documentMutationLease {
+                        await documentRegistry?.releaseInternalMutationLease(documentMutationLease)
+                    }
                     throw fatal
                 }
             } catch {
                 await fileTreeProvider.cancelExternalMutation(lease)
                 if let fatal = error as? FileOperationRecoveryRequiredError {
                     recoveryRequired = fatal
+                }
+                if let documentMutationLease {
+                    await documentRegistry?.releaseInternalMutationLease(documentMutationLease)
                 }
                 throw error
             }

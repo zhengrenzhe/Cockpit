@@ -20,21 +20,97 @@ import CockpitTypes
 }
 
 @Test func documentRecoveryCheckpointUsesIndependentFrozenHashDomain() throws {
+    let persistedBytes = Data("hello\n".utf8)
     let checkpoint = try DocumentRecoveryCheckpoint(
         documentID: DocumentID(try protocolUUID(12)),
-        persistedDocumentVersion: 7,
-        persistedClientSequence: 8,
+        persistedDocumentVersion: 0,
+        persistedClientSequence: 0,
         diskFingerprint: DiskFingerprint(
             deviceID: 9,
             inode: 10,
-            byteCount: 11,
+            byteCount: UInt64(persistedBytes.count),
             modificationTimeSeconds: -12,
             modificationTimeNanoseconds: 13,
-            contentSHA256: SHA256Digest(validating: Data(0..<32))
+            contentSHA256: try SHA256Digest(
+                validating: protocolHexData("5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03")
+            )
+        ),
+        persistedDocumentBytes: persistedBytes
+    )
+    #expect(checkpoint.checkpointSHA256.bytes.map { String(format: "%02x", $0) }.joined() == "4769bb5a48487c87d0a28001a5b12863716052c35a498606b125e339d864c7df")
+    let message = try DocumentMessages.encode(checkpoint)
+    #expect(message.formatVersion == 2)
+    #expect(message.persistedDocumentBytes == persistedBytes)
+    #expect(
+        try DocumentMessages.decodeDelimitedCheckpoint(
+            DocumentMessages.encodeDelimited(checkpoint)
+        ).value == checkpoint
+    )
+}
+
+@Test func documentRecoveryCheckpointRejectsMismatchedBytesAndSequenceAboveVersion() throws {
+    let bytes = Data("disk".utf8)
+    let fingerprint = DiskFingerprint(
+        deviceID: 1,
+        inode: 2,
+        byteCount: UInt64(bytes.count),
+        modificationTimeSeconds: 3,
+        modificationTimeNanoseconds: 4,
+        contentSHA256: try SHA256Digest(
+            validating: protocolHexData("4b1e72365f7c481426ceb098c15adc429eb64e51e5d656409236fbdd1a99f4c2")
         )
     )
-    #expect(checkpoint.checkpointSHA256.bytes.map { String(format: "%02x", $0) }.joined() == "402bb3b4792238087cfff167a3eb46481ab04f6df84873928d2b64560edde030")
-    #expect(try DocumentMessages.decodeDelimitedCheckpoint(DocumentMessages.encodeDelimited(checkpoint)).value == checkpoint)
+    #expect(throws: ProtocolMappingError.self) {
+        _ = try DocumentRecoveryCheckpoint(
+            documentID: DocumentID(try protocolUUID(14)),
+            persistedDocumentVersion: 0,
+            persistedClientSequence: 1,
+            diskFingerprint: fingerprint,
+            persistedDocumentBytes: bytes
+        )
+    }
+    #expect(throws: ProtocolMappingError.self) {
+        _ = try DocumentRecoveryCheckpoint(
+            documentID: DocumentID(try protocolUUID(14)),
+            persistedDocumentVersion: 0,
+            persistedClientSequence: 0,
+            diskFingerprint: fingerprint,
+            persistedDocumentBytes: Data("other".utf8)
+        )
+    }
+}
+
+@Test func documentEditingCanonicalPayloadRoundTripsExactSchemaAndRejectsMutation() throws {
+    let transaction = try EditTransaction(
+        validatingDocumentID: DocumentID(try protocolUUID(21)),
+        editLeaseID: EditLeaseID(try protocolUUID(22)),
+        baseVersion: 7,
+        clientSequence: 8,
+        changes: [
+            try UTF16TextEdit(validatingOffset: 1, length: 2, replacement: "x"),
+            try UTF16TextEdit(validatingOffset: 5, length: 0, replacement: "y\n"),
+        ]
+    )
+    let payload = try DocumentEditing.encodeRecoveryPayload(transaction)
+    #expect(String(decoding: payload, as: UTF8.self) == #"{"baseVersion":7,"changes":[{"length":2,"offset":1,"replacement":"x"},{"length":0,"offset":5,"replacement":"y\n"}],"clientSequence":8,"documentID":"00000000-0000-0000-0000-000000000021","editLeaseID":"00000000-0000-0000-0000-000000000022"}"#)
+    #expect(try DocumentEditing.decodeRecoveryPayload(payload) == transaction)
+
+    let unknown = Data(String(decoding: payload.dropLast(), as: UTF8.self).appending(",\"unknown\":true}").utf8)
+    #expect(throws: DocumentProtocolError.self) {
+        _ = try DocumentEditing.decodeRecoveryPayload(unknown)
+    }
+    #expect(throws: DocumentProtocolError.self) {
+        _ = try EditTransaction(
+            validatingDocumentID: transaction.documentID,
+            editLeaseID: transaction.editLeaseID,
+            baseVersion: 7,
+            clientSequence: 8,
+            changes: [
+                try UTF16TextEdit(validatingOffset: 2, length: 2, replacement: "a"),
+                try UTF16TextEdit(validatingOffset: 3, length: 1, replacement: "b"),
+            ]
+        )
+    }
 }
 
 @Test func documentRecoveryMapperRejectsFrozenMalformedFieldsAndUnknownFields() throws {
@@ -105,6 +181,21 @@ private let protocol11 = ProtocolVersion(major: 1, minor: 1)
 
 private func protocolUUID(_ suffix: Int) throws -> UUID {
     try #require(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", suffix)))
+}
+
+private func protocolHexData(_ hex: String) throws -> Data {
+    guard hex.count.isMultiple(of: 2) else { throw CocoaError(.coderInvalidValue) }
+    var result = Data()
+    var index = hex.startIndex
+    while index < hex.endIndex {
+        let next = hex.index(index, offsetBy: 2)
+        guard let byte = UInt8(hex[index..<next], radix: 16) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        result.append(byte)
+        index = next
+    }
+    return result
 }
 
 private func requestContext(generation: UInt64 = 17) throws -> RequestContext {

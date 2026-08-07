@@ -1,5 +1,65 @@
 import Foundation
+import CockpitProtocol
 import CockpitTypes
+
+public struct DocumentMetadata: Hashable, Sendable {
+    public let documentID: DocumentID
+    public let environmentID: EnvironmentID
+    public let relativePath: RelativePath
+    public let documentVersion: UInt64
+    public let persistedVersion: UInt64
+    public let dirtyState: DocumentDirtyState
+    public let editLeaseID: EditLeaseID?
+
+    public init(
+        validatingDocumentID documentID: DocumentID,
+        environmentID: EnvironmentID,
+        relativePath: RelativePath,
+        documentVersion: UInt64,
+        persistedVersion: UInt64,
+        dirtyState: DocumentDirtyState,
+        editLeaseID: EditLeaseID?
+    ) throws {
+        guard persistedVersion <= documentVersion,
+              !relativePath.string.contains("\0")
+        else { throw DocumentMetadataRepositoryError.invalidValue }
+        self.documentID = documentID
+        self.environmentID = environmentID
+        self.relativePath = relativePath
+        self.documentVersion = documentVersion
+        self.persistedVersion = persistedVersion
+        self.dirtyState = dirtyState
+        self.editLeaseID = editLeaseID
+    }
+}
+
+public enum DocumentMetadataRepositoryError: Error, Equatable, Sendable {
+    case invalidValue
+    case stale
+    case counterOverflow
+}
+
+public protocol DocumentMetadataRepository: DocumentLocatorUpdating, Sendable {
+    func findOrCreateDocument(
+        in environmentID: EnvironmentID,
+        at path: RelativePath
+    ) async throws -> DocumentMetadata
+    func loadDocument(id: DocumentID) async throws -> DocumentMetadata?
+    func compareAndSetDocumentMetadata(
+        _ metadata: DocumentMetadata,
+        expectedDocumentVersion: UInt64,
+        expectedEditLeaseID: EditLeaseID?
+    ) async throws
+    func repairDocumentMetadata(_ metadata: DocumentMetadata) async throws
+}
+
+public extension DocumentMetadataRepository {
+    func relocateDocumentLocators(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) async throws {}
+}
 
 public struct Project: Hashable, Sendable {
     public let id: ProjectID

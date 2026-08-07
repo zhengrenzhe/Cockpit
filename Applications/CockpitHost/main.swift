@@ -22,7 +22,11 @@ private func parkHostProcess(retaining graph: [Any]) -> Never {
 
 let storage = try CockpitStorageLocations.production()
 let repository = try await SQLiteWorkspaceRepository(databaseURL: storage.workspaceDatabase)
-let registry = WorkspaceKernelRegistry(documentLocatorUpdater: repository)
+let registry = WorkspaceKernelRegistry(
+    documentLocatorUpdater: repository,
+    documentMetadataRepository: repository,
+    documentRecoveryRoot: storage.documentRecoveryRoot
+)
 let service = WorkspaceService(
     repository: repository,
     rootResolver: SecurityScopedProjectRootResolver(),

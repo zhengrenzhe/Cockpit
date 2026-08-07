@@ -83,25 +83,31 @@ public struct DocumentRecoveryCheckpoint: Hashable, Sendable {
     public let persistedClientSequence: UInt64
     public let diskFingerprint: DiskFingerprint
     public let checkpointSHA256: CockpitTypes.SHA256Digest
+    public let persistedDocumentBytes: Data
 
     public init(
         documentID: DocumentID,
         persistedDocumentVersion: UInt64,
         persistedClientSequence: UInt64,
-        diskFingerprint: DiskFingerprint
+        diskFingerprint: DiskFingerprint,
+        persistedDocumentBytes: Data
     ) throws {
-        guard persistedDocumentVersion > 0, persistedClientSequence > 0,
-              diskFingerprint.modificationTimeNanoseconds < 1_000_000_000
+        guard persistedClientSequence <= persistedDocumentVersion,
+              diskFingerprint.modificationTimeNanoseconds < 1_000_000_000,
+              diskFingerprint.byteCount == UInt64(persistedDocumentBytes.count),
+              diskFingerprint.contentSHA256.bytes == Data(SHA256.hash(data: persistedDocumentBytes))
         else { throw ProtocolMappingError.invalidValue("document_recovery_checkpoint") }
         self.documentID = documentID
         self.persistedDocumentVersion = persistedDocumentVersion
         self.persistedClientSequence = persistedClientSequence
         self.diskFingerprint = diskFingerprint
+        self.persistedDocumentBytes = persistedDocumentBytes
         self.checkpointSHA256 = try recoveryCheckpointDigest(
             documentID: documentID,
             persistedDocumentVersion: persistedDocumentVersion,
             persistedClientSequence: persistedClientSequence,
-            diskFingerprint: diskFingerprint
+            diskFingerprint: diskFingerprint,
+            persistedDocumentBytes: persistedDocumentBytes
         )
     }
 }
@@ -164,7 +170,7 @@ public enum DocumentMessages {
     ) throws -> CPDocumentRecoveryCheckpoint {
         var message = CPDocumentRecoveryCheckpoint()
         message.magic = recoveryMagic
-        message.formatVersion = recoveryFormatVersion
+        message.formatVersion = recoveryCheckpointFormatVersion
         message.documentID = value.documentID.description
         message.persistedDocumentVersion = value.persistedDocumentVersion
         message.persistedClientSequence = value.persistedClientSequence
@@ -175,6 +181,7 @@ public enum DocumentMessages {
         message.modificationTimeNanoseconds = value.diskFingerprint.modificationTimeNanoseconds
         message.contentSha256 = value.diskFingerprint.contentSHA256.bytes
         message.checkpointSha256 = value.checkpointSHA256.bytes
+        message.persistedDocumentBytes = value.persistedDocumentBytes
         return message
     }
 
@@ -183,9 +190,8 @@ public enum DocumentMessages {
     ) throws -> DocumentRecoveryCheckpoint {
         try rejectUnknownFields(message.unknownFields.data, field: "document_recovery_checkpoint")
         guard message.magic == recoveryMagic,
-              message.formatVersion == recoveryFormatVersion,
-              message.persistedDocumentVersion > 0,
-              message.persistedClientSequence > 0,
+              message.formatVersion == recoveryCheckpointFormatVersion,
+              message.persistedClientSequence <= message.persistedDocumentVersion,
               message.modificationTimeNanoseconds < 1_000_000_000,
               message.contentSha256.count == 32,
               message.checkpointSha256.count == 32
@@ -202,7 +208,8 @@ public enum DocumentMessages {
             documentID: canonicalDocumentID(message.documentID),
             persistedDocumentVersion: message.persistedDocumentVersion,
             persistedClientSequence: message.persistedClientSequence,
-            diskFingerprint: fingerprint
+            diskFingerprint: fingerprint,
+            persistedDocumentBytes: message.persistedDocumentBytes
         )
         guard value.checkpointSHA256.bytes == message.checkpointSha256 else {
             throw ProtocolMappingError.invalidValue("document_recovery_checkpoint.checkpoint_sha256")
@@ -253,6 +260,7 @@ public enum DocumentMessages {
 
 private let recoveryMagic = Data("CKDR".utf8)
 private let recoveryFormatVersion: UInt32 = 1
+private let recoveryCheckpointFormatVersion: UInt32 = 2
 
 private func validEditPayload(_ data: Data) -> Bool {
     !data.isEmpty && !data.contains(0) && String(data: data, encoding: .utf8) != nil
@@ -291,10 +299,11 @@ private func recoveryCheckpointDigest(
     documentID: DocumentID,
     persistedDocumentVersion: UInt64,
     persistedClientSequence: UInt64,
-    diskFingerprint: DiskFingerprint
+    diskFingerprint: DiskFingerprint,
+    persistedDocumentBytes: Data
 ) throws -> CockpitTypes.SHA256Digest {
     var data = Data("CKDR-CHECKPOINT\0".utf8)
-    data.appendBigEndian(recoveryFormatVersion)
+    data.appendBigEndian(recoveryCheckpointFormatVersion)
     data.append(uuidBytes(documentID.rawValue))
     data.appendBigEndian(persistedDocumentVersion)
     data.appendBigEndian(persistedClientSequence)
@@ -304,6 +313,8 @@ private func recoveryCheckpointDigest(
     data.appendBigEndian(UInt64(bitPattern: diskFingerprint.modificationTimeSeconds))
     data.appendBigEndian(diskFingerprint.modificationTimeNanoseconds)
     data.append(diskFingerprint.contentSHA256.bytes)
+    data.appendBigEndian(UInt64(persistedDocumentBytes.count))
+    data.append(persistedDocumentBytes)
     return try CockpitTypes.SHA256Digest(validating: Data(SHA256.hash(data: data)))
 }
 

@@ -8,11 +8,14 @@ public final class WorkspaceKernel: @unchecked Sendable {
     private let eventSource: FileSystemEventSource
     private let reconciler: FileTreeReconciler
     let fileOperationCoordinator: FileOperationCoordinator
+    public let documentRegistry: DocumentRegistry?
 
     init(
         environmentID: EnvironmentID,
         root: ResolvedProjectRoot,
-        documentLocatorUpdater: any DocumentLocatorUpdating
+        documentLocatorUpdater: any DocumentLocatorUpdating,
+        documentMetadataRepository: (any DocumentMetadataRepository)?,
+        documentRecoveryRoot: URL?
     ) {
         self.root = root
         let provider = FileTreeProvider(
@@ -23,19 +26,34 @@ public final class WorkspaceKernel: @unchecked Sendable {
         let eventSource = FileSystemEventSource(
             rootURL: URL(fileURLWithPath: root.canonicalAbsolutePath, isDirectory: true)
         )
+        let rootHandle = WorkspaceRootHandle(
+            rootURL: URL(fileURLWithPath: root.canonicalAbsolutePath, isDirectory: true)
+        )
+        let documentRegistry: DocumentRegistry?
+        if let documentMetadataRepository, let documentRecoveryRoot {
+            documentRegistry = DocumentRegistry(
+                environmentID: environmentID,
+                documentServing: rootHandle,
+                metadataRepository: documentMetadataRepository,
+                recoveryRoot: documentRecoveryRoot
+            )
+        } else {
+            documentRegistry = nil
+        }
+        self.documentRegistry = documentRegistry
         fileTreeProvider = provider
         fileOperationCoordinator = FileOperationCoordinator(
             environmentID: environmentID,
-            rootHandle: WorkspaceRootHandle(
-                rootURL: URL(fileURLWithPath: root.canonicalAbsolutePath, isDirectory: true)
-            ),
+            rootHandle: rootHandle,
             documentLocatorUpdater: documentLocatorUpdater,
-            fileTreeProvider: provider
+            fileTreeProvider: provider,
+            documentRegistry: documentRegistry
         )
         self.eventSource = eventSource
         reconciler = FileTreeReconciler(
             provider: provider,
-            invalidations: eventSource.invalidations
+            invalidations: eventSource.invalidations,
+            documentRegistry: documentRegistry
         )
     }
 
@@ -48,13 +66,29 @@ public final class WorkspaceKernel: @unchecked Sendable {
 public actor WorkspaceKernelRegistry: WorkspaceKernelRegistering {
     private var kernels: [EnvironmentID: WorkspaceKernel] = [:]
     private let documentLocatorUpdater: any DocumentLocatorUpdating
+    private let documentMetadataRepository: (any DocumentMetadataRepository)?
+    private let documentRecoveryRoot: URL?
 
     public init() {
         documentLocatorUpdater = NoOpDocumentLocatorUpdater()
+        documentMetadataRepository = nil
+        documentRecoveryRoot = nil
     }
 
     public init(documentLocatorUpdater: any DocumentLocatorUpdating) {
         self.documentLocatorUpdater = documentLocatorUpdater
+        documentMetadataRepository = nil
+        documentRecoveryRoot = nil
+    }
+
+    public init(
+        documentLocatorUpdater: any DocumentLocatorUpdating,
+        documentMetadataRepository: any DocumentMetadataRepository,
+        documentRecoveryRoot: URL
+    ) {
+        self.documentLocatorUpdater = documentLocatorUpdater
+        self.documentMetadataRepository = documentMetadataRepository
+        self.documentRecoveryRoot = documentRecoveryRoot
     }
 
     public func register(environmentID: EnvironmentID, root: ResolvedProjectRoot) {
@@ -62,7 +96,9 @@ public actor WorkspaceKernelRegistry: WorkspaceKernelRegistering {
         kernels[environmentID] = WorkspaceKernel(
             environmentID: environmentID,
             root: root,
-            documentLocatorUpdater: documentLocatorUpdater
+            documentLocatorUpdater: documentLocatorUpdater,
+            documentMetadataRepository: documentMetadataRepository,
+            documentRecoveryRoot: documentRecoveryRoot
         )
     }
 

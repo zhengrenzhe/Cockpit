@@ -159,4 +159,5 @@ message DocumentRecoveryCheckpoint {
   uint32 modification_time_nanoseconds = 10;
   bytes content_sha256 = 11;
   bytes checkpoint_sha256 = 12;
+  bytes persisted_document_bytes = 13;
 }
