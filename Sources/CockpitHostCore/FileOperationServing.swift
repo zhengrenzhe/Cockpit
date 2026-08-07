@@ -14,6 +14,7 @@ public enum FileOperationError: Error, Equatable, Sendable {
 public enum FileOperationRecoveryState: Hashable, Sendable {
     case committed(FileOperationResult)
     case staged(RelativePath)
+    case stagedLocationUnknown
 }
 
 public struct FileOperationRecoveryRequiredError: Error, @unchecked Sendable {

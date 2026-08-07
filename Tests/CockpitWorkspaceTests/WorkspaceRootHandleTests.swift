@@ -285,9 +285,13 @@ import CockpitTypes
             return
         }
         #expect(stagingPath.string.hasPrefix(".cockpit-trash-"))
+        #expect(stagingPath.string == swap.movedURL.lastPathComponent)
+        #expect(stagingPath.string != swap.replacementURL.lastPathComponent)
         #expect(error.originalError as? FileOperationError == .identityChanged)
-        #expect(try Data(contentsOf: fixture.root.appendingPathComponent(stagingPath.string)) == Data("replacement".utf8))
-        #expect(try Data(contentsOf: swap.movedURL) == Data("original".utf8))
+        #expect(try fileIdentity(at: fixture.root.appendingPathComponent(stagingPath.string)) == swap.originalIdentity)
+        #expect(try fileIdentity(at: swap.replacementURL) != swap.originalIdentity)
+        #expect(try Data(contentsOf: fixture.root.appendingPathComponent(stagingPath.string)) == Data("original".utf8))
+        #expect(try Data(contentsOf: swap.replacementURL) == Data("replacement".utf8))
     }
 }
 
@@ -332,8 +336,29 @@ import CockpitTypes
                 continue
             }
             #expect(stagingPath.string.hasPrefix(".cockpit-mkdir-"))
+            #expect(stagingPath.string == action.actualStagingURL.lastPathComponent)
+            #expect(try fileIdentity(at: fixture.root.appendingPathComponent(stagingPath.string)) == action.originalIdentity)
             #expect(FileManager.default.fileExists(atPath: action.actualStagingURL.path))
         }
+    }
+}
+
+@Test func stagedObjectMovedOutsideRootReportsLocationUnknownWithoutNamingAReplacement() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let action = OutsideRootStagingMoveAction(root: fixture.root, outside: fixture.base)
+    let handle = WorkspaceRootHandle(
+        rootURL: fixture.root,
+        afterCreatingDirectoryStaging: { action.run(stagingPath: $0) }
+    )
+
+    do {
+        _ = try await handle.perform(.createDirectory(parent: .root, name: "destination"))
+        Issue.record("Expected recovery-required failure")
+    } catch let error as FileOperationRecoveryRequiredError {
+        #expect(error.state == .stagedLocationUnknown)
+        #expect(try fileIdentity(at: action.actualURL) == action.originalIdentity)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent(action.originalName).path))
     }
 }
 
@@ -437,14 +462,20 @@ private final class DirectorySwapAction: @unchecked Sendable {
 private final class FileIdentitySwapAction: @unchecked Sendable {
     private let lock = NSLock()
     private var recordedMovedURL: URL?
+    private var recordedReplacementURL: URL?
+    private var recordedOriginalIdentity: FileTestIdentity?
     private var completed = false
     var movedURL: URL { lock.withLock { recordedMovedURL! } }
+    var replacementURL: URL { lock.withLock { recordedReplacementURL! } }
+    var originalIdentity: FileTestIdentity { lock.withLock { recordedOriginalIdentity! } }
     func run(at url: URL) {
         lock.withLock {
             guard !completed else { return }
             completed = true
             let original = url.appendingPathExtension("moved")
+            recordedOriginalIdentity = try! fileIdentity(at: url)
             recordedMovedURL = original
+            recordedReplacementURL = url
             try! FileManager.default.moveItem(at: url, to: original)
             try! Data("replacement".utf8).write(to: url)
         }
@@ -481,11 +512,14 @@ private final class DirectoryStagingFailureAction: @unchecked Sendable {
     private let root: URL
     private let failure: DirectoryStagingFailure
     private var recordedStagingURL: URL?
+    private var recordedOriginalIdentity: FileTestIdentity?
     var actualStagingURL: URL { lock.withLock { recordedStagingURL! } }
+    var originalIdentity: FileTestIdentity { lock.withLock { recordedOriginalIdentity! } }
     init(root: URL, failure: DirectoryStagingFailure) { self.root = root; self.failure = failure }
     func run(stagingPath: RelativePath) {
         lock.withLock {
             let stagingURL = root.appendingPathComponent(stagingPath.string, isDirectory: true)
+            recordedOriginalIdentity = try! fileIdentity(at: stagingURL)
             switch failure {
             case .destinationCollision:
                 recordedStagingURL = stagingURL
@@ -500,6 +534,47 @@ private final class DirectoryStagingFailureAction: @unchecked Sendable {
             }
         }
     }
+}
+
+private final class OutsideRootStagingMoveAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let root: URL
+    private let outside: URL
+    private var recordedURL: URL?
+    private var recordedName: String?
+    private var recordedIdentity: FileTestIdentity?
+    var actualURL: URL { lock.withLock { recordedURL! } }
+    var originalName: String { lock.withLock { recordedName! } }
+    var originalIdentity: FileTestIdentity { lock.withLock { recordedIdentity! } }
+    init(root: URL, outside: URL) { self.root = root; self.outside = outside }
+    func run(stagingPath: RelativePath) {
+        lock.withLock {
+            let source = root.appendingPathComponent(stagingPath.string, isDirectory: true)
+            let destination = outside.appendingPathComponent(stagingPath.string + "-outside", isDirectory: true)
+            recordedName = stagingPath.string
+            recordedIdentity = try! fileIdentity(at: source)
+            recordedURL = destination
+            try! FileManager.default.moveItem(at: source, to: destination)
+        }
+    }
+}
+
+private struct FileTestIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let type: mode_t
+}
+
+private func fileIdentity(at url: URL) throws -> FileTestIdentity {
+    var metadata = stat()
+    guard lstat(url.path, &metadata) == 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    return FileTestIdentity(
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
+        type: metadata.st_mode & mode_t(S_IFMT)
+    )
 }
 
 private final class FileOperationFixture {

@@ -171,8 +171,22 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
                 prefix: ".cockpit-trash-",
                 rootFD: rootFD
             )
+            let stagingFD: Int32
             do {
-                let before = try entryMetadata(rootFD: rootFD, path: stagingPath)
+                stagingFD = try openStagedObject(rootFD: rootFD, path: stagingPath)
+            } catch {
+                throw FileOperationRecoveryRequiredError(
+                    originalOperation: operation,
+                    state: .stagedLocationUnknown,
+                    originalError: error
+                )
+            }
+            defer { close(stagingFD) }
+            do {
+                var before = stat()
+                guard fstat(stagingFD, &before) == 0 else {
+                    throw posixError(code: errno, path: try currentURL(for: stagingPath).path)
+                }
                 let stagingURL = try currentURL(for: stagingPath)
                 beforeTrashValidation(stagingURL)
                 let secureAfter = try entryMetadata(rootFD: rootFD, path: stagingPath)
@@ -193,7 +207,7 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             } catch {
                 throw FileOperationRecoveryRequiredError(
                     originalOperation: operation,
-                    state: .staged(stagingPath),
+                    state: stagedRecoveryState(stagingFD: stagingFD, rootFD: rootFD),
                     originalError: error
                 )
             }
@@ -256,6 +270,17 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             }
         }
         let stagingPath = try RelativePath(stagingName)
+        let stagingFD: Int32
+        do {
+            stagingFD = try openStagedObject(rootFD: rootFD, path: stagingPath)
+        } catch {
+            throw FileOperationRecoveryRequiredError(
+                originalOperation: operation,
+                state: .stagedLocationUnknown,
+                originalError: error
+            )
+        }
+        defer { close(stagingFD) }
         afterCreatingDirectoryStaging(stagingPath)
         do {
             _ = try entryMetadata(rootFD: rootFD, path: stagingPath)
@@ -272,7 +297,7 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
         } catch {
             throw FileOperationRecoveryRequiredError(
                 originalOperation: operation,
-                state: .staged(stagingPath),
+                state: stagedRecoveryState(stagingFD: stagingFD, rootFD: rootFD),
                 originalError: error
             )
         }
@@ -315,6 +340,45 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
                 throw pathResolutionError(code: code, path: try currentURL(for: source).path)
             }
         }
+    }
+
+    private func openStagedObject(rootFD: Int32, path: RelativePath) throws -> Int32 {
+        let fd = openat(
+            rootFD,
+            path.string,
+            O_EVTONLY | O_SYMLINK | O_RESOLVE_BENEATH | O_CLOEXEC
+        )
+        guard fd >= 0 else {
+            throw pathResolutionError(code: errno, path: try currentURL(for: path).path)
+        }
+        return fd
+    }
+
+    private func stagedRecoveryState(
+        stagingFD: Int32,
+        rootFD: Int32
+    ) -> FileOperationRecoveryState {
+        guard let rootPath = try? pathForFD(rootFD),
+              let objectPath = try? pathForFD(stagingFD)
+        else {
+            return .stagedLocationUnknown
+        }
+        let root = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
+        let object = URL(fileURLWithPath: objectPath).standardizedFileURL
+        guard object.deletingLastPathComponent() == root,
+              let relativePath = try? RelativePath(object.lastPathComponent)
+        else {
+            return .stagedLocationUnknown
+        }
+        var retainedMetadata = stat()
+        guard fstat(stagingFD, &retainedMetadata) == 0,
+              let currentMetadata = try? entryMetadata(rootFD: rootFD, path: relativePath),
+              sameIdentity(retainedMetadata, currentMetadata),
+              (try? pathForFD(stagingFD)) == objectPath
+        else {
+            return .stagedLocationUnknown
+        }
+        return .staged(relativePath)
     }
 
     private func validatedDirectory(_ directory: WorkspaceDirectory) throws -> WorkspaceDirectory {
