@@ -488,6 +488,9 @@ actor RecordingFileTreeFileSystem: FileTreeFileSystem {
     private var entries: [WorkspaceDirectory: [FileSystemEntryRecord]]
     private var errors: [WorkspaceDirectory: FileTreeProviderError]
     private var reads: [WorkspaceDirectory] = []
+    private var controlsReads = false
+    private var readPermits = 0
+    private var readWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         entries: [WorkspaceDirectory: [FileSystemEntryRecord]],
@@ -502,6 +505,13 @@ actor RecordingFileTreeFileSystem: FileTreeFileSystem {
         directory: WorkspaceDirectory
     ) async throws -> [FileSystemEntryRecord] {
         reads.append(directory)
+        if controlsReads {
+            if readPermits > 0 {
+                readPermits -= 1
+            } else {
+                await withCheckedContinuation { readWaiters.append($0) }
+            }
+        }
         if let error = errors[directory] {
             throw error
         }
@@ -522,6 +532,18 @@ actor RecordingFileTreeFileSystem: FileTreeFileSystem {
 
     func clearReads() {
         reads.removeAll()
+    }
+
+    func beginControlledReads() {
+        controlsReads = true
+    }
+
+    func releaseNextRead() {
+        if readWaiters.isEmpty {
+            readPermits += 1
+        } else {
+            readWaiters.removeFirst().resume()
+        }
     }
 }
 

@@ -277,6 +277,68 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         }
     }
 
+    public func relocateDocumentLocators(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) async throws {
+        let validSource: RelativePath
+        let validDestination: RelativePath
+        do {
+            guard !source.string.contains("\0"), !destination.string.contains("\0") else {
+                throw FileOperationError.invalidPath
+            }
+            validSource = try RelativePath(source.string)
+            validDestination = try RelativePath(destination.string)
+        } catch let error as FileOperationError {
+            throw error
+        } catch {
+            throw FileOperationError.invalidPath
+        }
+
+        try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                "SELECT id, relative_path FROM documents WHERE environment_id = ? ORDER BY id",
+                bindings: [.text(environmentID.description)]
+            )
+            for row in rows {
+                guard let id = row[safe: 0]?.text,
+                      let storedText = row[safe: 1]?.text
+                else {
+                    throw WorkspaceRepositoryError.invalidStoredValue
+                }
+                let stored: RelativePath
+                do {
+                    stored = try RelativePath(storedText)
+                } catch {
+                    throw WorkspaceRepositoryError.invalidStoredValue
+                }
+                let relocatedText: String
+                if stored.string == validSource.string {
+                    relocatedText = validDestination.string
+                } else if stored.string.hasPrefix(validSource.string + "/") {
+                    relocatedText = validDestination.string + stored.string.dropFirst(validSource.string.count)
+                } else {
+                    continue
+                }
+                let relocated: RelativePath
+                do {
+                    relocated = try RelativePath(relocatedText)
+                } catch {
+                    throw WorkspaceRepositoryError.invalidStoredValue
+                }
+                try connection.execute(
+                    "UPDATE documents SET relative_path = ? WHERE id = ? AND environment_id = ?",
+                    bindings: [
+                        .text(relocated.string),
+                        .text(id),
+                        .text(environmentID.description),
+                    ]
+                )
+            }
+        }
+    }
+
     private static func project(from row: [SQLiteColumn]) throws -> Project {
         guard let id = projectID(row[safe: 0]),
               let displayName = row[safe: 1]?.text,

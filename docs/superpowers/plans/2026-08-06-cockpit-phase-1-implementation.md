@@ -590,15 +590,23 @@ git commit -m "feat: add lazy environment file tree"
 **Files:**
 
 - Create: `Sources/CockpitHostCore/FileOperationServing.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
 - Create: `Sources/CockpitWorkspace/WorkspaceRootHandle.swift`
 - Create: `Sources/CockpitWorkspace/FileOperationCoordinator.swift`
 - Create: `Sources/CockpitWorkspace/FileOperationError.swift`
+- Modify: `Sources/CockpitWorkspace/FileTreeProvider.swift`
+- Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCProtocol.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
+- Modify: `Applications/CockpitHost/main.swift`
 - Create: `Tests/CockpitWorkspaceTests/WorkspaceRootHandleTests.swift`
 - Create: `Tests/CockpitWorkspaceTests/FileOperationCoordinatorTests.swift`
+- Modify: `Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift`
+- Modify: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
 - Modify: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
 
 **Contract:**
@@ -620,30 +628,34 @@ public protocol FileOperationServing: Sendable {
 }
 ```
 
-`WorkspaceRootHandle` 持有 root directory FD。祖先遍历使用 `openat(..., O_DIRECTORY | O_NOFOLLOW)`；创建使用 `openat`/`mkdirat`；重命名和移动使用 `renameat`；删除在重新验证 file identity 后调用 macOS Trash，不调用 unlink/rmdir。
+`WorkspaceRootHandle` 持有 root directory FD。祖先遍历使用 `openat(..., O_DIRECTORY | O_NOFOLLOW)`；创建使用 `openat`/`mkdirat`；重命名和移动使用 `renameatx_np(..., RENAME_EXCL)`，目标已存在时原子失败且不覆盖；删除在重新验证 file identity 后调用 macOS Trash，不调用 unlink/rmdir。
+
+Host 控制面使用 `performFileOperation(context: RequestContext, operation: FileOperation)`；`WorkspaceService` 解析 `workspaceContextID` 并验证其当前 `EnvironmentID` 与请求一致后，才路由到 Environment 级 `FileOperationServing`。`FileOperationResult` 只返回相对路径：create 返回新路径，rename/move 返回旧路径与新路径，trash 返回原路径，不返回 root URL/FD。
+
+`WorkspaceRepository` 提供 Environment 级 Document locator 重定位端口；文件或目录 rename/move 时在同一事务更新精确路径和全部后代路径。`TabRecord.Resource.file` 只保存稳定 `DocumentID`，不保存路径，因此 Context tabs 在重定位时保持原引用和值不变。Task 9 在同一 coordinator 元数据端口接入运行中的 `DocumentRegistry`。
 
 - [ ] **Step 1: 写失败测试**
 
-断言根目录下 create/move 成功；`..`、绝对路径、空文件名、`/`、NUL、符号链接祖先和跨根目标全部被拒绝；失败操作不增加 tree revision、不更新 Document path、不更新 tabs；成功 rename/move 返回旧 path 与新 path；trash 后物理文件位于系统废纸篓且源路径消失。
+断言根目录下 create/move 成功；`..`、绝对路径、空文件名、`.`、`/`、NUL、符号链接祖先和跨根目标全部被拒绝；已存在目标不会被覆盖；失败操作不增加 tree revision、不更新 Document path、不更新 tabs；成功 rename/move 返回旧 path 与新 path，并在一个事务重定位精确 Document locator 与目录后代 locator、保持稳定 DocumentID/tab 引用；目录 rename/move/trash 清除旧路径下已展开 tree cache；trash 后物理文件位于系统废纸篓且源路径消失。Host 测试同时覆盖 Context→Environment 不匹配拒绝、显式 wire tag/未知字段拒绝和 NSError domain/code/path 保真。
 
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.FileOperationCoordinatorTests|CockpitLocalTransportTests.HostXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests|CockpitHostCoreTests|CockpitPersistenceTests|CockpitLocalTransportTests'
 ```
 
 Expected: 失败，原因是 WorkspaceRootHandle 与文件操作协调器不存在。
 
 - [ ] **Step 3: 实现每 Environment 一个串行 coordinator**
 
-所有元数据更新发生在文件系统操作成功之后；成功后同一个 actor 依次更新 Document locator、Context tab 引用和 FileTree revision。`WorkspaceService` 通过 Host XPC 暴露类型化 `performFileOperation` 低频命令，并在路由前校验当前 Context→Environment；App 不取得 root URL/FD。错误保留真实 URL、`NSPOSIXErrorDomain`/`NSCocoaErrorDomain` 与 code。
+`WorkspaceKernelRegistry` 为每个 Environment 创建并持有一个串行 `FileOperationCoordinator`。所有元数据更新发生在文件系统操作成功之后；成功后 coordinator 依次更新 Document locator、保持稳定 DocumentID/tab 引用，并通过 FileTree provider 的同一 mutation gate 丢弃已移动/删除目录的旧 expanded cache、对账受影响父目录和递增 revision，避免 FSEvents 在元数据提交前发布中间树状态。`WorkspaceService` 通过现有 Host XPC `workspaceCommand(Data)` 暴露类型化 `performFileOperation` 低频命令，并在路由前校验当前 Context→Environment；App 不取得 root URL/FD。错误保留真实 URL、`NSPOSIXErrorDomain`/`NSCocoaErrorDomain` 与 code。
 
 - [ ] **Step 4: 运行 focused checks 并提交**
 
 ```bash
-/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests.WorkspaceRootHandleTests|CockpitWorkspaceTests.FileOperationCoordinatorTests|CockpitLocalTransportTests.HostXPCTests'
+/usr/bin/swift test --disable-automatic-resolution --filter 'CockpitWorkspaceTests|CockpitHostCoreTests|CockpitPersistenceTests|CockpitLocalTransportTests'
 /usr/bin/git diff --check
-git add Sources/CockpitHostCore Sources/CockpitWorkspace Sources/CockpitLocalTransport Tests/CockpitWorkspaceTests Tests/CockpitLocalTransportTests/HostXPCTests.swift
+git add Applications/CockpitHost/main.swift Sources/CockpitHostCore Sources/CockpitWorkspace Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift Sources/CockpitLocalTransport Tests/CockpitWorkspaceTests Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift Tests/CockpitLocalTransportTests/HostXPCTests.swift
 git commit -m "feat: manage files inside environment root"
 ```
 
@@ -722,6 +734,8 @@ git commit -m "feat: add recoverable utf8 document storage"
 
 - Create: `Sources/CockpitWorkspace/DocumentActor.swift`
 - Create: `Sources/CockpitWorkspace/DocumentRegistry.swift`
+- Modify: `Sources/CockpitWorkspace/FileOperationCoordinator.swift`
+- Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
 - Modify: `Sources/CockpitWorkspace/FileTreeReconciler.swift`
 - Create: `Sources/CockpitClientCore/DocumentDataTransport.swift`
 - Create: `Sources/CockpitClientCore/DocumentClientController.swift`

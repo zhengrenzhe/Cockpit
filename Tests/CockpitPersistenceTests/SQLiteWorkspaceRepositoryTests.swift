@@ -335,6 +335,119 @@ import CockpitTypes
     }
 }
 
+@Test func documentLocatorRelocationIsAtomicEnvironmentScopedAndPreservesDocumentAndTabState() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let otherEnvironmentID = EnvironmentID()
+        let exactID = DocumentID()
+        let descendantID = DocumentID()
+        let siblingID = DocumentID()
+        let otherEnvironmentDocumentID = DocumentID()
+        let state = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: .project(project.id),
+            documentID: exactID, tabID: TabID(), cursorLine: 9,
+            collapsed: false, leadingWidth: 240, trailingWidth: 360, scroll: 15
+        )
+        try await repository.saveClientState(state)
+        let inspection = try SQLiteConnection(databaseURL: databaseURL)
+        try await inspection.withImmediateTransaction { connection in
+            try connection.execute(
+                """
+                INSERT INTO environments (
+                    id, project_id, kind, workspace_root, workspace_root_identity,
+                    git_common_directory, worktree_branch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                bindings: [
+                    .text(otherEnvironmentID.description), .text(project.id.description),
+                    .text("worktree"), .text("/other"), .text("identity:other"), .null, .text("other"),
+                ]
+            )
+            try insertDocument(
+                connection: connection, id: exactID, environmentID: project.baseEnvironmentID,
+                path: "old", documentVersion: 11, persistedVersion: 7,
+                dirtyState: "dirty", editLeaseID: "lease-exact"
+            )
+            try insertDocument(
+                connection: connection, id: descendantID, environmentID: project.baseEnvironmentID,
+                path: "old/child.txt", documentVersion: 5, persistedVersion: 5,
+                dirtyState: "clean", editLeaseID: nil
+            )
+            try insertDocument(
+                connection: connection, id: siblingID, environmentID: project.baseEnvironmentID,
+                path: "oldish/unchanged.txt", documentVersion: 3, persistedVersion: 2,
+                dirtyState: "conflict", editLeaseID: "lease-sibling"
+            )
+            try insertDocument(
+                connection: connection, id: otherEnvironmentDocumentID, environmentID: otherEnvironmentID,
+                path: "old/other.txt", documentVersion: 13, persistedVersion: 8,
+                dirtyState: "missing", editLeaseID: nil
+            )
+        }
+        let stateJSONBefore = try await storedStateJSON(connection: inspection)
+
+        try await inspection.execute(
+            """
+            CREATE TRIGGER reject_descendant_relocation
+            BEFORE UPDATE OF relative_path ON documents
+            WHEN OLD.relative_path = 'old/child.txt'
+            BEGIN
+                SELECT RAISE(ABORT, 'reject descendant relocation');
+            END
+            """
+        )
+        await #expect(throws: (any Error).self) {
+            try await repository.relocateDocumentLocators(
+                in: project.baseEnvironmentID,
+                from: RelativePath("old"),
+                to: RelativePath("failed")
+            )
+        }
+        #expect(try await storedDocumentPath(connection: inspection, id: exactID) == "old")
+        #expect(try await storedDocumentPath(connection: inspection, id: descendantID) == "old/child.txt")
+        try await inspection.execute("DROP TRIGGER reject_descendant_relocation")
+
+        try await repository.relocateDocumentLocators(
+            in: project.baseEnvironmentID,
+            from: RelativePath("old"),
+            to: RelativePath("new")
+        )
+
+        let rows = try await inspection.query(
+            """
+            SELECT id, environment_id, relative_path, document_version,
+                   persisted_version, dirty_state, edit_lease_id
+            FROM documents
+            ORDER BY id
+            """
+        )
+        let actual = rows.map(documentRow)
+        #expect(actual.contains(.init(
+            id: exactID.description, environmentID: project.baseEnvironmentID.description,
+            path: "new", documentVersion: 11, persistedVersion: 7,
+            dirtyState: "dirty", editLeaseID: "lease-exact"
+        )))
+        #expect(actual.contains(.init(
+            id: descendantID.description, environmentID: project.baseEnvironmentID.description,
+            path: "new/child.txt", documentVersion: 5, persistedVersion: 5,
+            dirtyState: "clean", editLeaseID: nil
+        )))
+        #expect(actual.contains(.init(
+            id: siblingID.description, environmentID: project.baseEnvironmentID.description,
+            path: "oldish/unchanged.txt", documentVersion: 3, persistedVersion: 2,
+            dirtyState: "conflict", editLeaseID: "lease-sibling"
+        )))
+        #expect(actual.contains(.init(
+            id: otherEnvironmentDocumentID.description, environmentID: otherEnvironmentID.description,
+            path: "old/other.txt", documentVersion: 13, persistedVersion: 8,
+            dirtyState: "missing", editLeaseID: nil
+        )))
+        #expect(try await storedStateJSON(connection: inspection) == stateJSONBefore)
+        #expect(try await repository.loadClientState(state.key) == state)
+    }
+}
+
 private func makeProjectInput() -> NewProject {
     NewProject(
         displayName: "Cockpit",
@@ -343,6 +456,79 @@ private func makeProjectInput() -> NewProject {
         workspaceRoot: "/Users/example/Cockpit",
         gitCommonDirectory: "/Users/example/Cockpit/.git"
     )
+}
+
+private struct StoredDocumentRow: Equatable {
+    let id: String
+    let environmentID: String
+    let path: String
+    let documentVersion: Int64
+    let persistedVersion: Int64
+    let dirtyState: String
+    let editLeaseID: String?
+}
+
+private func documentRow(_ columns: [SQLiteColumn]) -> StoredDocumentRow {
+    func text(_ index: Int) -> String {
+        guard case let .text(value) = columns[index] else { fatalError("Expected text column") }
+        return value
+    }
+    func integer(_ index: Int) -> Int64 {
+        guard case let .integer(value) = columns[index] else { fatalError("Expected integer column") }
+        return value
+    }
+    let lease: String?
+    if case let .text(value) = columns[6] { lease = value } else { lease = nil }
+    return StoredDocumentRow(
+        id: text(0), environmentID: text(1), path: text(2),
+        documentVersion: integer(3), persistedVersion: integer(4),
+        dirtyState: text(5), editLeaseID: lease
+    )
+}
+
+private func insertDocument(
+    connection: isolated SQLiteConnection,
+    id: DocumentID,
+    environmentID: EnvironmentID,
+    path: String,
+    documentVersion: Int64,
+    persistedVersion: Int64,
+    dirtyState: String,
+    editLeaseID: String?
+) throws {
+    try connection.execute(
+        """
+        INSERT INTO documents (
+            id, environment_id, relative_path, document_version,
+            persisted_version, dirty_state, edit_lease_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        bindings: [
+            .text(id.description), .text(environmentID.description), .text(path),
+            .integer(documentVersion), .integer(persistedVersion), .text(dirtyState),
+            editLeaseID.map(SQLiteValue.text) ?? .null,
+        ]
+    )
+}
+
+private func storedDocumentPath(
+    connection: SQLiteConnection,
+    id: DocumentID
+) async throws -> String? {
+    let rows = try await connection.query(
+        "SELECT relative_path FROM documents WHERE id = ?",
+        bindings: [.text(id.description)]
+    )
+    guard let value = rows.first?.first, case let .text(path) = value else { return nil }
+    return path
+}
+
+private func storedStateJSON(connection: SQLiteConnection) async throws -> Data? {
+    let rows = try await connection.query(
+        "SELECT CAST(state_json AS BLOB) FROM client_workspace_states"
+    )
+    guard let value = rows.first?.first, case let .blob(data) = value else { return nil }
+    return data
 }
 
 private func makeWorkspaceState(

@@ -7,6 +7,7 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
     case createDirectConversation(projectID: ProjectID)
     case renameConversation(id: ConversationID, title: String)
     case resolveContext(WorkspaceContextID)
+    case performFileOperation(context: RequestContext, operation: FileOperation)
 
     private enum Command: String, Codable {
         case addProject
@@ -14,6 +15,7 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case createDirectConversation
         case renameConversation
         case resolveContext
+        case performFileOperation
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -24,6 +26,8 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case conversationID
         case title
         case contextID
+        case context
+        case fileOperation
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,6 +73,15 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
             self = .resolveContext(
                 try container.decode(WireWorkspaceContextID.self, forKey: .contextID).value
             )
+        case .performFileOperation:
+            try requireExactKeys(
+                decoder,
+                required: ["command", "context", "fileOperation"]
+            )
+            self = .performFileOperation(
+                context: try container.decode(WireRequestContext.self, forKey: .context).value,
+                operation: try container.decode(WireFileOperation.self, forKey: .fileOperation).value
+            )
         }
     }
 
@@ -91,6 +104,10 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case let .resolveContext(contextID):
             try container.encode(Command.resolveContext, forKey: .command)
             try container.encode(WireWorkspaceContextID(contextID), forKey: .contextID)
+        case let .performFileOperation(context, operation):
+            try container.encode(Command.performFileOperation, forKey: .command)
+            try container.encode(WireRequestContext(context), forKey: .context)
+            try container.encode(WireFileOperation(operation), forKey: .fileOperation)
         }
     }
 
@@ -114,6 +131,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
     case conversation(Conversation)
     case empty
     case resolvedContext(ResolvedWorkspaceContext)
+    case fileOperationResult(FileOperationResult)
 
     private enum Result: String, Codable {
         case projectSnapshot
@@ -121,6 +139,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case conversation
         case empty
         case resolvedContext
+        case fileOperationResult
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -129,6 +148,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case workspaceSnapshot
         case conversation
         case resolvedContext
+        case fileOperationResult
     }
 
     public init(from decoder: Decoder) throws {
@@ -164,6 +184,11 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
             self = .resolvedContext(
                 try container.decode(WireResolvedWorkspaceContext.self, forKey: .resolvedContext).value
             )
+        case .fileOperationResult:
+            try requireExactKeys(decoder, required: ["result", "fileOperationResult"])
+            self = .fileOperationResult(
+                try container.decode(WireFileOperationResult.self, forKey: .fileOperationResult).value
+            )
         }
     }
 
@@ -184,6 +209,9 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case let .resolvedContext(context):
             try container.encode(Result.resolvedContext, forKey: .result)
             try container.encode(WireResolvedWorkspaceContext(context), forKey: .resolvedContext)
+        case let .fileOperationResult(result):
+            try container.encode(Result.fileOperationResult, forKey: .result)
+            try container.encode(WireFileOperationResult(result), forKey: .fileOperationResult)
         }
     }
 
@@ -227,9 +255,252 @@ public struct WorkspaceCommandRouter: Sendable {
             response = .empty
         case let .resolveContext(contextID):
             response = .resolvedContext(try await service.resolveContext(contextID))
+        case let .performFileOperation(context, operation):
+            response = .fileOperationResult(
+                try await service.performFileOperation(context: context, operation: operation)
+            )
         }
         return try JSONEncoder().encode(response)
     }
+}
+
+private struct WireRequestContext: Codable {
+    let value: RequestContext
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion
+        case clientInstanceID
+        case windowID
+        case workspaceContextID
+        case environmentID
+        case activeContextGeneration
+        case requestID
+    }
+
+    init(_ value: RequestContext) { self.value = value }
+
+    init(from decoder: Decoder) throws {
+        try requireExactKeys(
+            decoder,
+            required: [
+                "protocolVersion", "clientInstanceID", "windowID", "workspaceContextID",
+                "environmentID", "activeContextGeneration", "requestID",
+            ]
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = try RequestContext(
+            validating: container.decode(WireProtocolVersion.self, forKey: .protocolVersion).value,
+            clientInstanceID: container.decode(ClientInstanceID.self, forKey: .clientInstanceID),
+            windowID: container.decode(WindowID.self, forKey: .windowID),
+            workspaceContextID: container.decode(WireWorkspaceContextID.self, forKey: .workspaceContextID).value,
+            environmentID: container.decode(EnvironmentID.self, forKey: .environmentID),
+            activeContextGeneration: container.decode(UInt64.self, forKey: .activeContextGeneration),
+            requestID: container.decode(RequestID.self, forKey: .requestID)
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        let valid = try RequestContext(
+            validating: value.protocolVersion,
+            clientInstanceID: value.clientInstanceID,
+            windowID: value.windowID,
+            workspaceContextID: value.workspaceContextID,
+            environmentID: value.environmentID,
+            activeContextGeneration: value.activeContextGeneration,
+            requestID: value.requestID
+        )
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(WireProtocolVersion(valid.protocolVersion), forKey: .protocolVersion)
+        try container.encode(valid.clientInstanceID, forKey: .clientInstanceID)
+        try container.encode(valid.windowID, forKey: .windowID)
+        try container.encode(WireWorkspaceContextID(valid.workspaceContextID), forKey: .workspaceContextID)
+        try container.encode(valid.environmentID, forKey: .environmentID)
+        try container.encode(valid.activeContextGeneration, forKey: .activeContextGeneration)
+        try container.encode(valid.requestID, forKey: .requestID)
+    }
+}
+
+private struct WireProtocolVersion: Codable {
+    let value: ProtocolVersion
+    private enum CodingKeys: String, CodingKey { case major, minor }
+    init(_ value: ProtocolVersion) { self.value = value }
+    init(from decoder: Decoder) throws {
+        try requireExactKeys(decoder, required: ["major", "minor"])
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let value = ProtocolVersion(
+            major: try container.decode(UInt16.self, forKey: .major),
+            minor: try container.decode(UInt16.self, forKey: .minor)
+        )
+        guard value.major > 0 else { throw CocoaError(.coderInvalidValue) }
+        self.value = value
+    }
+    func encode(to encoder: Encoder) throws {
+        guard value.major > 0 else { throw CocoaError(.coderInvalidValue) }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(value.major, forKey: .major)
+        try container.encode(value.minor, forKey: .minor)
+    }
+}
+
+private struct WireWorkspaceDirectory: Codable {
+    let value: WorkspaceDirectory
+    private enum CodingKeys: String, CodingKey { case root, relative }
+    init(_ value: WorkspaceDirectory) { self.value = value }
+    init(from decoder: Decoder) throws {
+        let keys = try decodedKeySet(decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch keys {
+        case ["root"]:
+            guard try container.decode(Bool.self, forKey: .root) else {
+                throw CocoaError(.coderInvalidValue)
+            }
+            value = .root
+        case ["relative"]:
+            value = .relative(try RelativePath(container.decode(String.self, forKey: .relative)))
+        default:
+            throw CocoaError(.coderInvalidValue)
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        let valid = try value.validated()
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch valid {
+        case .root: try container.encode(true, forKey: .root)
+        case let .relative(path): try container.encode(path.string, forKey: .relative)
+        }
+    }
+}
+
+private struct WireFileOperation: Codable {
+    let value: FileOperation
+    private enum Kind: String, Codable { case createFile, createDirectory, rename, move, trash }
+    private enum CodingKeys: String, CodingKey {
+        case kind, parent, name, source, newName, destinationDirectory, path
+    }
+    init(_ value: FileOperation) { self.value = value }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .createFile:
+            try requireExactKeys(decoder, required: ["kind", "parent", "name"])
+            value = .createFile(
+                parent: try container.decode(WireWorkspaceDirectory.self, forKey: .parent).value,
+                name: try validatedWireName(container.decode(String.self, forKey: .name))
+            )
+        case .createDirectory:
+            try requireExactKeys(decoder, required: ["kind", "parent", "name"])
+            value = .createDirectory(
+                parent: try container.decode(WireWorkspaceDirectory.self, forKey: .parent).value,
+                name: try validatedWireName(container.decode(String.self, forKey: .name))
+            )
+        case .rename:
+            try requireExactKeys(decoder, required: ["kind", "source", "newName"])
+            value = .rename(
+                source: try RelativePath(container.decode(String.self, forKey: .source)),
+                newName: try validatedWireName(container.decode(String.self, forKey: .newName))
+            )
+        case .move:
+            try requireExactKeys(decoder, required: ["kind", "source", "destinationDirectory"])
+            value = .move(
+                source: try RelativePath(container.decode(String.self, forKey: .source)),
+                destinationDirectory: try container.decode(WireWorkspaceDirectory.self, forKey: .destinationDirectory).value
+            )
+        case .trash:
+            try requireExactKeys(decoder, required: ["kind", "path"])
+            value = .trash(path: try RelativePath(container.decode(String.self, forKey: .path)))
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch value {
+        case let .createFile(parent, name):
+            try container.encode(Kind.createFile, forKey: .kind)
+            try container.encode(WireWorkspaceDirectory(parent), forKey: .parent)
+            try container.encode(validatedWireName(name), forKey: .name)
+        case let .createDirectory(parent, name):
+            try container.encode(Kind.createDirectory, forKey: .kind)
+            try container.encode(WireWorkspaceDirectory(parent), forKey: .parent)
+            try container.encode(validatedWireName(name), forKey: .name)
+        case let .rename(source, newName):
+            try container.encode(Kind.rename, forKey: .kind)
+            try container.encode(RelativePath(source.string).string, forKey: .source)
+            try container.encode(validatedWireName(newName), forKey: .newName)
+        case let .move(source, destinationDirectory):
+            try container.encode(Kind.move, forKey: .kind)
+            try container.encode(RelativePath(source.string).string, forKey: .source)
+            try container.encode(WireWorkspaceDirectory(destinationDirectory), forKey: .destinationDirectory)
+        case let .trash(path):
+            try container.encode(Kind.trash, forKey: .kind)
+            try container.encode(RelativePath(path.string).string, forKey: .path)
+        }
+    }
+}
+
+private struct WireFileOperationResult: Codable {
+    let value: FileOperationResult
+    private enum Kind: String, Codable { case created, relocated, trashed }
+    private enum EntryKind: String, Codable { case file, directory, symbolicLink }
+    private enum CodingKeys: String, CodingKey { case kind, path, entryKind, from, to }
+    init(_ value: FileOperationResult) { self.value = value }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .created:
+            try requireExactKeys(decoder, required: ["kind", "path", "entryKind"])
+            let entryKind: FileTreeEntryKind
+            switch try container.decode(EntryKind.self, forKey: .entryKind) {
+            case .file: entryKind = .file
+            case .directory: entryKind = .directory
+            case .symbolicLink: entryKind = .symbolicLink
+            }
+            value = .created(
+                path: try RelativePath(container.decode(String.self, forKey: .path)),
+                kind: entryKind
+            )
+        case .relocated:
+            try requireExactKeys(decoder, required: ["kind", "from", "to"])
+            value = .relocated(
+                from: try RelativePath(container.decode(String.self, forKey: .from)),
+                to: try RelativePath(container.decode(String.self, forKey: .to))
+            )
+        case .trashed:
+            try requireExactKeys(decoder, required: ["kind", "path"])
+            value = .trashed(path: try RelativePath(container.decode(String.self, forKey: .path)))
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch value {
+        case let .created(path, kind):
+            try container.encode(Kind.created, forKey: .kind)
+            try container.encode(RelativePath(path.string).string, forKey: .path)
+            let entryKind: EntryKind = switch kind {
+            case .file: .file
+            case .directory: .directory
+            case .symbolicLink: .symbolicLink
+            }
+            try container.encode(entryKind, forKey: .entryKind)
+        case let .relocated(from, to):
+            try container.encode(Kind.relocated, forKey: .kind)
+            try container.encode(RelativePath(from.string).string, forKey: .from)
+            try container.encode(RelativePath(to.string).string, forKey: .to)
+        case let .trashed(path):
+            try container.encode(Kind.trashed, forKey: .kind)
+            try container.encode(RelativePath(path.string).string, forKey: .path)
+        }
+    }
+}
+
+private func validatedWireName(_ name: String) throws -> String {
+    guard !name.isEmpty,
+          name != ".",
+          name != "..",
+          !name.contains("/"),
+          !name.contains("\0")
+    else {
+        throw FileOperationError.invalidName
+    }
+    return name
 }
 
 private struct WireProjectSnapshot: Codable {

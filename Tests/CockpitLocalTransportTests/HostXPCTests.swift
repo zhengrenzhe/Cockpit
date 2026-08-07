@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 import CockpitTypes
@@ -79,6 +80,76 @@ import CockpitHostCore
     }
 }
 
+@Test func fileOperationWireTagsRoundTripCompleteContextAndRejectUnknownForbiddenAndInvalidPaths() throws {
+    let fixture = try WorkspaceFixture()
+    let context = try fixture.requestContext()
+    let request = try WorkspaceCommandRequest.performFileOperation(
+        context: context,
+        operation: .createFile(parent: .relative(RelativePath("nested")), name: "file.txt")
+    )
+    let encoded = try JSONEncoder().encode(request)
+    let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+    #expect(object.keys.sorted() == ["command", "context", "fileOperation"])
+    #expect(object["command"] as? String == "performFileOperation")
+    #expect(try JSONDecoder().decode(WorkspaceCommandRequest.self, from: encoded) == request)
+    #expect(!String(decoding: encoded, as: UTF8.self).contains("/private/tmp"))
+
+    let unknownOperation = try mutatingJSONObject(encoded) { object in
+        var operation = object["fileOperation"] as! [String: Any]
+        operation["unknown"] = true
+        object["fileOperation"] = operation
+    }
+    let forbiddenOperation = try mutatingJSONObject(encoded) { object in
+        var operation = object["fileOperation"] as! [String: Any]
+        operation["source"] = "forbidden"
+        object["fileOperation"] = operation
+    }
+    let unknownDirectory = try mutatingJSONObject(encoded) { object in
+        var operation = object["fileOperation"] as! [String: Any]
+        var parent = operation["parent"] as! [String: Any]
+        parent["unknown"] = true
+        operation["parent"] = parent
+        object["fileOperation"] = operation
+    }
+    let unknownContext = try mutatingJSONObject(encoded) { object in
+        var context = object["context"] as! [String: Any]
+        context["unknown"] = true
+        object["context"] = context
+    }
+    let traversal = try JSONEncoder().encode(
+        WorkspaceCommandRequest.performFileOperation(
+            context: context,
+            operation: .rename(source: RelativePath("safe"), newName: "new")
+        )
+    )
+    let invalidTraversal = try mutatingJSONObject(traversal) { object in
+        var operation = object["fileOperation"] as! [String: Any]
+        operation["source"] = "../escape"
+        object["fileOperation"] = operation
+    }
+    for invalid in [unknownOperation, forbiddenOperation, unknownDirectory, unknownContext, invalidTraversal] {
+        #expect(throws: (any Error).self) {
+            _ = try JSONDecoder().decode(WorkspaceCommandRequest.self, from: invalid)
+        }
+    }
+
+    let result = try WorkspaceCommandResponse.fileOperationResult(
+        .relocated(from: RelativePath("nested/file.txt"), to: RelativePath("moved/file.txt"))
+    )
+    let resultData = try JSONEncoder().encode(result)
+    #expect(try JSONDecoder().decode(WorkspaceCommandResponse.self, from: resultData) == result)
+    #expect(!String(decoding: resultData, as: UTF8.self).contains("/private/tmp"))
+    let unknownResult = try mutatingJSONObject(resultData) { object in
+        var value = object["fileOperationResult"] as! [String: Any]
+        value["unknown"] = true
+        object["fileOperationResult"] = value
+    }
+    #expect(throws: DecodingError.self) {
+        _ = try JSONDecoder().decode(WorkspaceCommandResponse.self, from: unknownResult)
+    }
+}
+
 @Test func routerRoundTripsWorkspaceCommandsWithoutAbsolutePathOnTheWire() async throws {
     let fixture = try WorkspaceFixture()
     let service = RecordingWorkspaceService(fixture: fixture)
@@ -113,7 +184,16 @@ import CockpitHostCore
             through: router
         ) == .resolvedContext(fixture.conversationContext)
     )
-    #expect(await service.recordedCommands == ["list", "add", "create", "rename:Renamed", "resolve"])
+    #expect(
+        try await route(
+            .performFileOperation(
+                context: fixture.requestContext(),
+                operation: .createFile(parent: .root, name: "created.txt")
+            ),
+            through: router
+        ) == .fileOperationResult(.created(path: RelativePath("created.txt"), kind: .file))
+    )
+    #expect(await service.recordedCommands == ["list", "add", "create", "rename:Renamed", "resolve", "file"])
 }
 
 @Test func hostExportRoutesAsynchronouslyRepliesOnceAndPreservesNSError() async throws {
@@ -166,8 +246,57 @@ import CockpitHostCore
     let client = HostXPCClient(connectionFactory: { _ in connection })
 
     #expect(try await client.listWorkspace() == [fixture.snapshot])
+    #expect(
+        try await client.performFileOperation(
+            context: fixture.requestContext(),
+            operation: .createDirectory(parent: .root, name: "created")
+        ) == .created(path: RelativePath("created"), kind: .directory)
+    )
     #expect(connection.resumeCount == 1)
     await client.disconnect()
+}
+
+@Test func hostExportAndClientPreservePOSIXAndCocoaErrorDomainCodeAndPath() async throws {
+    let fixture = try WorkspaceFixture()
+    let errors = [
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(EEXIST),
+            userInfo: [NSFilePathErrorKey: "/private/tmp/root/existing"]
+        ),
+        NSError(
+            domain: NSCocoaErrorDomain,
+            code: NSFileWriteNoPermissionError,
+            userInfo: [NSURLErrorKey: URL(fileURLWithPath: "/private/tmp/root/denied")]
+        ),
+    ]
+
+    for expected in errors {
+        let service = ThrowingWorkspaceService(error: expected)
+        let exported = HostXPCExport(
+            handshakeHandler: { try HostHandshakeHandler().handle($0) },
+            workspaceRouter: WorkspaceCommandRouter(service: service)
+        )
+        let connection = FakeHostClientConnection(proxy: exported)
+        let client = HostXPCClient(connectionFactory: { _ in connection })
+        do {
+            _ = try await client.performFileOperation(
+                context: fixture.requestContext(),
+                operation: .createFile(parent: .root, name: "failure")
+            )
+            Issue.record("Expected file operation to fail")
+        } catch {
+            let actual = error as NSError
+            #expect(actual.domain == expected.domain)
+            #expect(actual.code == expected.code)
+            if let path = expected.userInfo[NSFilePathErrorKey] as? String {
+                #expect(actual.userInfo[NSFilePathErrorKey] as? String == path)
+            }
+            if let url = expected.userInfo[NSURLErrorKey] as? URL {
+                #expect(actual.userInfo[NSURLErrorKey] as? URL == url)
+            }
+        }
+    }
 }
 
 @Test func cockpitHostParksWithoutCheckedContinuationMisuse() async throws {
@@ -237,6 +366,7 @@ private func cockpitHostExecutableURL() throws -> URL {
 
 private struct WorkspaceFixture: Sendable {
     let projectID: ProjectID
+    let environmentID: EnvironmentID
     let conversation: Conversation
     let projectContext: ResolvedWorkspaceContext
     let conversationContext: ResolvedWorkspaceContext
@@ -244,7 +374,7 @@ private struct WorkspaceFixture: Sendable {
 
     init() throws {
         projectID = ProjectID(UUID(uuidString: "00000000-0000-0000-0000-000000000101")!)
-        let environmentID = EnvironmentID(UUID(uuidString: "00000000-0000-0000-0000-000000000102")!)
+        environmentID = EnvironmentID(UUID(uuidString: "00000000-0000-0000-0000-000000000102")!)
         let conversationID = ConversationID(UUID(uuidString: "00000000-0000-0000-0000-000000000103")!)
         conversation = Conversation(
             id: conversationID,
@@ -274,6 +404,18 @@ private struct WorkspaceFixture: Sendable {
             displayName: "Cockpit",
             resolvedContext: projectContext,
             conversations: [conversation]
+        )
+    }
+
+    func requestContext() throws -> RequestContext {
+        try RequestContext(
+            validating: .current,
+            clientInstanceID: ClientInstanceID(UUID(uuidString: "00000000-0000-0000-0000-000000000104")!),
+            windowID: WindowID(UUID(uuidString: "00000000-0000-0000-0000-000000000105")!),
+            workspaceContextID: .project(projectID),
+            environmentID: environmentID,
+            activeContextGeneration: 7,
+            requestID: RequestID(UUID(uuidString: "00000000-0000-0000-0000-000000000106")!)
         )
     }
 }
@@ -307,6 +449,15 @@ private actor RecordingWorkspaceService: WorkspaceServing {
         recordedCommands.append("resolve")
         return fixture.conversationContext
     }
+
+    func performFileOperation(context: RequestContext, operation: FileOperation) throws -> FileOperationResult {
+        recordedCommands.append("file")
+        switch operation {
+        case let .createFile(_, name): return .created(path: try RelativePath(name), kind: .file)
+        case let .createDirectory(_, name): return .created(path: try RelativePath(name), kind: .directory)
+        default: throw FileOperationError.invalidPath
+        }
+    }
 }
 
 private actor ThrowingWorkspaceService: WorkspaceServing {
@@ -319,6 +470,7 @@ private actor ThrowingWorkspaceService: WorkspaceServing {
     func createDirectConversation(projectID: ProjectID) throws -> Conversation { throw error }
     func renameConversation(id: ConversationID, title: String) throws { throw error }
     func resolveContext(_ id: WorkspaceContextID) throws -> ResolvedWorkspaceContext { throw error }
+    func performFileOperation(context: RequestContext, operation: FileOperation) throws -> FileOperationResult { throw error }
 }
 
 private final class ReplyCounter: @unchecked Sendable {

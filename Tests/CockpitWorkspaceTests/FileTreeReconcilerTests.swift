@@ -53,6 +53,7 @@ import CockpitTypes
     await fileSystem.setEntries(try [entry("root-new", .file)], for: .root)
     await fileSystem.setEntries(try [entry("a/new", .file)], for: a)
     await fileSystem.setEntries(try [entry("z/new", .file)], for: z)
+    await fileSystem.beginControlledReads()
     let source = FakeFileSystemEventSource()
     let reconciler = FileTreeReconciler(provider: provider, invalidations: source.invalidations)
     defer { reconciler.cancel() }
@@ -60,8 +61,14 @@ import CockpitTypes
     await waitForSubscriberCount(1, provider: provider)
 
     source.send(.allExpanded)
+    await waitForReadCount(1, fileSystem: fileSystem)
+    await fileSystem.releaseNextRead()
     let first = try #require(try await iterator.next())
+    await waitForReadCount(2, fileSystem: fileSystem)
+    await fileSystem.releaseNextRead()
     let second = try #require(try await iterator.next())
+    await waitForReadCount(3, fileSystem: fileSystem)
+    await fileSystem.releaseNextRead()
     let third = try #require(try await iterator.next())
 
     #expect([first.directory, second.directory, third.directory] == [.root, a, z])
@@ -271,6 +278,12 @@ private func testProvider(
 
 private func waitForSubscriberCount(_ count: Int, provider: FileTreeProvider) async {
     while await provider.subscriptionCount != count {
+        await Task.yield()
+    }
+}
+
+private func waitForReadCount(_ count: Int, fileSystem: RecordingFileTreeFileSystem) async {
+    while await fileSystem.recordedReads().count < count {
         await Task.yield()
     }
 }

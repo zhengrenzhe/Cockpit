@@ -198,6 +198,52 @@ import CockpitTypes
     #expect(boundary.stopURLs.isEmpty)
 }
 
+@Test func fileOperationsRejectContextEnvironmentMismatchBeforeRoutingAndAcceptBothContextKinds() async throws {
+    let repository = InMemoryWorkspaceRepository()
+    let registry = RecordingFileOperationRegistry()
+    let service = WorkspaceService(
+        repository: repository,
+        rootResolver: FixedProjectRootResolver(root: makeResolvedRoot()),
+        kernelRegistry: registry
+    )
+    let project = try await service.addProject(bookmark: Data([0x01]), displayName: "Cockpit")
+    let conversation = try await service.createDirectConversation(projectID: project.projectID)
+    let environmentID = project.resolvedContext.environmentID
+    let projectContext = try makeFileOperationRequestContext(
+        workspaceContextID: .project(project.projectID),
+        environmentID: environmentID
+    )
+    let conversationContext = try makeFileOperationRequestContext(
+        workspaceContextID: .conversation(conversation.id),
+        environmentID: environmentID
+    )
+
+    #expect(
+        try await service.performFileOperation(
+            context: projectContext,
+            operation: .createDirectory(parent: .root, name: "project")
+        ) == .created(path: RelativePath("project"), kind: .directory)
+    )
+    #expect(
+        try await service.performFileOperation(
+            context: conversationContext,
+            operation: .createFile(parent: .root, name: "conversation")
+        ) == .created(path: RelativePath("conversation"), kind: .file)
+    )
+
+    let mismatched = try makeFileOperationRequestContext(
+        workspaceContextID: .project(project.projectID),
+        environmentID: EnvironmentID()
+    )
+    await #expect(throws: FileOperationError.contextEnvironmentMismatch) {
+        _ = try await service.performFileOperation(
+            context: mismatched,
+            operation: .createFile(parent: .root, name: "rejected")
+        )
+    }
+    #expect(await registry.performedNames == ["project", "conversation"])
+}
+
 private final class TestProjectRootAccessToken: ProjectRootAccessToken, @unchecked Sendable {}
 
 private final class RecordingSecurityScopeBoundary:
@@ -280,6 +326,21 @@ private func makeResolvedRoot() -> ResolvedProjectRoot {
     )
 }
 
+private func makeFileOperationRequestContext(
+    workspaceContextID: WorkspaceContextID,
+    environmentID: EnvironmentID
+) throws -> RequestContext {
+    try RequestContext(
+        validating: .current,
+        clientInstanceID: ClientInstanceID(),
+        windowID: WindowID(),
+        workspaceContextID: workspaceContextID,
+        environmentID: environmentID,
+        activeContextGeneration: 1,
+        requestID: RequestID()
+    )
+}
+
 private struct FixedProjectRootResolver: ProjectRootResolving {
     let root: ResolvedProjectRoot
 
@@ -290,6 +351,23 @@ private struct FailingProjectRootResolver: ProjectRootResolving {
     let error: NSError
 
     func resolve(bookmark: Data) throws -> ResolvedProjectRoot { throw error }
+}
+
+private actor RecordingFileOperationRegistry: WorkspaceKernelRegistering {
+    private(set) var performedNames: [String] = []
+    func register(environmentID: EnvironmentID, root: ResolvedProjectRoot) {}
+    func perform(_ operation: FileOperation, in environmentID: EnvironmentID) throws -> FileOperationResult {
+        switch operation {
+        case let .createFile(_, name):
+            performedNames.append(name)
+            return .created(path: try RelativePath(name), kind: .file)
+        case let .createDirectory(_, name):
+            performedNames.append(name)
+            return .created(path: try RelativePath(name), kind: .directory)
+        default:
+            throw FileOperationError.invalidPath
+        }
+    }
 }
 
 private actor InMemoryWorkspaceRepository: WorkspaceRepository {
@@ -389,4 +467,10 @@ private actor InMemoryWorkspaceRepository: WorkspaceRepository {
         let valid = try state.validated()
         clientStates[valid.key] = valid
     }
+
+    func relocateDocumentLocators(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) {}
 }

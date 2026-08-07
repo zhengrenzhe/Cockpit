@@ -28,6 +28,10 @@ public protocol WorkspaceServing: Sendable {
     func createDirectConversation(projectID: ProjectID) async throws -> Conversation
     func renameConversation(id: ConversationID, title: String) async throws
     func resolveContext(_ id: WorkspaceContextID) async throws -> ResolvedWorkspaceContext
+    func performFileOperation(
+        context: RequestContext,
+        operation: FileOperation
+    ) async throws -> FileOperationResult
 }
 
 public protocol ProjectRootAccessToken: AnyObject, Sendable {}
@@ -55,7 +59,7 @@ public protocol ProjectRootResolving: Sendable {
     func resolve(bookmark: Data) throws -> ResolvedProjectRoot
 }
 
-public protocol WorkspaceKernelRegistering: Sendable {
+public protocol WorkspaceKernelRegistering: FileOperationServing, Sendable {
     func register(environmentID: EnvironmentID, root: ResolvedProjectRoot) async
 }
 
@@ -124,6 +128,20 @@ public actor WorkspaceService: WorkspaceServing {
         let (_, root) = try await registerProject(id: resolved.projectID)
         await kernelRegistry.register(environmentID: resolved.environmentID, root: root)
         return resolved
+    }
+
+    public func performFileOperation(
+        context: RequestContext,
+        operation: FileOperation
+    ) async throws -> FileOperationResult {
+        let context = try context.validated(negotiatedVersion: .current)
+        let resolved = try await repository.resolve(context.workspaceContextID)
+        guard resolved.environmentID == context.environmentID else {
+            throw FileOperationError.contextEnvironmentMismatch
+        }
+        let (_, root) = try await registerProject(id: resolved.projectID)
+        await kernelRegistry.register(environmentID: resolved.environmentID, root: root)
+        return try await kernelRegistry.perform(operation, in: resolved.environmentID)
     }
 
     private func snapshot(for project: Project) async throws -> ProjectSnapshot {

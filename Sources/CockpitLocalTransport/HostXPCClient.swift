@@ -83,6 +83,18 @@ public actor HostXPCClient: WorkspaceServing {
         return value
     }
 
+    public func performFileOperation(
+        context: RequestContext,
+        operation: FileOperation
+    ) async throws -> FileOperationResult {
+        guard case let .fileOperationResult(value) = try await send(
+            .performFileOperation(context: context, operation: operation)
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return value
+    }
+
     public func disconnect() {
         guard let connection = activeConnection else { return }
         activeConnection = nil

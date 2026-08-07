@@ -131,7 +131,15 @@ public enum WorkspaceRepositoryError: Error, Equatable, Sendable {
     case invalidStoredValue
 }
 
-public protocol WorkspaceRepository: Sendable {
+public protocol DocumentLocatorUpdating: Sendable {
+    func relocateDocumentLocators(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) async throws
+}
+
+public protocol WorkspaceRepository: DocumentLocatorUpdating, Sendable {
     func createProjectWithDirectEnvironment(_ input: NewProject) async throws -> Project
     func listProjects() async throws -> [Project]
     func createConversation(_ input: NewConversation) async throws -> Conversation

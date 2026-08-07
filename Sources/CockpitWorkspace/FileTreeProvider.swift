@@ -178,6 +178,9 @@ private final class FileTreeSubscriptionHub: @unchecked Sendable {
 }
 
 actor FileTreeProvider: FileTreeProviding {
+    struct ExternalMutationLease: Hashable, Sendable {
+        let id: UUID
+    }
     private let environmentID: EnvironmentID
     private let rootURL: URL
     private let rootAccessToken: (any ProjectRootAccessToken)?
@@ -188,6 +191,7 @@ actor FileTreeProvider: FileTreeProviding {
     private var expanded: [WorkspaceDirectory: [FileTreeEntry]] = [:]
     private var inFlight: Set<WorkspaceDirectory> = []
     private var pendingInvalidations: Set<WorkspaceDirectory> = []
+    private var activeExternalMutation: UUID?
 
     init(environmentID: EnvironmentID, rootURL: URL, rootAccessToken: (any ProjectRootAccessToken)? = nil, fileSystem: any FileTreeFileSystem = FoundationFileTreeFileSystem()) {
         self.environmentID = environmentID; self.rootURL = rootURL; self.rootAccessToken = rootAccessToken; self.fileSystem = fileSystem
@@ -234,6 +238,70 @@ actor FileTreeProvider: FileTreeProviding {
             await gate.release(); return delta
         } catch { await gate.release(); throw error }
     }
+
+    func acquireExternalMutationLease() async throws -> ExternalMutationLease {
+        try await gate.acquire()
+        let lease = ExternalMutationLease(id: UUID())
+        precondition(activeExternalMutation == nil)
+        activeExternalMutation = lease.id
+        return lease
+    }
+
+    func cancelExternalMutation(_ lease: ExternalMutationLease) async {
+        guard activeExternalMutation == lease.id else { return }
+        activeExternalMutation = nil
+        await gate.release()
+    }
+
+    func completeExternalMutation(
+        operation: FileOperation,
+        physical: PhysicalFileOperationResult,
+        lease: ExternalMutationLease
+    ) async throws {
+        guard activeExternalMutation == lease.id else {
+            throw FileOperationError.invalidPath
+        }
+        do {
+            if physical.affectedKind == .directory {
+                let staleRoot: RelativePath?
+                switch physical.result {
+                case let .relocated(source, _): staleRoot = source
+                case let .trashed(path): staleRoot = path
+                case .created: staleRoot = nil
+                }
+                if let staleRoot {
+                    let staleDirectories = expanded.keys.filter {
+                        guard case let .relative(path) = $0 else { return false }
+                        return path.string == staleRoot.string || path.string.hasPrefix(staleRoot.string + "/")
+                    }
+                    staleDirectories.forEach {
+                        expanded.removeValue(forKey: $0)
+                        pendingInvalidations.remove($0)
+                    }
+                }
+            }
+
+            let parents = Set(affectedParents(for: operation, result: physical.result))
+                .sorted(by: Self.directoryPrecedes)
+            for directory in parents where expanded[directory] != nil {
+                let previous = expanded[directory]!
+                let current = try await enumerate(directory)
+                try commit(previous: previous, current: current, directory: directory)
+            }
+            activeExternalMutation = nil
+            await gate.release()
+        } catch {
+            activeExternalMutation = nil
+            await gate.release()
+            throw error
+        }
+    }
+
+    func waitUntilOperationIsQueued() async {
+        while await gate.waiterCount == 0 {
+            await Task.yield()
+        }
+    }
     func failCurrentSubscribers(_ error: FileTreeProviderError) { hub.failCurrent(error) }
     func terminateChanges(_ error: FileTreeProviderError) { hub.terminate(error) }
 
@@ -263,5 +331,30 @@ actor FileTreeProvider: FileTreeProviding {
     private static func rawPathPrecedes(_ l: FileTreeEntry, _ r: FileTreeEntry) -> Bool { l.identity.path.string < r.identity.path.string }
     private static func directoryPrecedes(_ l: WorkspaceDirectory, _ r: WorkspaceDirectory) -> Bool {
         switch (l, r) { case (.root, .root): return false; case (.root, _): return true; case (_, .root): return false; case let (.relative(a), .relative(b)): let c = a.string.localizedStandardCompare(b.string); return c == .orderedSame ? a.string < b.string : c == .orderedAscending }
+    }
+
+    private func affectedParents(
+        for operation: FileOperation,
+        result: FileOperationResult
+    ) -> [WorkspaceDirectory] {
+        switch (operation, result) {
+        case let (.createFile(parent, _), .created),
+             let (.createDirectory(parent, _), .created):
+            return [parent]
+        case let (.rename(source, _), .relocated):
+            return [Self.parentDirectory(of: source)]
+        case let (.move(source, destinationDirectory), .relocated):
+            return [Self.parentDirectory(of: source), destinationDirectory]
+        case let (.trash(path), .trashed):
+            return [Self.parentDirectory(of: path)]
+        default:
+            return []
+        }
+    }
+
+    private static func parentDirectory(of path: RelativePath) -> WorkspaceDirectory {
+        let components = path.string.split(separator: "/")
+        guard components.count > 1 else { return .root }
+        return .relative(try! RelativePath(components.dropLast().joined(separator: "/")))
     }
 }
