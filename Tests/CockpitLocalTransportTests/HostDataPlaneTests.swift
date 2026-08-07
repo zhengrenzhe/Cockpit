@@ -10,7 +10,10 @@ import CockpitTypes
 @Test func hostDataPlaneTicketUsesCanonicalRawHashExpiryAndAtomicReplay() async throws {
     let fixture = try HostDataPlaneFixture()
     let clock = AdvancingHostDataPlaneClock()
-    let random = FixedHostDataPlaneRandomBytes(Array(0..<32))
+    let random = SequencedHostDataPlaneRandomBytes([
+        (0..<32).map(UInt8.init),
+        (32..<64).map(UInt8.init),
+    ])
     let store = HostDataPlaneTicketStore(clock: clock, randomBytes: random)
 
     let first = try await store.issue(binding: fixture.binding, expectedPeerUID: 501)
@@ -103,6 +106,43 @@ import CockpitTypes
     }
 }
 
+@Test func hostDataPlaneTicketCollisionPreservesLiveAndConsumedEntriesUntilExpiry() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let clock = AdvancingHostDataPlaneClock()
+    let firstBytes = Array(repeating: UInt8(0x41), count: 32)
+    let secondBytes = Array(repeating: UInt8(0x42), count: 32)
+    let random = SequencedHostDataPlaneRandomBytes(
+        [firstBytes, firstBytes, secondBytes] + Array(repeating: firstBytes, count: 9)
+    )
+    let store = HostDataPlaneTicketStore(clock: clock, randomBytes: random)
+
+    let first = try await store.issue(binding: fixture.binding, expectedPeerUID: 501)
+    let second = try await store.issue(binding: fixture.binding, expectedPeerUID: 501)
+    #expect(first.wireValue != second.wireValue)
+    #expect(
+        try await store.consume(
+            wireValue: first.wireValue,
+            binding: fixture.binding,
+            peerUID: 501
+        ) == fixture.binding
+    )
+
+    await #expect(throws: HostDataPlaneTicketError.randomGenerationFailed) {
+        _ = try await store.issue(binding: fixture.binding, expectedPeerUID: 501)
+    }
+    await #expect(throws: HostDataPlaneTicketError.replay) {
+        _ = try await store.consume(
+            wireValue: first.wireValue,
+            binding: fixture.binding,
+            peerUID: 501
+        )
+    }
+
+    clock.advance(by: .seconds(30))
+    let reused = try await store.issue(binding: fixture.binding, expectedPeerUID: 501)
+    #expect(reused.wireValue == first.wireValue)
+}
+
 @Test func hostDataPlaneAddressUsesExactTupleCapacitySunLengthAndNamespace() async throws {
     let path = "/private/tmp/cockpit.501/host/test/host.sock"
     let address = try UnixDomainSocketAddress(path: path)
@@ -168,6 +208,142 @@ import CockpitTypes
     await server.shutdown()
     #expect(calls.closedDescriptors.contains(41))
     #expect(calls.unlinkedPaths == ["/private/tmp/cockpit.501/host/flags/host.sock"])
+}
+
+@Test func hostDataPlaneServerShutdownClosesClientOnceListenerLastAndJoinsWorker() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = ScriptedUnixDomainSocketSystemCalls(uid: 501)
+    calls.seedSafeDirectories(namespace: "lifecycle")
+    calls.acceptedDescriptors = [44]
+    calls.blockReads = true
+    let server = HostDataPlaneServer(
+        namespace: "lifecycle",
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: FixedPeerCredentialReader(uid: 501)
+    )
+    try await server.start()
+    try await eventually { calls.readEntered }
+
+    let returned = LockedHostDataPlaneBox(false)
+    let shutdown = Task {
+        await server.shutdown()
+        returned.withValue { $0 = true }
+    }
+    try await eventually { calls.closedDescriptors.contains(44) }
+    #expect(!returned.value)
+    calls.markDescriptorReused(44)
+    calls.releaseBlockedRead()
+    await shutdown.value
+    try await eventually { calls.closedDescriptors.filter { $0 == 44 }.count >= 1 }
+
+    #expect(calls.closedDescriptors.filter { $0 == 44 }.count == 1)
+    #expect(calls.closedReusedDescriptors.isEmpty)
+    let clientClose = try #require(calls.closedDescriptors.firstIndex(of: 44))
+    let listenerClose = try #require(calls.closedDescriptors.firstIndex(of: 41))
+    #expect(clientClose < listenerClose)
+}
+
+@Test func hostDataPlaneServerShutdownCancelsSubscriptionBeforeListenerClose() async throws {
+    let order = LockedHostDataPlaneBox<[String]>([])
+    let fixture = try HostDataPlaneFixture {
+        order.withValue { $0.append("subscription-cancel") }
+    }
+    let calls = RecordingDarwinUnixDomainSocketSystemCalls { event in
+        order.withValue { $0.append(event) }
+    }
+    let namespace = uniqueHostDataPlaneNamespace("shutdown-order")
+    let server = HostDataPlaneServer(
+        namespace: namespace,
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: DarwinPeerCredentialReader()
+    )
+    try await server.start()
+    let issued = try await fixture.ticketStore.issue(
+        binding: fixture.binding,
+        expectedPeerUID: geteuid()
+    )
+    let peer = try RawHostDataPlanePeer(
+        path: hostDataPlaneSocketPath(namespace: namespace, uid: geteuid())
+    )
+    try peer.handshake()
+    #expect(try peer.authenticate(ticket: issued.wireValue, binding: fixture.binding).code == .unspecified)
+    let subscriptionID = RequestID().description
+    try peer.writeFrame(
+        channel: .fileTreeEvents,
+        sequence: 1,
+        acknowledgement: 0,
+        payload: try fileTreeSubscribeEnvelope(
+            requestID: subscriptionID,
+            binding: fixture.binding,
+            after: fixture.treeSnapshot.revision
+        ).serializedData()
+    )
+    _ = try peer.readFrame()
+    try await eventually { fixture.service.activeTreeSubscriptions == 1 }
+
+    await server.shutdown()
+
+    let events = order.value
+    let clientClose = try #require(events.firstIndex(of: "client-close"))
+    let subscriptionCancel = try #require(events.firstIndex(of: "subscription-cancel"))
+    let listenerClose = try #require(events.firstIndex(of: "listener-close"))
+    #expect(clientClose < subscriptionCancel)
+    #expect(subscriptionCancel < listenerClose)
+}
+
+@Test func hostDataPlaneServerShutdownRejectsSubscriptionRegistrationAfterStopBegins() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = RecordingDarwinUnixDomainSocketSystemCalls(
+        blockSubscriptionAccepted: true
+    ) { _ in }
+    let namespace = uniqueHostDataPlaneNamespace("subreg-race")
+    let server = HostDataPlaneServer(
+        namespace: namespace,
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: DarwinPeerCredentialReader()
+    )
+    try await server.start()
+    let issued = try await fixture.ticketStore.issue(
+        binding: fixture.binding,
+        expectedPeerUID: geteuid()
+    )
+    let peer = try RawHostDataPlanePeer(
+        path: hostDataPlaneSocketPath(namespace: namespace, uid: geteuid())
+    )
+    try peer.handshake()
+    #expect(
+        try peer.authenticate(
+            ticket: issued.wireValue,
+            binding: fixture.binding
+        ).code == .unspecified
+    )
+    let subscriptionID = RequestID().description
+    try peer.writeFrame(
+        channel: .fileTreeEvents,
+        sequence: 1,
+        acknowledgement: 0,
+        payload: try fileTreeSubscribeEnvelope(
+            requestID: subscriptionID,
+            binding: fixture.binding,
+            after: fixture.treeSnapshot.revision
+        ).serializedData()
+    )
+    _ = try peer.readFrame()
+    try await eventually { calls.subscriptionAcceptedWriteBlocked }
+
+    let shutdown = Task { await server.shutdown() }
+    try await Task.sleep(for: .milliseconds(20))
+    calls.releaseSubscriptionAcceptedWrite()
+    await shutdown.value
+    try await Task.sleep(for: .milliseconds(20))
+
+    #expect(fixture.service.treeAfterRevisions.isEmpty)
 }
 
 @Test func hostDataPlaneServerFailsClosedForUnsafeLiveStaleAndRacedPaths() async throws {
@@ -302,6 +478,60 @@ import CockpitTypes
     await server.shutdown()
 }
 
+@Test func hostDataPlaneXPCRejectsEveryNoncanonicalContextIDAndUnsafeGenerationAsInvalidContext() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let random = CountingHostDataPlaneRandomBytes(Array(repeating: 0x33, count: 32))
+    let store = HostDataPlaneTicketStore(clock: AdvancingHostDataPlaneClock(), randomBytes: random)
+    let server = HostDataPlaneServer(
+        namespace: uniqueHostDataPlaneNamespace("exactctx"),
+        service: fixture.service,
+        ticketStore: store
+    )
+    try await server.start()
+    let issuer = HostDataPlaneTicketIssuer(server: server, store: store, effectiveUserID: geteuid())
+    let export = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(service: ThrowingWorkspaceService()),
+        hostDataPlaneTicketIssuer: issuer
+    )
+    defer { Task { await issuer.stopIssuingTickets(); await server.shutdown() } }
+
+    let canonical = try WorkspaceMessages.encode(fixture.requestContext, negotiatedVersion: .current)
+    let uppercase = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".uppercased()
+    let mutations: [(inout CPRequestContext) -> Void] = [
+        { $0.clientInstanceID = uppercase },
+        { $0.windowID = uppercase },
+        { $0.workspaceContextID.projectID = uppercase },
+        { $0.environmentID = uppercase },
+        { $0.requestID = uppercase },
+    ]
+    for mutate in mutations {
+        var context = canonical
+        mutate(&context)
+        var request = CPHostDataPlaneTicketRequest(); request.context = context
+        let reply = await invokeTicketExport(export, data: try request.serializedData())
+        #expect(reply.data == nil)
+        #expect(reply.error?.domain == "dev.cockpit.host-data-plane-ticket")
+        #expect(reply.error?.code == 2)
+    }
+
+    var unsafe = canonical
+    unsafe.activeContextGeneration = documentJavaScriptMaximum + 1
+    var unsafeRequest = CPHostDataPlaneTicketRequest(); unsafeRequest.context = unsafe
+    let unsafeReply = await invokeTicketExport(export, data: try unsafeRequest.serializedData())
+    #expect(unsafeReply.data == nil)
+    #expect(unsafeReply.error?.code == 2)
+    #expect(random.callCount == 0)
+
+    var maximum = canonical
+    maximum.activeContextGeneration = documentJavaScriptMaximum
+    var maximumRequest = CPHostDataPlaneTicketRequest(); maximumRequest.context = maximum
+    let maximumReply = await invokeTicketExport(export, data: try maximumRequest.serializedData())
+    #expect(maximumReply.error == nil)
+    #expect(maximumReply.data != nil)
+    #expect(random.callCount == 1)
+}
+
 @Test func hostDataPlaneIssuanceShutdownGateOrdersDeliverStopAndRejectsNewIssues() async throws {
     let fixture = try HostDataPlaneFixture()
     let server = HostDataPlaneServer(
@@ -351,6 +581,106 @@ import CockpitTypes
         }
         Issue.record("post-stop issue succeeded")
     } catch {}
+    #expect(lateDeliveries.value == 0)
+}
+
+@Test func hostDataPlaneIssuanceUsesOnePermitForTwoAdmittedIssuesThroughStop() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let random = BlockingFirstHostDataPlaneRandomBytes()
+    let store = HostDataPlaneTicketStore(clock: AdvancingHostDataPlaneClock(), randomBytes: random)
+    let server = HostDataPlaneServer(
+        namespace: uniqueHostDataPlaneNamespace("permit"),
+        service: fixture.service,
+        ticketStore: store
+    )
+    try await server.start()
+    let issuer = HostDataPlaneTicketIssuer(server: server, store: store, effectiveUserID: geteuid())
+    let order = LockedHostDataPlaneBox<[String]>([])
+    let first = Task {
+        try await issuer.issue(for: fixture.requestContext) { _ in
+            order.withValue { $0.append("first") }
+        }
+    }
+    try await eventually { random.firstCallEntered }
+    let second = Task {
+        try await issuer.issue(for: fixture.requestContext) { _ in
+            order.withValue { $0.append("second") }
+        }
+    }
+    let stopReturned = LockedHostDataPlaneBox(false)
+    let stop = Task {
+        await issuer.stopIssuingTickets()
+        order.withValue { $0.append("stop") }
+        stopReturned.withValue { $0 = true }
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(random.callCount == 1)
+    #expect(order.value.isEmpty)
+    #expect(!stopReturned.value)
+    random.releaseFirstCall()
+    try await first.value
+    try await second.value
+    await stop.value
+    #expect(order.value == ["first", "second", "stop"])
+    await server.shutdown()
+}
+
+@Test func hostDataPlaneHostShutdownCoordinatorOrdersAdmittedReplyServerAndListener() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let order = LockedHostDataPlaneBox<[String]>([])
+    let calls = ScriptedUnixDomainSocketSystemCalls(uid: 501)
+    calls.closeObserver = { descriptor in
+        if descriptor == 41 { order.withValue { $0.append("server") } }
+    }
+    let server = HostDataPlaneServer(
+        namespace: "coordinator",
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: FixedPeerCredentialReader(uid: 501)
+    )
+    try await server.start()
+    let issuer = HostDataPlaneTicketIssuer(
+        server: server,
+        store: fixture.ticketStore,
+        effectiveUserID: 501
+    )
+    let deliveryEntered = DispatchSemaphore(value: 0)
+    let releaseDelivery = DispatchSemaphore(value: 0)
+    let issue = Task {
+        try await issuer.issue(for: fixture.requestContext) { _ in
+            order.withValue { $0.append("reply") }
+            deliveryEntered.signal()
+            releaseDelivery.wait()
+        }
+    }
+    let entered = await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: deliveryEntered.wait(timeout: .now() + 2))
+        }
+    }
+    #expect(entered == .success)
+
+    let coordinator = HostShutdownCoordinator(
+        ticketIssuer: issuer,
+        dataPlaneServer: server,
+        invalidateListener: { order.withValue { $0.append("listener") } },
+        stopProcess: { order.withValue { $0.append("run-loop") } }
+    )
+    let shutdown = Task { await coordinator.shutdown() }
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(order.value == ["reply"])
+    releaseDelivery.signal()
+    try await issue.value
+    await shutdown.value
+    #expect(order.value == ["reply", "server", "listener", "run-loop"])
+
+    let lateDeliveries = LockedHostDataPlaneBox(0)
+    await #expect(throws: (any Error).self) {
+        try await issuer.issue(for: fixture.requestContext) { _ in
+            lateDeliveries.withValue { $0 += 1 }
+        }
+    }
     #expect(lateDeliveries.value == 0)
 }
 
@@ -432,6 +762,396 @@ import CockpitTypes
     ])
 }
 
+@Test func hostDataPlaneClientSingleReadPumpDispatchesReorderedConcurrentUnaryReplies() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+    defer { Task { await harness.client.disconnect() } }
+
+    let first = Task { try await harness.client.snapshot(documentID: fixture.documentID) }
+    try await harness.calls.waitForWrittenFrames(3)
+    let tree = Task { try await harness.client.children(at: .root) }
+    try await harness.calls.waitForWrittenFrames(4)
+    let second = Task { try await harness.client.snapshot(documentID: fixture.documentID) }
+    try await harness.calls.waitForWrittenFrames(5)
+    let firstRequest = try documentEnvelope(harness.calls.writtenFrames[2])
+    let treeRequest = try fileTreeEnvelope(harness.calls.writtenFrames[3])
+    let secondRequest = try documentEnvelope(harness.calls.writtenFrames[4])
+
+    harness.calls.enqueue(try documentSnapshotFrame(
+        requestID: secondRequest.requestID,
+        binding: fixture.binding,
+        snapshot: fixture.snapshot,
+        sequence: 1,
+        acknowledgement: 2
+    ))
+    harness.calls.enqueue(try fileTreeSnapshotFrame(
+        requestID: treeRequest.requestID,
+        binding: fixture.binding,
+        snapshot: fixture.treeSnapshot,
+        sequence: 1,
+        acknowledgement: 1
+    ))
+    harness.calls.enqueue(try documentSnapshotFrame(
+        requestID: firstRequest.requestID,
+        binding: fixture.binding,
+        snapshot: fixture.snapshot,
+        sequence: 2,
+        acknowledgement: 2
+    ))
+
+    #expect(try await first.value == fixture.snapshot)
+    #expect(try await tree.value == fixture.treeSnapshot)
+    #expect(try await second.value == fixture.snapshot)
+    #expect(harness.calls.maximumConcurrentReaders == 1)
+}
+
+@Test func hostDataPlaneClientCancellationCompletesBeforeLateReplyAndDiscardKeepsConnectionUsable() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+    defer { Task { await harness.client.disconnect() } }
+    let completion = LockedHostDataPlaneBox<Result<DocumentSnapshot, any Error>?>(nil)
+    let cancelled = Task {
+        do {
+            let value = try await harness.client.snapshot(documentID: fixture.documentID)
+            completion.withValue { $0 = .success(value) }
+        } catch {
+            completion.withValue { $0 = .failure(error) }
+        }
+    }
+    try await harness.calls.waitForWrittenFrames(3)
+    let cancelledRequest = try documentEnvelope(harness.calls.writtenFrames[2])
+    cancelled.cancel()
+    try await eventually(timeout: .milliseconds(250)) { completion.value != nil }
+    if case let .failure(error)? = completion.value {
+        #expect(error as? HostDataPlaneClientError == .requestCancelled)
+    } else {
+        Issue.record("cancelled unary did not complete with requestCancelled")
+    }
+
+    harness.calls.enqueue(try documentSnapshotFrame(
+        requestID: cancelledRequest.requestID,
+        binding: fixture.binding,
+        snapshot: fixture.snapshot,
+        sequence: 1,
+        acknowledgement: 1
+    ))
+    await cancelled.value
+
+    let next = Task { try await harness.client.snapshot(documentID: fixture.documentID) }
+    try await harness.calls.waitForWrittenFrames(4)
+    let nextRequest = try documentEnvelope(harness.calls.writtenFrames[3])
+    harness.calls.enqueue(try documentSnapshotFrame(
+        requestID: nextRequest.requestID,
+        binding: fixture.binding,
+        snapshot: fixture.snapshot,
+        sequence: 2,
+        acknowledgement: 2
+    ))
+    #expect(try await next.value == fixture.snapshot)
+}
+
+@Test func hostDataPlaneClientDisconnectAndInflightReadCloseDescriptorExactlyOnce() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+    harness.calls.holdClosedRead = true
+    let operation = Task { try await harness.client.snapshot(documentID: fixture.documentID) }
+    try await harness.calls.waitForWrittenFrames(3)
+    try await eventually { harness.calls.activeReaderCount == 1 }
+    await harness.client.disconnect()
+    harness.calls.markDescriptorReused()
+    harness.calls.releaseClosedRead()
+    await #expect(throws: HostDataPlaneClientError.disconnected) { _ = try await operation.value }
+    #expect(harness.calls.closeCount == 1)
+    #expect(harness.calls.replacementCloseCount == 0)
+}
+
+@Test func hostDataPlaneClientRejectsMismatchedDocumentBindingAndPayloadAndCloses() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let wrongBinding = try HostDataPlaneBinding(
+        validatingClientInstanceID: ClientInstanceID(uuid(21)),
+        windowID: fixture.binding.windowID,
+        workspaceContextID: fixture.binding.workspaceContextID,
+        environmentID: fixture.binding.environmentID,
+        activeContextGeneration: fixture.binding.activeContextGeneration
+    )
+    let mismatchedSnapshot = try DocumentSnapshot(
+        validatingDocumentID: DocumentID(uuid(22)),
+        environmentID: fixture.snapshot.environmentID,
+        relativePath: fixture.snapshot.relativePath,
+        text: fixture.snapshot.text,
+        documentVersion: fixture.snapshot.documentVersion,
+        persistedVersion: fixture.snapshot.persistedVersion,
+        lastAcceptedClientSequence: fixture.snapshot.lastAcceptedClientSequence,
+        dirtyState: fixture.snapshot.dirtyState,
+        observedDiskFingerprint: fixture.snapshot.observedDiskFingerprint,
+        currentLease: nil,
+        maintenance: fixture.snapshot.maintenance
+    )
+
+    for (binding, snapshot) in [
+        (wrongBinding, fixture.snapshot),
+        (fixture.binding, mismatchedSnapshot),
+    ] {
+        let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+        let operation = Task { try await harness.client.snapshot(documentID: fixture.documentID) }
+        try await harness.calls.waitForWrittenFrames(3)
+        let request = try documentEnvelope(harness.calls.writtenFrames[2])
+        harness.calls.enqueue(try documentSnapshotFrame(
+            requestID: request.requestID,
+            binding: binding,
+            snapshot: snapshot,
+            sequence: 1,
+            acknowledgement: 1
+        ))
+        await #expect(throws: HostDataPlaneClientError.disconnected) { _ = try await operation.value }
+        #expect(harness.calls.closeCount == 1)
+    }
+}
+
+@Test func hostDataPlaneClientRejectsMismatchedLeaseAckAndTreeSnapshotCorrelation() async throws {
+    let fixture = try HostDataPlaneFixture()
+
+    for wrongLease in [
+        try EditLease(
+            validatingID: fixture.lease.id,
+            documentID: fixture.documentID,
+            clientInstanceID: ClientInstanceID(uuid(23))
+        ),
+        try EditLease(
+            validatingID: fixture.lease.id,
+            documentID: DocumentID(uuid(23)),
+            clientInstanceID: fixture.binding.clientInstanceID
+        ),
+    ] {
+        let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+        let operation = Task {
+            try await harness.client.acquireEditLease(
+                documentID: fixture.documentID,
+                client: fixture.binding.clientInstanceID
+            )
+        }
+        try await harness.calls.waitForWrittenFrames(3)
+        let request = try documentEnvelope(harness.calls.writtenFrames[2])
+        harness.calls.enqueue(try documentLeaseFrame(
+            requestID: request.requestID,
+            binding: fixture.binding,
+            lease: wrongLease
+        ))
+        await #expect(throws: HostDataPlaneClientError.disconnected) { _ = try await operation.value }
+    }
+
+    for wrongAck in [
+        try EditAcknowledgement(
+            validatingDocumentID: fixture.documentID,
+            clientSequence: 1,
+            documentVersion: 3
+        ),
+        try EditAcknowledgement(
+            validatingDocumentID: DocumentID(uuid(23)),
+            clientSequence: fixture.transaction.clientSequence,
+            documentVersion: 3
+        ),
+    ] {
+        let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+        let operation = Task { try await harness.client.apply(fixture.transaction) }
+        try await harness.calls.waitForWrittenFrames(3)
+        let request = try documentEnvelope(harness.calls.writtenFrames[2])
+        harness.calls.enqueue(try documentAcknowledgementFrame(
+            requestID: request.requestID,
+            binding: fixture.binding,
+            acknowledgementValue: wrongAck
+        ))
+        await #expect(throws: HostDataPlaneClientError.disconnected) { _ = try await operation.value }
+    }
+
+    for wrongSnapshot in [
+        try FileTreeSnapshot(
+            validating: fixture.binding.environmentID,
+            directory: .relative(RelativePath("nested")),
+            generation: fixture.binding.activeContextGeneration,
+            revision: fixture.treeSnapshot.revision,
+            children: []
+        ),
+        try FileTreeSnapshot(
+            validating: fixture.binding.environmentID,
+            directory: .root,
+            generation: fixture.binding.activeContextGeneration + 1,
+            revision: fixture.treeSnapshot.revision,
+            children: []
+        ),
+    ] {
+        let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+        let operation = Task { try await harness.client.children(at: .root) }
+        try await harness.calls.waitForWrittenFrames(3)
+        let request = try fileTreeEnvelope(harness.calls.writtenFrames[2])
+        harness.calls.enqueue(try fileTreeSnapshotFrame(
+            requestID: request.requestID,
+            binding: fixture.binding,
+            snapshot: wrongSnapshot
+        ))
+        await #expect(throws: HostDataPlaneClientError.disconnected) { _ = try await operation.value }
+    }
+}
+
+@Test func hostDataPlaneTreeClientRejectsEveryMismatchedAckReplyField() async throws {
+    enum Mismatch: CaseIterable { case request, subscription, event, revision }
+
+    let fixture = try HostDataPlaneFixture()
+    for mismatch in Mismatch.allCases {
+        let harness = try ScriptedHostDataPlaneTreeHarness(fixture: fixture)
+        var iterator = harness.client.changes(
+            after: fixture.treeSnapshot.revision,
+            expandedDirectories: [.root]
+        ).makeAsyncIterator()
+        try await harness.calls.waitForWrittenFrames(3)
+        let subscribe = try fileTreeEnvelope(harness.calls.writtenFrames[2])
+        harness.calls.enqueue(try fileTreeSubscriptionAcceptedFrame(
+            requestID: subscribe.requestID,
+            binding: fixture.binding,
+            revision: fixture.treeSnapshot.revision
+        ))
+        let eventID = RequestID().description
+        harness.calls.enqueue(try fileTreeDeltaFrame(
+            requestID: eventID,
+            subscriptionID: subscribe.requestID,
+            binding: fixture.binding,
+            delta: fixture.treeDelta,
+            sequence: 2,
+            acknowledgement: 1
+        ))
+        #expect(try await iterator.next() == fixture.treeDelta)
+
+        let next = Task { try await iterator.next() }
+        try await harness.calls.waitForWrittenFrames(4)
+        let acknowledgementRequest = try fileTreeEnvelope(harness.calls.writtenFrames[3])
+        let requested = acknowledgementRequest.deltaAck
+        harness.calls.enqueue(try fileTreeAckAcceptedFrame(
+            requestID: mismatch == .request ? RequestID().description : acknowledgementRequest.requestID,
+            subscriptionID: mismatch == .subscription ? RequestID().description : requested.subscriptionID,
+            eventID: mismatch == .event ? RequestID().description : requested.eventID,
+            revision: mismatch == .revision ? requested.revision + 1 : requested.revision,
+            binding: fixture.binding,
+            sequence: 3,
+            acknowledgement: 2
+        ))
+        await #expect(throws: HostDataPlaneClientError.disconnected) {
+            _ = try await next.value
+        }
+        #expect(harness.calls.closeCount == 1)
+    }
+}
+
+@Test func hostDataPlaneTreeClientRejectsMismatchedDeltaIdentityAndNonadvancingRevision() async throws {
+    enum Mismatch: CaseIterable { case eventIdentity, revision }
+
+    let fixture = try HostDataPlaneFixture()
+    let nonadvancing = try FileTreeDelta(
+        validating: fixture.binding.environmentID,
+        directory: fixture.treeDelta.directory,
+        revision: fixture.treeSnapshot.revision,
+        mutations: fixture.treeDelta.mutations
+    )
+    for mismatch in Mismatch.allCases {
+        let harness = try ScriptedHostDataPlaneTreeHarness(fixture: fixture)
+        var iterator = harness.client.changes(
+            after: fixture.treeSnapshot.revision,
+            expandedDirectories: [.root]
+        ).makeAsyncIterator()
+        try await harness.calls.waitForWrittenFrames(3)
+        let subscribe = try fileTreeEnvelope(harness.calls.writtenFrames[2])
+        harness.calls.enqueue(try fileTreeSubscriptionAcceptedFrame(
+            requestID: subscribe.requestID,
+            binding: fixture.binding,
+            revision: fixture.treeSnapshot.revision
+        ))
+        let envelopeRequestID = RequestID().description
+        harness.calls.enqueue(try fileTreeDeltaFrame(
+            requestID: envelopeRequestID,
+            eventID: mismatch == .eventIdentity ? RequestID().description : envelopeRequestID,
+            subscriptionID: subscribe.requestID,
+            binding: fixture.binding,
+            delta: mismatch == .revision ? nonadvancing : fixture.treeDelta,
+            sequence: 2,
+            acknowledgement: 1
+        ))
+
+        await #expect(throws: HostDataPlaneClientError.disconnected) {
+            _ = try await iterator.next()
+        }
+        #expect(harness.calls.closeCount == 1)
+    }
+}
+
+@Test func hostDataPlaneTreeClientWaitsForAndConsumesCorrelatedCancelReply() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let harness = try ScriptedHostDataPlaneTreeHarness(fixture: fixture)
+    let firstDelta = LockedHostDataPlaneBox<FileTreeDelta?>(nil)
+    var waiting: Task<FileTreeDelta?, any Error>? = Task {
+        var iterator = harness.client.changes(
+            after: fixture.treeSnapshot.revision,
+            expandedDirectories: [.root]
+        ).makeAsyncIterator()
+        let received = try await iterator.next()
+        firstDelta.withValue { $0 = received }
+        return try await iterator.next()
+    }
+    try await harness.calls.waitForWrittenFrames(3)
+    let subscribe = try fileTreeEnvelope(harness.calls.writtenFrames[2])
+    harness.calls.enqueue(try fileTreeSubscriptionAcceptedFrame(
+        requestID: subscribe.requestID,
+        binding: fixture.binding,
+        revision: fixture.treeSnapshot.revision
+    ))
+    let eventID = RequestID().description
+    harness.calls.enqueue(try fileTreeDeltaFrame(
+        requestID: eventID,
+        subscriptionID: subscribe.requestID,
+        binding: fixture.binding,
+        delta: fixture.treeDelta,
+        sequence: 2,
+        acknowledgement: 1
+    ))
+    try await eventually { firstDelta.value == fixture.treeDelta }
+    try await harness.calls.waitForWrittenFrames(4)
+    let acknowledgementRequest = try fileTreeEnvelope(harness.calls.writtenFrames[3])
+
+    waiting?.cancel()
+    _ = try? await waiting?.value
+    waiting = nil
+    do {
+        try await harness.calls.waitForWrittenFrames(5)
+    } catch {
+        Issue.record("tree cancellation did not write cancel request")
+        return
+    }
+    #expect(harness.calls.closeCount == 0)
+    let cancel = try fileTreeEnvelope(harness.calls.writtenFrames[4])
+    let requestedAcknowledgement = acknowledgementRequest.deltaAck
+    harness.calls.enqueue(try fileTreeAckAcceptedFrame(
+        requestID: acknowledgementRequest.requestID,
+        subscriptionID: requestedAcknowledgement.subscriptionID,
+        eventID: requestedAcknowledgement.eventID,
+        revision: requestedAcknowledgement.revision,
+        binding: fixture.binding,
+        sequence: 3,
+        acknowledgement: 2
+    ))
+    harness.calls.enqueue(try fileTreeCancelledFrame(
+        requestID: cancel.requestID,
+        subscriptionID: RequestID().description,
+        binding: fixture.binding,
+        sequence: 4,
+        acknowledgement: 3
+    ))
+    do {
+        try await eventually { harness.calls.closeCount == 1 }
+    } catch {
+        Issue.record("tree cancellation did not close after cancel response")
+        return
+    }
+    #expect(harness.calls.unreadByteCount == 0)
+}
+
 @Test func hostDataPlaneClientRejectsAcquireIdentityAndWireBindingMismatchWithoutHostCall() async throws {
     let stack = try await HostDataPlaneTestStack.make(prefix: "bind")
     defer { Task { await stack.shutdown() } }
@@ -490,7 +1210,7 @@ import CockpitTypes
 
     stack.fixture.service.nextError = HostDataPlaneDocumentError.committedRecoveryRequired(acknowledgement)
     await #expect(throws: DocumentProtocolError.recoveryRequired) {
-        _ = try await stack.client.snapshot(documentID: stack.fixture.documentID)
+        _ = try await stack.client.apply(stack.fixture.transaction)
     }
     #expect(await diagnostics.next() == .committedRecoveryRequired(acknowledgement))
 
@@ -499,7 +1219,10 @@ import CockpitTypes
         actual: stack.fixture.otherFingerprint
     )
     await #expect(throws: DocumentProtocolError.recoveryRequired) {
-        _ = try await stack.client.snapshot(documentID: stack.fixture.documentID)
+        _ = try await stack.client.save(
+            documentID: stack.fixture.documentID,
+            expectedFingerprint: stack.fixture.fingerprint
+        )
     }
     #expect(await diagnostics.next() == .fingerprintMismatch)
 }
@@ -529,6 +1252,87 @@ import CockpitTypes
         }
         #expect(transport.applyCount == 1)
         #expect(await controller.state == .resynchronizing)
+    }
+}
+
+@Test func hostDataPlaneLocalTransportNumericApplyErrorsSendOnceAndResynchronizeController() async throws {
+    let errors: [DocumentProtocolError] = [
+        .invalidLease,
+        .leaseHeld,
+        .baseVersionMismatch(expected: 2, actual: 1),
+        .sequenceGap(expected: 2, actual: 1),
+        .duplicateMismatch,
+        .staleSequence,
+        .recoveryRequired,
+    ]
+    for expected in errors {
+        let stack = try await HostDataPlaneTestStack.make(prefix: "controller")
+        let controller = DocumentClientController(
+            clientInstanceID: stack.fixture.binding.clientInstanceID,
+            transport: stack.client
+        )
+        _ = try await controller.open(
+            in: stack.fixture.binding.environmentID,
+            at: RelativePath("file.txt"),
+            requestWriteAccess: true
+        )
+        stack.fixture.service.nextError = expected == .recoveryRequired
+            ? HostDataPlaneDocumentError.committedRecoveryRequired(
+                stack.fixture.acknowledgement
+            )
+            : expected
+        await #expect(throws: expected) {
+            _ = try await controller.submit([
+                try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "x"),
+            ])
+        }
+        #expect(stack.fixture.service.callNames.filter { $0 == "apply" }.count == 1)
+        #expect(await controller.state == .resynchronizing)
+        await stack.shutdown()
+    }
+}
+
+@Test func hostDataPlaneCommittedDiagnosticMustMatchApplyDocumentAndSequence() async throws {
+    let fixture = try HostDataPlaneFixture()
+    for wrong in [
+        try EditAcknowledgement(
+            validatingDocumentID: DocumentID(uuid(25)),
+            clientSequence: fixture.transaction.clientSequence,
+            documentVersion: fixture.acknowledgement.documentVersion
+        ),
+        try EditAcknowledgement(
+            validatingDocumentID: fixture.transaction.documentID,
+            clientSequence: fixture.transaction.clientSequence + 1,
+            documentVersion: fixture.acknowledgement.documentVersion
+        ),
+    ] {
+        let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
+        let receivedDiagnostic = LockedHostDataPlaneBox<DocumentDataPlaneDiagnostic?>(nil)
+        let diagnostic = Task {
+            var iterator = harness.client.documentDiagnostics().makeAsyncIterator()
+            if let value = await iterator.next() {
+                receivedDiagnostic.withValue { $0 = value }
+            }
+        }
+        let operation = Task { try await harness.client.apply(fixture.transaction) }
+        try await harness.calls.waitForWrittenFrames(3)
+        let request = try documentEnvelope(harness.calls.writtenFrames[2])
+        var remote = CPDataPlaneError()
+        remote.code = .documentRecoveryRequired
+        remote.committedAcknowledgement = try HostDataPlaneMessages.encode(wrong)
+        harness.calls.enqueue(try documentErrorFrame(
+            requestID: request.requestID,
+            binding: fixture.binding,
+            error: remote
+        ))
+        await #expect(throws: HostDataPlaneClientError.disconnected) {
+            _ = try await operation.value
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(receivedDiagnostic.value == nil)
+        diagnostic.cancel()
+        await diagnostic.value
+        #expect(harness.calls.closeCount == 1)
     }
 }
 
@@ -577,6 +1381,89 @@ import CockpitTypes
     stack.fixture.service.yieldTreeDelta(stack.fixture.nextTreeDelta)
     #expect(try await recovered.next() == stack.fixture.nextTreeDelta)
     #expect(stack.fixture.service.childrenDirectories == [.root, .root])
+}
+
+@Test func hostDataPlaneFileTreeDisconnectGetsNewTicketAndResubscribesFromLastAppliedRevision() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let namespace = uniqueHostDataPlaneNamespace("reconnect")
+    let firstServer = HostDataPlaneServer(
+        namespace: namespace,
+        service: fixture.service,
+        ticketStore: fixture.ticketStore
+    )
+    try await firstServer.start()
+    let firstIssuer = HostDataPlaneTicketIssuer(
+        server: firstServer,
+        store: fixture.ticketStore,
+        effectiveUserID: geteuid()
+    )
+    let firstExport = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(service: ThrowingWorkspaceService()),
+        hostDataPlaneTicketIssuer: firstIssuer
+    )
+    let proxy = SwitchingHostDataPlaneTicketProxy(export: firstExport)
+    let xpc = HostXPCClient(connectionFactory: { _ in HostDataPlaneXPCConnection(proxy: proxy) })
+    let client = HostDataPlaneClient(binding: fixture.binding, xpcClient: xpc)
+
+    var iterator = client.changes(
+        after: fixture.treeSnapshot.revision,
+        expandedDirectories: [.root, .root]
+    ).makeAsyncIterator()
+    try await eventually { fixture.service.activeTreeSubscriptions == 1 }
+    fixture.service.yieldTreeDelta(fixture.treeDelta)
+    #expect(try await iterator.next() == fixture.treeDelta)
+
+    await firstIssuer.stopIssuingTickets()
+    await firstServer.shutdown()
+    let secondServer = HostDataPlaneServer(
+        namespace: namespace,
+        service: fixture.service,
+        ticketStore: fixture.ticketStore
+    )
+    try await secondServer.start()
+    let secondIssuer = HostDataPlaneTicketIssuer(
+        server: secondServer,
+        store: fixture.ticketStore,
+        effectiveUserID: geteuid()
+    )
+    let secondExport = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(service: ThrowingWorkspaceService()),
+        hostDataPlaneTicketIssuer: secondIssuer
+    )
+    proxy.replaceExport(secondExport)
+    fixture.service.nextError = FileTreeProviderError.revisionUnavailable(
+        requested: fixture.treeDelta.revision,
+        current: fixture.treeDelta.revision
+    )
+
+    let resumed = Task { try await iterator.next() }
+    do {
+        try await eventually {
+            proxy.successfulIssueCount == 2
+                && fixture.service.childrenDirectories == [.root]
+                && fixture.service.activeTreeSubscriptions == 1
+        }
+    } catch {
+        Issue.record("tree stream did not reconnect with a new ticket and captured directory refresh")
+    }
+    fixture.service.yieldTreeDelta(fixture.nextTreeDelta)
+    do {
+        #expect(try await resumed.value == fixture.nextTreeDelta)
+    } catch {
+        Issue.record("reconnected tree stream did not resume: \(error)")
+    }
+    #expect(fixture.service.treeAfterRevisions.prefix(3) == [
+        fixture.treeSnapshot.revision,
+        fixture.treeDelta.revision,
+        fixture.treeDelta.revision,
+    ])
+    #expect(fixture.service.callNames.filter { $0 == "apply" }.isEmpty)
+
+    await client.disconnect()
+    await secondIssuer.stopIssuingTickets()
+    await secondServer.shutdown()
 }
 
 @Test func hostDataPlaneMalformedSequenceAckRequestReuseAndPeerUIDFailClosed() async throws {
@@ -680,6 +1567,167 @@ import CockpitTypes
     #expect(goodStack.fixture.service.callNames.isEmpty)
 }
 
+@Test func hostDataPlaneRawWireRejectsAckViolationAndRequestIDReuse() async throws {
+    let stack = try await HostDataPlaneTestStack.make(prefix: "ackreuse")
+    defer { Task { await stack.shutdown() } }
+
+    do {
+        let issued = try await stack.fixture.ticketStore.issue(
+            binding: stack.fixture.binding,
+            expectedPeerUID: geteuid()
+        )
+        let peer = try RawHostDataPlanePeer(path: stack.serverSocketPath)
+        try peer.handshake()
+        #expect(try peer.authenticate(ticket: issued.wireValue, binding: stack.fixture.binding).code == .unspecified)
+        try peer.sendRaw(try peer.documentSnapshotRequest(
+            binding: stack.fixture.binding,
+            documentID: stack.fixture.documentID,
+            requestID: RequestID(),
+            sequence: 1,
+            acknowledgement: 1
+        ))
+        #expect(try peer.dataPlaneError(from: peer.readFrame()).code == .ackViolation)
+    }
+
+    do {
+        let issued = try await stack.fixture.ticketStore.issue(
+            binding: stack.fixture.binding,
+            expectedPeerUID: geteuid()
+        )
+        let peer = try RawHostDataPlanePeer(path: stack.serverSocketPath)
+        try peer.handshake()
+        #expect(try peer.authenticate(ticket: issued.wireValue, binding: stack.fixture.binding).code == .unspecified)
+        let requestID = RequestID()
+        try peer.sendRaw(try peer.documentSnapshotRequest(
+            binding: stack.fixture.binding,
+            documentID: stack.fixture.documentID,
+            requestID: requestID,
+            sequence: 1,
+            acknowledgement: 0
+        ))
+        _ = try peer.readFrame()
+        try peer.sendRaw(try peer.documentSnapshotRequest(
+            binding: stack.fixture.binding,
+            documentID: stack.fixture.documentID,
+            requestID: requestID,
+            sequence: 2,
+            acknowledgement: 1
+        ))
+        #expect(try peer.dataPlaneError(from: peer.readFrame()).code == .requestIDReuse)
+    }
+}
+
+@Test func hostDataPlaneWrongTreeEventOrRevisionAckCancelsOnlyThatSubscription() async throws {
+    for wrongRevision in [false, true] {
+        let stack = try await HostDataPlaneTestStack.make(prefix: wrongRevision ? "ackrev" : "ackevent")
+        defer { Task { await stack.shutdown() } }
+        let issued = try await stack.fixture.ticketStore.issue(
+            binding: stack.fixture.binding,
+            expectedPeerUID: geteuid()
+        )
+        let peer = try RawHostDataPlanePeer(path: stack.serverSocketPath)
+        try peer.handshake()
+        #expect(try peer.authenticate(ticket: issued.wireValue, binding: stack.fixture.binding).code == .unspecified)
+
+        let subscriptionIDs = [RequestID().description, RequestID().description]
+        var outgoing: UInt64 = 0
+        var lastIncoming: UInt64 = 0
+        for subscriptionID in subscriptionIDs {
+            outgoing += 1
+            try peer.writeFrame(
+                channel: .fileTreeEvents,
+                sequence: outgoing,
+                acknowledgement: lastIncoming,
+                payload: try fileTreeSubscribeEnvelope(
+                    requestID: subscriptionID,
+                    binding: stack.fixture.binding,
+                    after: stack.fixture.treeSnapshot.revision
+                ).serializedData()
+            )
+            let acceptedFrame = try peer.readFrame()
+            lastIncoming = acceptedFrame.header.sequence
+            let acceptedEnvelope = try fileTreeEnvelope(acceptedFrame)
+            #expect(acceptedEnvelope.requestID == subscriptionID)
+            #expect(acceptedEnvelope.subscriptionAccepted.subscriptionID == subscriptionID)
+        }
+        try await eventually { stack.fixture.service.activeTreeSubscriptions == 2 }
+        stack.fixture.service.yieldTreeDelta(stack.fixture.treeDelta)
+        var events: [String: CPFileTreeDeltaEvent] = [:]
+        for _ in subscriptionIDs {
+            let eventFrame = try peer.readFrame()
+            lastIncoming = eventFrame.header.sequence
+            let eventEnvelope = try fileTreeEnvelope(eventFrame)
+            guard case let .deltaEvent(event)? = eventEnvelope.payload else {
+                Issue.record("missing tree delta event")
+                continue
+            }
+            events[event.subscriptionID] = event
+        }
+        let cancelledEvent = try #require(events[subscriptionIDs[0]])
+        let survivingEvent = try #require(events[subscriptionIDs[1]])
+
+        var ack = CPFileTreeDeltaAck()
+        ack.subscriptionID = subscriptionIDs[0]
+        ack.eventID = wrongRevision ? cancelledEvent.eventID : survivingEvent.eventID
+        ack.revision = wrongRevision ? cancelledEvent.delta.revision + 1 : cancelledEvent.delta.revision
+        var ackEnvelope = CPFileTreeEnvelope()
+        ackEnvelope.requestID = RequestID().description
+        ackEnvelope.binding = try HostDataPlaneMessages.encode(stack.fixture.binding)
+        ackEnvelope.deltaAck = ack
+        outgoing += 1
+        try peer.writeFrame(
+            channel: .fileTreeEvents,
+            sequence: outgoing,
+            acknowledgement: lastIncoming,
+            payload: ackEnvelope.serializedData()
+        )
+        let errorFrame = try peer.readFrame()
+        lastIncoming = errorFrame.header.sequence
+        #expect(try peer.dataPlaneError(from: errorFrame).code == .treeBackpressure)
+        do {
+            try await eventually {
+                stack.fixture.service.cancelledTreeSubscriptions == 1
+                    && stack.fixture.service.activeTreeSubscriptions == 1
+            }
+        } catch {
+            Issue.record("wrong tree ACK did not cancel only its subscription")
+        }
+
+        var survivingAck = CPFileTreeDeltaAck()
+        survivingAck.subscriptionID = subscriptionIDs[1]
+        survivingAck.eventID = survivingEvent.eventID
+        survivingAck.revision = survivingEvent.delta.revision
+        var survivingAckEnvelope = CPFileTreeEnvelope()
+        survivingAckEnvelope.requestID = RequestID().description
+        survivingAckEnvelope.binding = try HostDataPlaneMessages.encode(stack.fixture.binding)
+        survivingAckEnvelope.deltaAck = survivingAck
+        outgoing += 1
+        try peer.writeFrame(
+            channel: .fileTreeEvents,
+            sequence: outgoing,
+            acknowledgement: lastIncoming,
+            payload: survivingAckEnvelope.serializedData()
+        )
+        let acceptedAckFrame = try peer.readFrame()
+        lastIncoming = acceptedAckFrame.header.sequence
+        let acceptedAck = try fileTreeEnvelope(acceptedAckFrame)
+        guard case .ackAccepted? = acceptedAck.payload else {
+            Issue.record("wrong tree ACK cancelled the unrelated subscription")
+            continue
+        }
+        #expect(acceptedAck.ackAccepted.subscriptionID == subscriptionIDs[1])
+        #expect(acceptedAck.ackAccepted.eventID == survivingEvent.eventID)
+        #expect(acceptedAck.ackAccepted.revision == survivingEvent.delta.revision)
+
+        let pulls = stack.fixture.service.treePullCount
+        stack.fixture.service.yieldTreeDelta(stack.fixture.nextTreeDelta)
+        try await eventually { stack.fixture.service.treePullCount == pulls + 1 }
+        let nextFrame = try peer.readFrame()
+        let nextEnvelope = try fileTreeEnvelope(nextFrame)
+        #expect(nextEnvelope.deltaEvent.subscriptionID == subscriptionIDs[1])
+    }
+}
+
 @Test func hostDataPlaneRealSameUIDChildExercisesGetpeereidHandshakeAndChannelsThreeFour() async throws {
     let stack = try await HostDataPlaneTestStack.make(prefix: "child")
     defer { Task { await stack.shutdown() } }
@@ -737,8 +1785,11 @@ import CockpitTypes
         guard let inode = hostDataPlaneInode(path) else { return false }
         return previousInode == nil || inode != previousInode
     }
+    let activePeer = try RawHostDataPlanePeer(path: path)
+    try activePeer.handshake()
     #expect(kill(process.processIdentifier, SIGTERM) == 0)
     process.waitUntilExit()
+    #expect(try activePeer.readUntilEOF().isEmpty)
     let output = String(
         decoding: diagnostics.fileHandleForReading.readDataToEndOfFile(),
         as: UTF8.self
@@ -764,7 +1815,7 @@ private struct HostDataPlaneFixture: Sendable {
     let service: RecordingHostDataPlaneService
     let ticketStore: HostDataPlaneTicketStore
 
-    init() throws {
+    init(treeCancellationObserver: (@Sendable () -> Void)? = nil) throws {
         let client = ClientInstanceID(uuid(1))
         let window = WindowID(uuid(2))
         let project = ProjectID(uuid(3))
@@ -862,7 +1913,8 @@ private struct HostDataPlaneFixture: Sendable {
             snapshot: snapshot,
             lease: lease,
             acknowledgement: acknowledgement,
-            treeSnapshot: treeSnapshot
+            treeSnapshot: treeSnapshot,
+            treeCancellationObserver: treeCancellationObserver
         )
         ticketStore = HostDataPlaneTicketStore()
     }
@@ -874,23 +1926,27 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
     private let leaseValue: EditLease
     private let acknowledgementValue: EditAcknowledgement
     private let treeSnapshotValue: FileTreeSnapshot
+    private let treeCancellationObserver: (@Sendable () -> Void)?
     private var calls: [String] = []
     private var pendingError: (any Error)?
     private var treeContinuations: [UUID: AsyncThrowingStream<FileTreeDelta, Error>.Continuation] = [:]
     private var pulls = 0
     private var cancelledSubscriptions = 0
     private var directories: [WorkspaceDirectory] = []
+    private var afterRevisions: [UInt64] = []
 
     init(
         snapshot: DocumentSnapshot,
         lease: EditLease,
         acknowledgement: EditAcknowledgement,
-        treeSnapshot: FileTreeSnapshot
+        treeSnapshot: FileTreeSnapshot,
+        treeCancellationObserver: (@Sendable () -> Void)? = nil
     ) {
         snapshotValue = snapshot
         leaseValue = lease
         acknowledgementValue = acknowledgement
         treeSnapshotValue = treeSnapshot
+        self.treeCancellationObserver = treeCancellationObserver
     }
 
     var callNames: [String] { lock.withLock { calls } }
@@ -898,6 +1954,7 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
     var cancelledTreeSubscriptions: Int { lock.withLock { cancelledSubscriptions } }
     var activeTreeSubscriptions: Int { lock.withLock { treeContinuations.count } }
     var childrenDirectories: [WorkspaceDirectory] { lock.withLock { directories } }
+    var treeAfterRevisions: [UInt64] { lock.withLock { afterRevisions } }
     var nextError: (any Error)? {
         get { lock.withLock { pendingError } }
         set { lock.withLock { pendingError = newValue } }
@@ -935,6 +1992,7 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
     func fileTreeChanges(binding: HostDataPlaneBinding, after revision: UInt64) -> AsyncThrowingStream<FileTreeDelta, Error> {
         let id = UUID()
         let error = lock.withLock { () -> (any Error)? in
+            afterRevisions.append(revision)
             defer { pendingError = nil }
             return pendingError
         }
@@ -949,6 +2007,7 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
                     self?.treeContinuations.removeValue(forKey: id)
                     self?.cancelledSubscriptions += 1
                 }
+                self?.treeCancellationObserver?()
             }
         }
     }
@@ -988,6 +2047,49 @@ private struct ThrowingHostDataPlaneRandomBytes: HostDataPlaneRandomBytes {
     func bytes(count: Int) throws -> [UInt8] { throw CocoaError(.coderInvalidValue) }
 }
 
+private final class SequencedHostDataPlaneRandomBytes: HostDataPlaneRandomBytes, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [[UInt8]]
+    init(_ values: [[UInt8]]) { self.values = values }
+    func bytes(count: Int) throws -> [UInt8] {
+        try lock.withLock {
+            guard !values.isEmpty else { throw HostDataPlaneTicketError.randomGenerationFailed }
+            return values.removeFirst()
+        }
+    }
+}
+
+private final class CountingHostDataPlaneRandomBytes: HostDataPlaneRandomBytes, @unchecked Sendable {
+    private let lock = NSLock()
+    private let value: [UInt8]
+    private var calls = 0
+    init(_ value: [UInt8]) { self.value = value }
+    var callCount: Int { lock.withLock { calls } }
+    func bytes(count: Int) throws -> [UInt8] {
+        lock.withLock { calls += 1 }
+        return value
+    }
+}
+
+private final class BlockingFirstHostDataPlaneRandomBytes: HostDataPlaneRandomBytes, @unchecked Sendable {
+    private let lock = NSLock()
+    private let release = DispatchSemaphore(value: 0)
+    private var calls = 0
+    private var entered = false
+    var callCount: Int { lock.withLock { calls } }
+    var firstCallEntered: Bool { lock.withLock { entered } }
+    func bytes(count: Int) throws -> [UInt8] {
+        let call = lock.withLock { () -> Int in
+            calls += 1
+            if calls == 1 { entered = true }
+            return calls
+        }
+        if call == 1 { release.wait() }
+        return Array(repeating: UInt8(call), count: count)
+    }
+    func releaseFirstCall() { release.signal() }
+}
+
 private struct FixedPeerCredentialReader: PeerCredentialReading {
     let uid: uid_t
     func peerCredentials(for descriptor: Int32) throws -> (uid: uid_t, gid: gid_t) { (uid, 20) }
@@ -995,10 +2097,13 @@ private struct FixedPeerCredentialReader: PeerCredentialReading {
 
 private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls, @unchecked Sendable {
     private let lock = NSLock()
+    private let readRelease = DispatchSemaphore(value: 0)
     let uid: uid_t
     var statuses: [String: [UnixSocketPathStatus?]] = [:]
     var connectError: UnixDomainSocketError? = .systemCall(function: "connect", errno: ENOENT)
     var acceptedDescriptors: [Int32] = []
+    var blockReads = false
+    var closeObserver: (@Sendable (Int32) -> Void)?
     var postBindSocketIdentity = UnixSocketPathStatus(
         kind: .socket, owner: 501, permissions: 0o600, device: 8, inode: 9
     )
@@ -1008,10 +2113,15 @@ private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemC
     private(set) var closeOnExecDescriptors: [Int32] = []
     private(set) var noSigPipeDescriptors: [Int32] = []
     private(set) var closedDescriptors: [Int32] = []
+    private(set) var closedReusedDescriptors: [Int32] = []
     private(set) var unlinkedPaths: [String] = []
     private(set) var pathStatusCalls: [String] = []
     private var boundPath: String?
     private var nextDescriptor: Int32 = 41
+    private var enteredRead = false
+    private var reusedDescriptors: Set<Int32> = []
+
+    var readEntered: Bool { lock.withLock { enteredRead } }
 
     init(uid: uid_t) {
         self.uid = uid
@@ -1080,9 +2190,572 @@ private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemC
         lock.withLock { permissionChanges[path] = permissions }
     }
     func unlink(_ path: String) throws { lock.withLock { unlinkedPaths.append(path) } }
-    func close(_ descriptor: Int32) { lock.withLock { closedDescriptors.append(descriptor) } }
-    func read(_ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer) throws -> Int { 0 }
+    func close(_ descriptor: Int32) {
+        lock.withLock {
+            if reusedDescriptors.contains(descriptor) {
+                closedReusedDescriptors.append(descriptor)
+            } else {
+                closedDescriptors.append(descriptor)
+            }
+        }
+        closeObserver?(descriptor)
+    }
+    func read(_ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        if lock.withLock({ blockReads }) {
+            lock.withLock { enteredRead = true }
+            readRelease.wait()
+        }
+        return 0
+    }
     func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int { buffer.count }
+    func markDescriptorReused(_ descriptor: Int32) {
+        lock.withLock { _ = reusedDescriptors.insert(descriptor) }
+    }
+    func releaseBlockedRead() { readRelease.signal() }
+}
+
+private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls, @unchecked Sendable {
+    private let base = DarwinUnixDomainSocketSystemCalls()
+    private let lock = NSLock()
+    private let observe: @Sendable (String) -> Void
+    private let blockSubscriptionAccepted: Bool
+    private let subscriptionAcceptedRelease = DispatchSemaphore(value: 0)
+    private var listenerDescriptor: Int32?
+    private var clientDescriptors: Set<Int32> = []
+    private var blockedSubscriptionAccepted = false
+    private var didBlockSubscriptionAccepted = false
+
+    init(
+        blockSubscriptionAccepted: Bool = false,
+        observe: @escaping @Sendable (String) -> Void
+    ) {
+        self.blockSubscriptionAccepted = blockSubscriptionAccepted
+        self.observe = observe
+    }
+
+    var subscriptionAcceptedWriteBlocked: Bool {
+        lock.withLock { blockedSubscriptionAccepted }
+    }
+
+    func releaseSubscriptionAcceptedWrite() {
+        subscriptionAcceptedRelease.signal()
+    }
+
+    func effectiveUserID() -> uid_t { base.effectiveUserID() }
+    func createStreamSocket() throws -> Int32 {
+        let descriptor = try base.createStreamSocket()
+        lock.withLock {
+            if listenerDescriptor == nil { listenerDescriptor = descriptor }
+        }
+        return descriptor
+    }
+    func setCloseOnExec(_ descriptor: Int32) throws { try base.setCloseOnExec(descriptor) }
+    func setNoSigPipe(_ descriptor: Int32) throws { try base.setNoSigPipe(descriptor) }
+    func bind(_ descriptor: Int32, to address: UnixDomainSocketAddress) throws {
+        try base.bind(descriptor, to: address)
+    }
+    func listen(_ descriptor: Int32, backlog: Int32) throws { try base.listen(descriptor, backlog: backlog) }
+    func accept(_ descriptor: Int32) throws -> Int32 {
+        let accepted = try base.accept(descriptor)
+        lock.withLock { _ = clientDescriptors.insert(accepted) }
+        return accepted
+    }
+    func connect(_ descriptor: Int32, to address: UnixDomainSocketAddress) throws {
+        try base.connect(descriptor, to: address)
+    }
+    func pathStatus(_ path: String) throws -> UnixSocketPathStatus? { try base.pathStatus(path) }
+    func makeDirectory(_ path: String, permissions: mode_t) throws {
+        try base.makeDirectory(path, permissions: permissions)
+    }
+    func setPermissions(_ path: String, permissions: mode_t) throws {
+        try base.setPermissions(path, permissions: permissions)
+    }
+    func unlink(_ path: String) throws { try base.unlink(path) }
+    func close(_ descriptor: Int32) {
+        base.close(descriptor)
+        let event = lock.withLock { () -> String? in
+            if descriptor == listenerDescriptor { return "listener-close" }
+            if clientDescriptors.contains(descriptor) { return "client-close" }
+            return nil
+        }
+        if let event { observe(event) }
+    }
+    func read(_ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        try base.read(descriptor, into: buffer)
+    }
+    func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int {
+        let written = try base.write(descriptor, from: buffer)
+        let blocks = lock.withLock { () -> Bool in
+            guard blockSubscriptionAccepted,
+                  !didBlockSubscriptionAccepted,
+                  clientDescriptors.contains(descriptor),
+                  written == buffer.count,
+                  isSubscriptionAcceptedFrame(Data(buffer)) else {
+                return false
+            }
+            didBlockSubscriptionAccepted = true
+            blockedSubscriptionAccepted = true
+            return true
+        }
+        if blocks { subscriptionAcceptedRelease.wait() }
+        return written
+    }
+
+    private func isSubscriptionAcceptedFrame(_ data: Data) -> Bool {
+        var decoder = FrameDecoder()
+        guard let frames = try? decoder.append(data),
+              frames.count == 1,
+              case let .fileTree(envelope) = try? HostDataPlaneMessages.decodeEnvelope(frames[0]),
+              case .subscriptionAccepted? = envelope.payload else {
+            return false
+        }
+        return true
+    }
+}
+
+private final class ScriptedHostDataPlaneClientSocketCalls: UnixDomainSocketSystemCalls, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var input = Data()
+    private var output = Data()
+    private var frames: [Frame] = []
+    private var closed = false
+    private var closes = 0
+    private var replacementCloses = 0
+    private var descriptorReused = false
+    private var releaseClosedReader = false
+    private var activeReaders = 0
+    private var maximumReaders = 0
+    var holdClosedRead = false
+
+    var writtenFrames: [Frame] {
+        condition.withLock { frames }
+    }
+    var closeCount: Int { condition.withLock { closes } }
+    var replacementCloseCount: Int { condition.withLock { replacementCloses } }
+    var maximumConcurrentReaders: Int { condition.withLock { maximumReaders } }
+    var activeReaderCount: Int { condition.withLock { activeReaders } }
+    var unreadByteCount: Int { condition.withLock { input.count } }
+
+    func enqueue(_ frame: Frame) {
+        condition.lock()
+        input.append(frame.encoded())
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func waitForWrittenFrames(_ count: Int) async throws {
+        try await eventually { self.writtenFrames.count >= count }
+    }
+
+    func effectiveUserID() -> uid_t { geteuid() }
+    func createStreamSocket() throws -> Int32 { 71 }
+    func setCloseOnExec(_ descriptor: Int32) throws {}
+    func setNoSigPipe(_ descriptor: Int32) throws {}
+    func bind(_ descriptor: Int32, to address: UnixDomainSocketAddress) throws {}
+    func listen(_ descriptor: Int32, backlog: Int32) throws {}
+    func accept(_ descriptor: Int32) throws -> Int32 { throw UnixDomainSocketError.systemCall(function: "accept", errno: ECANCELED) }
+    func connect(_ descriptor: Int32, to address: UnixDomainSocketAddress) throws {}
+    func pathStatus(_ path: String) throws -> UnixSocketPathStatus? { nil }
+    func makeDirectory(_ path: String, permissions: mode_t) throws {}
+    func setPermissions(_ path: String, permissions: mode_t) throws {}
+    func unlink(_ path: String) throws {}
+    func close(_ descriptor: Int32) {
+        condition.lock()
+        if descriptorReused {
+            replacementCloses += 1
+        } else {
+            closes += 1
+        }
+        closed = true
+        condition.broadcast()
+        condition.unlock()
+    }
+    func read(_ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        condition.lock()
+        activeReaders += 1
+        maximumReaders = max(maximumReaders, activeReaders)
+        defer {
+            activeReaders -= 1
+            condition.unlock()
+        }
+        while input.isEmpty, !closed { condition.wait() }
+        while input.isEmpty, closed, holdClosedRead, !releaseClosedReader {
+            condition.wait()
+        }
+        if input.isEmpty, closed { return 0 }
+        let count = min(buffer.count, input.count)
+        input.copyBytes(to: buffer.bindMemory(to: UInt8.self), count: count)
+        input.removeFirst(count)
+        return count
+    }
+    func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int {
+        condition.withLock {
+            output.append(buffer.bindMemory(to: UInt8.self))
+            while output.count >= FrameHeader.encodedLength {
+                guard let header = try? FrameHeader(decoding: output.prefix(FrameHeader.encodedLength)) else { break }
+                let length = FrameHeader.encodedLength + Int(header.payloadLength)
+                guard output.count >= length else { break }
+                let payloadStart = output.index(
+                    output.startIndex,
+                    offsetBy: FrameHeader.encodedLength
+                )
+                let payloadEnd = output.index(output.startIndex, offsetBy: length)
+                if let frame = try? Frame(
+                    header: header,
+                    payload: output.subdata(in: payloadStart..<payloadEnd)
+                ) {
+                    frames.append(frame)
+                }
+                output = Data(output.dropFirst(length))
+            }
+            condition.broadcast()
+        }
+        return buffer.count
+    }
+    func markDescriptorReused() {
+        condition.withLock { descriptorReused = true }
+    }
+    func releaseClosedRead() {
+        condition.withLock {
+            releaseClosedReader = true
+            condition.broadcast()
+        }
+    }
+}
+
+private final class FixedHostDataPlaneTicketProxy: NSObject, HostXPCProtocol, @unchecked Sendable {
+    private let socketPath: String
+    private let ticket: String
+    private let lock = NSLock()
+    private var issues = 0
+    init(socketPath: String = "/private/tmp/cockpit-test.sock", ticket: String = String(repeating: "A", count: 43)) {
+        self.socketPath = socketPath
+        self.ticket = ticket
+    }
+    var issueCount: Int { lock.withLock { issues } }
+    func issueHostDataPlaneTicket(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        lock.withLock { issues += 1 }
+        var response = CPHostDataPlaneTicketResponse()
+        response.socketPath = socketPath
+        response.ticket = ticket
+        response.validForMilliseconds = 30_000
+        reply(try? response.serializedData(), nil)
+    }
+    func exchangeHandshake(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        reply(nil, CocoaError(.coderInvalidValue) as NSError)
+    }
+    func workspaceCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        reply(nil, CocoaError(.coderInvalidValue) as NSError)
+    }
+}
+
+private final class SwitchingHostDataPlaneTicketProxy: NSObject, HostXPCProtocol, @unchecked Sendable {
+    private let lock = NSLock()
+    private var export: HostXPCExport
+    private var issues = 0
+    private var successfulIssues = 0
+    init(export: HostXPCExport) { self.export = export }
+    var issueCount: Int { lock.withLock { issues } }
+    var successfulIssueCount: Int { lock.withLock { successfulIssues } }
+    func replaceExport(_ export: HostXPCExport) { lock.withLock { self.export = export } }
+    func issueHostDataPlaneTicket(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        let current = lock.withLock { () -> HostXPCExport in
+            issues += 1
+            return export
+        }
+        current.issueHostDataPlaneTicket(request) { [weak self] data, error in
+            if data != nil, error == nil {
+                self?.lock.withLock { self?.successfulIssues += 1 }
+            }
+            reply(data, error)
+        }
+    }
+    func exchangeHandshake(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        lock.withLock { export }.exchangeHandshake(request, withReply: reply)
+    }
+    func workspaceCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        lock.withLock { export }.workspaceCommand(request, withReply: reply)
+    }
+}
+
+private struct ScriptedHostDataPlaneClientHarness: Sendable {
+    let calls: ScriptedHostDataPlaneClientSocketCalls
+    let proxy: FixedHostDataPlaneTicketProxy
+    let client: HostDataPlaneClient
+
+    static func make(fixture: HostDataPlaneFixture) async throws -> Self {
+        let calls = ScriptedHostDataPlaneClientSocketCalls()
+        let proxy = FixedHostDataPlaneTicketProxy()
+        var handshake = CPHandshakeResponse()
+        handshake.protocolMajor = 1
+        handshake.protocolMinor = 1
+        handshake.connectionID = ConnectionID(uuid(24)).description
+        handshake.acceptedFeatures = [ProtocolFeature.hostDataPlane.rawValue]
+        handshake.serviceKind = "host-data-plane"
+        var handshakeEnvelope = CPHostDataPlaneControlEnvelope()
+        handshakeEnvelope.handshakeResponse = handshake
+        calls.enqueue(try hostDataPlaneTestFrame(.control, 1, 1, handshakeEnvelope.serializedData()))
+        var authenticated = CPHostDataPlaneAuthenticated()
+        authenticated.binding = try HostDataPlaneMessages.encode(fixture.binding)
+        var authenticatedEnvelope = CPHostDataPlaneControlEnvelope()
+        authenticatedEnvelope.authenticated = authenticated
+        calls.enqueue(try hostDataPlaneTestFrame(.control, 2, 2, authenticatedEnvelope.serializedData()))
+        let xpc = HostXPCClient(connectionFactory: { _ in HostDataPlaneXPCConnection(proxy: proxy) })
+        let client = HostDataPlaneClient(binding: fixture.binding, xpcClient: xpc, systemCalls: calls)
+        try await client.connect()
+        return Self(calls: calls, proxy: proxy, client: client)
+    }
+}
+
+private struct ScriptedHostDataPlaneTreeHarness: Sendable {
+    let calls: ScriptedHostDataPlaneClientSocketCalls
+    let client: HostDataPlaneClient
+
+    init(fixture: HostDataPlaneFixture) throws {
+        let calls = ScriptedHostDataPlaneClientSocketCalls()
+        var handshake = CPHandshakeResponse()
+        handshake.protocolMajor = 1
+        handshake.protocolMinor = 1
+        handshake.connectionID = ConnectionID(uuid(24)).description
+        handshake.acceptedFeatures = [ProtocolFeature.hostDataPlane.rawValue]
+        handshake.serviceKind = "host-data-plane"
+        var handshakeEnvelope = CPHostDataPlaneControlEnvelope()
+        handshakeEnvelope.handshakeResponse = handshake
+        calls.enqueue(try hostDataPlaneTestFrame(
+            .control,
+            1,
+            1,
+            handshakeEnvelope.serializedData()
+        ))
+        var authenticated = CPHostDataPlaneAuthenticated()
+        authenticated.binding = try HostDataPlaneMessages.encode(fixture.binding)
+        var authenticatedEnvelope = CPHostDataPlaneControlEnvelope()
+        authenticatedEnvelope.authenticated = authenticated
+        calls.enqueue(try hostDataPlaneTestFrame(
+            .control,
+            2,
+            2,
+            authenticatedEnvelope.serializedData()
+        ))
+        let proxy = FixedHostDataPlaneTicketProxy()
+        let xpc = HostXPCClient(connectionFactory: { _ in
+            HostDataPlaneXPCConnection(proxy: proxy)
+        })
+        self.calls = calls
+        client = HostDataPlaneClient(
+            binding: fixture.binding,
+            xpcClient: xpc,
+            systemCalls: calls
+        )
+    }
+}
+
+private func documentEnvelope(_ frame: Frame) throws -> CPDocumentEnvelope {
+    guard case let .document(value) = try HostDataPlaneMessages.decodeEnvelope(frame) else {
+        throw ProtocolMappingError.invalidValue("document_envelope")
+    }
+    return value
+}
+
+private func fileTreeEnvelope(_ frame: Frame) throws -> CPFileTreeEnvelope {
+    guard case let .fileTree(value) = try HostDataPlaneMessages.decodeEnvelope(frame) else {
+        throw ProtocolMappingError.invalidValue("file_tree_envelope")
+    }
+    return value
+}
+
+private func fileTreeSubscribeEnvelope(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    after: UInt64
+) throws -> CPFileTreeEnvelope {
+    var request = CPFileTreeSubscribeRequest()
+    request.afterRevision = after
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.subscribeRequest = request
+    return envelope
+}
+
+private func documentSnapshotFrame(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    snapshot: DocumentSnapshot,
+    sequence: UInt64 = 1,
+    acknowledgement: UInt64 = 1
+) throws -> Frame {
+    var envelope = CPDocumentEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.snapshotResult = try HostDataPlaneMessages.encode(snapshot)
+    return try hostDataPlaneTestFrame(.documentEdits, sequence, acknowledgement, envelope.serializedData())
+}
+
+private func documentLeaseFrame(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    lease: EditLease
+) throws -> Frame {
+    var envelope = CPDocumentEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.leaseResult = try HostDataPlaneMessages.encode(lease)
+    return try hostDataPlaneTestFrame(.documentEdits, 1, 1, envelope.serializedData())
+}
+
+private func documentAcknowledgementFrame(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    acknowledgementValue: EditAcknowledgement
+) throws -> Frame {
+    var envelope = CPDocumentEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.acknowledgementResult = try HostDataPlaneMessages.encode(acknowledgementValue)
+    return try hostDataPlaneTestFrame(.documentEdits, 1, 1, envelope.serializedData())
+}
+
+private func documentErrorFrame(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    error: CPDataPlaneError
+) throws -> Frame {
+    var envelope = CPDocumentEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.error = error
+    return try hostDataPlaneTestFrame(.documentEdits, 1, 1, envelope.serializedData())
+}
+
+private func fileTreeSnapshotFrame(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    snapshot: FileTreeSnapshot,
+    sequence: UInt64 = 1,
+    acknowledgement: UInt64 = 1
+) throws -> Frame {
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.snapshotResult = try HostDataPlaneMessages.encode(snapshot)
+    return try hostDataPlaneTestFrame(
+        .fileTreeEvents,
+        sequence,
+        acknowledgement,
+        envelope.serializedData()
+    )
+}
+
+private func fileTreeSubscriptionAcceptedFrame(
+    requestID: String,
+    binding: HostDataPlaneBinding,
+    revision: UInt64,
+    sequence: UInt64 = 1,
+    acknowledgement: UInt64 = 1
+) throws -> Frame {
+    var accepted = CPFileTreeSubscriptionAccepted()
+    accepted.subscriptionID = requestID
+    accepted.revision = revision
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.subscriptionAccepted = accepted
+    return try hostDataPlaneTestFrame(
+        .fileTreeEvents,
+        sequence,
+        acknowledgement,
+        envelope.serializedData()
+    )
+}
+
+private func fileTreeDeltaFrame(
+    requestID: String,
+    eventID: String? = nil,
+    subscriptionID: String,
+    binding: HostDataPlaneBinding,
+    delta: FileTreeDelta,
+    sequence: UInt64,
+    acknowledgement: UInt64
+) throws -> Frame {
+    var event = CPFileTreeDeltaEvent()
+    event.subscriptionID = subscriptionID
+    event.eventID = eventID ?? requestID
+    event.delta = try HostDataPlaneMessages.encode(delta)
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.deltaEvent = event
+    return try hostDataPlaneTestFrame(
+        .fileTreeEvents,
+        sequence,
+        acknowledgement,
+        envelope.serializedData()
+    )
+}
+
+private func fileTreeAckAcceptedFrame(
+    requestID: String,
+    subscriptionID: String,
+    eventID: String,
+    revision: UInt64,
+    binding: HostDataPlaneBinding,
+    sequence: UInt64,
+    acknowledgement: UInt64
+) throws -> Frame {
+    var accepted = CPFileTreeAckAccepted()
+    accepted.subscriptionID = subscriptionID
+    accepted.eventID = eventID
+    accepted.revision = revision
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.ackAccepted = accepted
+    return try hostDataPlaneTestFrame(
+        .fileTreeEvents,
+        sequence,
+        acknowledgement,
+        envelope.serializedData()
+    )
+}
+
+private func fileTreeCancelledFrame(
+    requestID: String,
+    subscriptionID: String,
+    binding: HostDataPlaneBinding,
+    sequence: UInt64,
+    acknowledgement: UInt64
+) throws -> Frame {
+    var cancelled = CPFileTreeCancelled()
+    cancelled.subscriptionID = subscriptionID
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = requestID
+    envelope.binding = try HostDataPlaneMessages.encode(binding)
+    envelope.cancelled = cancelled
+    return try hostDataPlaneTestFrame(
+        .fileTreeEvents,
+        sequence,
+        acknowledgement,
+        envelope.serializedData()
+    )
+}
+
+private func hostDataPlaneTestFrame(
+    _ channel: ChannelID,
+    _ sequence: UInt64,
+    _ acknowledgement: UInt64,
+    _ payload: Data
+) throws -> Frame {
+    try Frame(
+        header: FrameHeader(
+            flags: 0,
+            channel: channel,
+            sequence: sequence,
+            acknowledgement: acknowledgement,
+            payloadLength: UInt32(payload.count)
+        ),
+        payload: payload
+    )
 }
 
 private final class HostDataPlaneXPCConnection: XPCConnectionBoundary, @unchecked Sendable {
@@ -1444,20 +3117,13 @@ private func cockpitHostDataPlaneExecutableURL() throws -> URL {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
         .deletingLastPathComponent()
-    let build = repository.appendingPathComponent(".build", isDirectory: true)
-    let enumerator = FileManager.default.enumerator(
-        at: build,
-        includingPropertiesForKeys: [.isExecutableKey],
-        options: [.skipsHiddenFiles]
-    )
-    while let candidate = enumerator?.nextObject() as? URL {
-        if candidate.lastPathComponent == "CockpitHost",
-           candidate.path.contains("/debug/"),
-           FileManager.default.isExecutableFile(atPath: candidate.path) {
-            return candidate
-        }
+    let candidate = repository
+        .appendingPathComponent(".build/debug", isDirectory: true)
+        .appendingPathComponent("CockpitHost")
+    guard FileManager.default.isExecutableFile(atPath: candidate.path) else {
+        throw CocoaError(.fileNoSuchFile)
     }
-    throw CocoaError(.fileNoSuchFile)
+    return candidate
 }
 
 private func uuid(_ value: UInt8) -> UUID {

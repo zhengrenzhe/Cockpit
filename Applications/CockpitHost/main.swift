@@ -20,46 +20,6 @@ private func parkHostProcess(retaining graph: [Any]) {
     }
 }
 
-private final class HostShutdownCoordinator: @unchecked Sendable {
-    private let lock = NSLock()
-    private var started = false
-    private let ticketIssuer: HostDataPlaneTicketIssuer
-    private let dataPlaneServer: HostDataPlaneServer
-    private let listener: NSXPCListener
-    private let runLoop: CFRunLoop
-
-    init(
-        ticketIssuer: HostDataPlaneTicketIssuer,
-        dataPlaneServer: HostDataPlaneServer,
-        listener: NSXPCListener,
-        runLoop: CFRunLoop
-    ) {
-        self.ticketIssuer = ticketIssuer
-        self.dataPlaneServer = dataPlaneServer
-        self.listener = listener
-        self.runLoop = runLoop
-    }
-
-    func handleTermination() {
-        let begins = lock.withLock {
-            guard !started else { return false }
-            started = true
-            return true
-        }
-        guard begins else { return }
-        Task {
-            await ticketIssuer.stopIssuingTickets()
-            await dataPlaneServer.shutdown()
-            listener.invalidate()
-            CFRunLoopStop(runLoop)
-        }
-    }
-
-    var eventHandler: @Sendable () -> Void {
-        { [weak self] in self?.handleTermination() }
-    }
-}
-
 signal(SIGTERM, SIG_IGN)
 let storage = try CockpitStorageLocations.production()
 let repository = try await SQLiteWorkspaceRepository(databaseURL: storage.workspaceDatabase)
@@ -112,8 +72,8 @@ let terminationSignal = DispatchSource.makeSignalSource(
 private let shutdownCoordinator = HostShutdownCoordinator(
     ticketIssuer: ticketIssuer,
     dataPlaneServer: dataPlaneServer,
-    listener: listener,
-    runLoop: mainRunLoop
+    invalidateListener: { listener.invalidate() },
+    stopProcess: { CFRunLoopStop(mainRunLoop) }
 )
 terminationSignal.setEventHandler(handler: shutdownCoordinator.eventHandler)
 terminationSignal.resume()

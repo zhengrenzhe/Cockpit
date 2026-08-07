@@ -82,30 +82,41 @@ public actor HostDataPlaneTicketStore {
         binding: HostDataPlaneBinding,
         expectedPeerUID: uid_t
     ) throws -> HostDataPlaneIssuedTicket {
-        let raw: [UInt8]
-        do {
-            raw = try randomBytes.bytes(count: 32)
-        } catch {
-            throw HostDataPlaneTicketError.randomGenerationFailed
-        }
-        guard raw.count == 32 else {
-            throw HostDataPlaneTicketError.randomGenerationFailed
-        }
+        for _ in 0..<8 {
+            let raw: [UInt8]
+            do {
+                raw = try randomBytes.bytes(count: 32)
+            } catch {
+                throw HostDataPlaneTicketError.randomGenerationFailed
+            }
+            guard raw.count == 32 else {
+                throw HostDataPlaneTicketError.randomGenerationFailed
+            }
 
-        let wireValue = Self.encode(raw)
-        guard wireValue.utf8.count == 43 else {
-            throw HostDataPlaneTicketError.randomGenerationFailed
-        }
+            let key = Self.digest(raw)
+            let issuedAt = clock.now()
+            if let existing = entries[key], issuedAt < existing.expiry {
+                continue
+            }
+            entries.removeValue(forKey: key)
 
-        let issuedAt = clock.now()
-        entries[Self.digest(raw)] = Entry(
-            binding: binding,
-            expectedPeerUID: expectedPeerUID,
-            issuedAt: issuedAt,
-            expiry: issuedAt.advanced(by: .seconds(30)),
-            consumed: false
-        )
-        return HostDataPlaneIssuedTicket(wireValue: wireValue, validForMilliseconds: 30_000)
+            let wireValue = Self.encode(raw)
+            guard wireValue.utf8.count == 43 else {
+                throw HostDataPlaneTicketError.randomGenerationFailed
+            }
+            entries[key] = Entry(
+                binding: binding,
+                expectedPeerUID: expectedPeerUID,
+                issuedAt: issuedAt,
+                expiry: issuedAt.advanced(by: .seconds(30)),
+                consumed: false
+            )
+            return HostDataPlaneIssuedTicket(
+                wireValue: wireValue,
+                validForMilliseconds: 30_000
+            )
+        }
+        throw HostDataPlaneTicketError.randomGenerationFailed
     }
 
     public func consume(
@@ -181,7 +192,9 @@ public actor HostDataPlaneTicketIssuer {
     private let store: HostDataPlaneTicketStore
     private let effectiveUserID: uid_t
     private var accepting = true
-    private var activeIssues = 0
+    private var permitInUse = false
+    private var permitWaiters: [CheckedContinuation<Void, Never>] = []
+    private var admittedIssues = 0
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(
@@ -199,15 +212,9 @@ public actor HostDataPlaneTicketIssuer {
         deliver: @escaping @Sendable (CPHostDataPlaneTicketResponse) throws -> Void
     ) async throws {
         guard accepting else { throw HostDataPlaneTicketIssueError.stopped }
-        activeIssues += 1
-        defer {
-            activeIssues -= 1
-            if activeIssues == 0 {
-                let waiters = stopWaiters
-                stopWaiters.removeAll()
-                for waiter in waiters { waiter.resume() }
-            }
-        }
+        admittedIssues += 1
+        await acquirePermit()
+        defer { releasePermitAndFinishIssue() }
         do {
             try await server.waitUntilReady()
         } catch {
@@ -230,7 +237,29 @@ public actor HostDataPlaneTicketIssuer {
 
     public func stopIssuingTickets() async {
         accepting = false
-        guard activeIssues > 0 else { return }
+        guard admittedIssues > 0 else { return }
         await withCheckedContinuation { stopWaiters.append($0) }
+    }
+
+    private func acquirePermit() async {
+        if !permitInUse {
+            permitInUse = true
+            return
+        }
+        await withCheckedContinuation { permitWaiters.append($0) }
+    }
+
+    private func releasePermitAndFinishIssue() {
+        admittedIssues -= 1
+        if permitWaiters.isEmpty {
+            permitInUse = false
+        } else {
+            permitWaiters.removeFirst().resume()
+        }
+        if admittedIssues == 0 {
+            let waiters = stopWaiters
+            stopWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
     }
 }

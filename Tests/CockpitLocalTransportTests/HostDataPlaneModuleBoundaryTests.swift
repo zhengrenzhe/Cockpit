@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@testable import CockpitLocalTransport
 
 @Test func hostDataPlaneModuleBoundaryKeepsWorkspaceOutOfLocalTransport() throws {
     let repository = URL(fileURLWithPath: #filePath)
@@ -56,4 +57,29 @@ import Testing
     #expect(declaration.contains(#""CockpitClientCore""#))
     #expect(declaration.contains(#""CockpitLocalTransport""#))
     #expect(!declaration.contains("CockpitWorkspace"))
+}
+
+@Test func hostDataPlaneModuleBoundaryGuardsEverySequenceTransitionBeforeOverflow() {
+    #expect(hostDataPlaneAdvanceSequence(UInt64.max - 1) == .value(UInt64.max))
+    #expect(hostDataPlaneAdvanceSequence(UInt64.max) == .overflow)
+}
+
+@Test func hostDataPlaneModuleBoundaryKeepsSIGTERMCompositionInFrozenOrder() throws {
+    let repository = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let main = try String(
+        contentsOf: repository.appendingPathComponent("Applications/CockpitHost/main.swift"),
+        encoding: .utf8
+    )
+    let coordinator = try #require(main.range(of: "HostShutdownCoordinator("))
+    let invalidateListener = try #require(
+        main.range(of: "invalidateListener: { listener.invalidate() }")
+    )
+    let stopRunLoop = try #require(
+        main.range(of: "stopProcess: { CFRunLoopStop(mainRunLoop) }")
+    )
+    #expect(coordinator.lowerBound < invalidateListener.lowerBound)
+    #expect(invalidateListener.lowerBound < stopRunLoop.lowerBound)
 }

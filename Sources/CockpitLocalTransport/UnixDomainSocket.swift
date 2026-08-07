@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 
 public enum UnixDomainSocketError: Error, Hashable, Sendable {
     case invalidNamespace
@@ -83,6 +84,40 @@ public protocol UnixDomainSocketSystemCalls: Sendable {
     func close(_ descriptor: Int32)
     func read(_ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer) throws -> Int
     func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int
+}
+
+final class HostDataPlaneDescriptorOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let calls: any UnixDomainSocketSystemCalls
+    private var value: Int32?
+
+    init(_ value: Int32, calls: any UnixDomainSocketSystemCalls) {
+        self.value = value
+        self.calls = calls
+    }
+
+    var descriptor: Int32? { lock.withLock { value } }
+
+    @discardableResult
+    func close() -> Bool {
+        let descriptor = lock.withLock { () -> Int32? in
+            defer { value = nil }
+            return value
+        }
+        guard let descriptor else { return false }
+        calls.close(descriptor)
+        return true
+    }
+}
+
+enum HostDataPlaneSequenceTransition: Equatable {
+    case value(UInt64)
+    case overflow
+}
+
+func hostDataPlaneAdvanceSequence(_ current: UInt64) -> HostDataPlaneSequenceTransition {
+    let (next, overflow) = current.addingReportingOverflow(1)
+    return overflow ? .overflow : .value(next)
 }
 
 public struct DarwinUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls {

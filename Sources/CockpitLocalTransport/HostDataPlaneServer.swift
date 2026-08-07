@@ -7,7 +7,7 @@ import CockpitTypes
 public final class HostDataPlaneServer: @unchecked Sendable {
     private enum State {
         case idle
-        case ready(descriptor: Int32, path: String, identity: UnixSocketPathStatus)
+        case ready(listener: HostDataPlaneDescriptorOwner, path: String, identity: UnixSocketPathStatus)
         case stopped
     }
 
@@ -17,8 +17,10 @@ public final class HostDataPlaneServer: @unchecked Sendable {
     private let systemCalls: any UnixDomainSocketSystemCalls
     private let peerCredentials: any PeerCredentialReading
     private let lock = NSLock()
+    private let acceptQueue = DispatchQueue(label: "dev.cockpit.host-data-plane.accept")
     private var state: State = .idle
-    private var acceptedDescriptors: Set<Int32> = []
+    private var connections: [UUID: HostDataPlaneServerConnection] = [:]
+    private let workers = DispatchGroup()
 
     public init(
         namespace: String,
@@ -129,7 +131,8 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             else { throw UnixDomainSocketError.permissionMismatch }
             cleanupIdentity = identity
             try systemCalls.listen(descriptor, backlog: 32)
-            lock.withLock { state = .ready(descriptor: descriptor, path: path, identity: identity) }
+            let listener = HostDataPlaneDescriptorOwner(descriptor, calls: systemCalls)
+            lock.withLock { state = .ready(listener: listener, path: path, identity: identity) }
         } catch {
             systemCalls.close(descriptor)
             if let cleanupIdentity,
@@ -142,7 +145,9 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             }
             throw error
         }
-        DispatchQueue.global().async { [weak self] in
+        workers.enter()
+        acceptQueue.async { [weak self] in
+            defer { self?.workers.leave() }
             self?.acceptLoop(descriptor: descriptor, uid: uid)
         }
     }
@@ -164,21 +169,25 @@ public final class HostDataPlaneServer: @unchecked Sendable {
     }
 
     public func shutdown() async {
-        let snapshot = lock.withLock { () -> (Int32, String, UnixSocketPathStatus, [Int32])? in
-            guard case let .ready(descriptor, path, identity) = state else {
+        let snapshot = lock.withLock { () -> (HostDataPlaneDescriptorOwner, String, UnixSocketPathStatus, [HostDataPlaneServerConnection])? in
+            guard case let .ready(listener, path, identity) = state else {
                 state = .stopped
                 return nil
             }
             state = .stopped
-            let clients = Array(acceptedDescriptors)
-            acceptedDescriptors.removeAll()
-            return (descriptor, path, identity, clients)
+            let clients = Array(connections.values)
+            connections.removeAll()
+            return (listener, path, identity, clients)
         }
         guard let snapshot else { return }
-        systemCalls.close(snapshot.0)
-        for client in snapshot.3 { systemCalls.close(client) }
+        for client in snapshot.3 { client.beginShutdownClose() }
+        for client in snapshot.3 { await client.cancelSubscriptionsForShutdown() }
+        snapshot.0.close()
         if let current = try? systemCalls.pathStatus(snapshot.1), current == snapshot.2 {
             try? systemCalls.unlink(snapshot.1)
+        }
+        await withCheckedContinuation { continuation in
+            workers.notify(queue: .global()) { continuation.resume() }
         }
     }
 
@@ -199,45 +208,55 @@ public final class HostDataPlaneServer: @unchecked Sendable {
                 systemCalls.close(accepted)
                 continue
             }
+            let id = UUID()
+            let connection = HostDataPlaneServerConnection(
+                descriptor: accepted,
+                systemCalls: systemCalls,
+                service: service,
+                ticketStore: ticketStore,
+                peerUID: uid
+            )
             let retained = lock.withLock { () -> Bool in
                 guard case .ready = state else { return false }
-                acceptedDescriptors.insert(accepted)
+                connections[id] = connection
+                workers.enter()
                 return true
             }
-            guard retained else { systemCalls.close(accepted); return }
-            Task.detached { [weak self] in
-                guard let self else { return }
-                await self.serveConnection(accepted, peerUID: uid)
-                self.systemCalls.close(accepted)
-                self.lock.withLock { _ = self.acceptedDescriptors.remove(accepted) }
+            guard retained else {
+                connection.closeAfterWorkerExit()
+                return
+            }
+            Task.detached { [self] in
+                defer {
+                    connection.closeAfterWorkerExit()
+                    self.lock.withLock { _ = self.connections.removeValue(forKey: id) }
+                    self.workers.leave()
+                }
+                await connection.run()
             }
         }
-    }
-
-    private func serveConnection(_ descriptor: Int32, peerUID: uid_t) async {
-        let connection = HostDataPlaneServerConnection(
-            descriptor: descriptor,
-            systemCalls: systemCalls,
-            service: service,
-            ticketStore: ticketStore,
-            peerUID: peerUID
-        )
-        await connection.run()
     }
 }
 
 private final class HostDataPlaneServerConnection: @unchecked Sendable {
-    private struct ChannelState { var expectedIncoming: UInt64 = 1; var nextOutgoing: UInt64 = 1; var lastAcknowledged: UInt64 = 0 }
-    private let descriptor: Int32
+    private struct ChannelState {
+        var expectedIncoming: UInt64 = 1
+        var lastOutgoing: UInt64 = 0
+        var lastAcknowledged: UInt64 = 0
+        var lastOutgoingAcknowledgement: UInt64 = 0
+    }
+    private let descriptorOwner: HostDataPlaneDescriptorOwner
     private let calls: any UnixDomainSocketSystemCalls
     private let service: any HostDataPlaneServing
     private let ticketStore: HostDataPlaneTicketStore
     private let peerUID: uid_t
     private let lock = NSLock()
     private let writeLock = NSLock()
+    private let readQueue = DispatchQueue(label: "dev.cockpit.host-data-plane.server-read")
     private var channels: [UInt32: ChannelState] = [:]
     private var binding: HostDataPlaneBinding?
     private var requestIDs: Set<String> = []
+    private var shuttingDown = false
     private var subscriptionTasks: [String: Task<Void, Never>] = [:]
     private struct AcknowledgementWaiter {
         let subscriptionID: String
@@ -247,14 +266,32 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
     private var acknowledgementWaiters: [String: AcknowledgementWaiter] = [:]
 
     init(descriptor: Int32, systemCalls: any UnixDomainSocketSystemCalls, service: any HostDataPlaneServing, ticketStore: HostDataPlaneTicketStore, peerUID: uid_t) {
-        self.descriptor = descriptor; calls = systemCalls; self.service = service; self.ticketStore = ticketStore; self.peerUID = peerUID
+        descriptorOwner = HostDataPlaneDescriptorOwner(descriptor, calls: systemCalls)
+        calls = systemCalls; self.service = service; self.ticketStore = ticketStore; self.peerUID = peerUID
     }
 
+    func beginShutdownClose() {
+        lock.withLock { shuttingDown = true }
+        writeLock.withLock { _ = descriptorOwner.close() }
+    }
+
+    func cancelSubscriptionsForShutdown() async {
+        for task in cancelSubscriptions() {
+            await task.value
+        }
+    }
+
+    func closeAfterWorkerExit() { descriptorOwner.close() }
+
     func run() async {
+        guard let descriptor = descriptorOwner.descriptor else { return }
+        defer {
+            if !lock.withLock({ shuttingDown }) { _ = cancelSubscriptions() }
+        }
         do {
             let handshake: Frame
             do {
-                handshake = try await readServerFrameAsync(calls, descriptor)
+                handshake = try await readServerFrameAsync(calls, descriptor, queue: readQueue)
             } catch is HostDataPlaneMalformedFrameError {
                 try? sendControlError(.malformedMessage)
                 return
@@ -299,7 +336,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
 
             let authentication: Frame
             do {
-                authentication = try await readServerFrameAsync(calls, descriptor)
+                authentication = try await readServerFrameAsync(calls, descriptor, queue: readQueue)
             } catch is HostDataPlaneMalformedFrameError {
                 try? sendControlError(.malformedMessage, acknowledgement: 1)
                 return
@@ -369,7 +406,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
             while true {
                 let frame: Frame
                 do {
-                    frame = try await readServerFrameAsync(calls, descriptor)
+                    frame = try await readServerFrameAsync(calls, descriptor, queue: readQueue)
                 } catch let error as HostDataPlaneMalformedFrameError {
                     if let channel = error.channel,
                        channel == .documentEdits || channel == .fileTreeEvents {
@@ -409,7 +446,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                         return (.sequenceViolation, channel.expectedIncoming - 1)
                     }
                     guard frame.header.acknowledgement >= channel.lastAcknowledged,
-                          frame.header.acknowledgement < channel.nextOutgoing else {
+                          frame.header.acknowledgement <= channel.lastOutgoing else {
                         return (.ackViolation, channel.expectedIncoming - 1)
                     }
                     return nil
@@ -435,9 +472,12 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                     )
                     return
                 }
-                lock.withLock {
+                try lock.withLock {
                     var channel = channels[frame.header.channel.rawValue] ?? ChannelState()
-                    channel.expectedIncoming += 1
+                    guard case let .value(next) = hostDataPlaneAdvanceSequence(channel.expectedIncoming) else {
+                        throw HostDataPlaneServerProtocolError(.sequenceViolation)
+                    }
+                    channel.expectedIncoming = next
                     channel.lastAcknowledged = frame.header.acknowledgement
                     channels[frame.header.channel.rawValue] = channel
                 }
@@ -449,9 +489,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                     return
                 }
             }
-        } catch {
-            cancelSubscriptions()
-        }
+        } catch {}
     }
 
     private func validate(_ supplied: CPDataPlaneBinding) throws -> HostDataPlaneBinding {
@@ -505,34 +543,34 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                 var accepted = CPFileTreeSubscriptionAccepted(); accepted.subscriptionID = subscriptionID; accepted.revision = value.afterRevision
                 var response = CPFileTreeEnvelope(); response.requestID = envelope.requestID; response.binding = envelope.binding; response.subscriptionAccepted = accepted
                 try send(channel: .fileTreeEvents, acknowledgement: incomingSequence, payload: response.serializedData())
-                let task = Task { [weak self] in
-                    guard let self else { return }
-                    await self.streamTree(binding: binding, bindingMessage: envelope.binding, subscriptionID: subscriptionID, after: value.afterRevision)
+                lock.withLock {
+                    guard !shuttingDown else { return }
+                    subscriptionTasks[subscriptionID] = Task { [weak self] in
+                        guard let self else { return }
+                        await self.streamTree(binding: binding, bindingMessage: envelope.binding, subscriptionID: subscriptionID, after: value.afterRevision)
+                    }
                 }
-                lock.withLock { subscriptionTasks[subscriptionID] = task }
             case let .deltaAck(value):
                 guard reserve(envelope.requestID) else { throw HostDataPlaneServerProtocolError(.requestIDReuse) }
                 let waiter = lock.withLock { () -> AcknowledgementWaiter? in
-                    guard let waiter = acknowledgementWaiters[value.eventID],
+                    let byEvent = acknowledgementWaiters[value.eventID]
+                    guard let waiter = byEvent,
                           waiter.subscriptionID == value.subscriptionID,
                           waiter.revision == value.revision
                     else { return nil }
                     return acknowledgementWaiters.removeValue(forKey: value.eventID)
                 }
-                guard let waiter else { throw HostDataPlaneServerProtocolError(.treeBackpressure) }
+                guard let waiter else {
+                    cancelSubscription(value.subscriptionID)
+                    throw HostDataPlaneServerProtocolError(.treeBackpressure)
+                }
                 waiter.continuation.resume()
                 var ack = CPFileTreeAckAccepted(); ack.subscriptionID = value.subscriptionID; ack.eventID = value.eventID; ack.revision = value.revision
                 var response = CPFileTreeEnvelope(); response.requestID = envelope.requestID; response.binding = envelope.binding; response.ackAccepted = ack
                 try send(channel: .fileTreeEvents, acknowledgement: incomingSequence, payload: response.serializedData())
             case let .cancelRequest(value):
                 guard reserve(envelope.requestID) else { throw HostDataPlaneServerProtocolError(.requestIDReuse) }
-                lock.withLock { subscriptionTasks.removeValue(forKey: value.subscriptionID) }?.cancel()
-                let waiters = lock.withLock { () -> [CheckedContinuation<Void, any Error>] in
-                    let matching = acknowledgementWaiters.filter { $0.value.subscriptionID == value.subscriptionID }
-                    for key in Array(matching.keys) { acknowledgementWaiters.removeValue(forKey: key) }
-                    return matching.values.map(\.continuation)
-                }
-                for waiter in waiters { waiter.resume() }
+                cancelSubscription(value.subscriptionID)
                 var cancelled = CPFileTreeCancelled(); cancelled.subscriptionID = value.subscriptionID
                 var response = CPFileTreeEnvelope(); response.requestID = envelope.requestID; response.binding = envelope.binding; response.cancelled = cancelled
                 try send(channel: .fileTreeEvents, acknowledgement: incomingSequence, payload: response.serializedData())
@@ -580,6 +618,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                 }
             }
         } catch {
+            if Task.isCancelled { return }
             let acknowledgement = lock.withLock {
                 (channels[ChannelID.fileTreeEvents.rawValue]?.expectedIncoming ?? 1) - 1
             }
@@ -626,15 +665,49 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
     }
     private func send(channel: ChannelID, acknowledgement: UInt64, payload: Data) throws {
         try writeLock.withLock {
-            let sequence = lock.withLock { () -> UInt64 in
-                var state = channels[channel.rawValue] ?? ChannelState()
-                let value = state.nextOutgoing; state.nextOutgoing += 1; channels[channel.rawValue] = state
-                return value
+            guard let descriptor = descriptorOwner.descriptor else {
+                throw HostDataPlaneServerProtocolError(.requestCancelled)
             }
-            try writeFrame(calls, descriptor, channel: channel, sequence: sequence, acknowledgement: acknowledgement, payload: payload)
+            let frameState = try lock.withLock { () -> (UInt64, UInt64) in
+                var state = channels[channel.rawValue] ?? ChannelState()
+                guard case let .value(sequence) = hostDataPlaneAdvanceSequence(
+                    state.lastOutgoing
+                ) else {
+                    throw HostDataPlaneServerProtocolError(.sequenceViolation)
+                }
+                state.lastOutgoing = sequence
+                state.lastOutgoingAcknowledgement = max(
+                    state.lastOutgoingAcknowledgement,
+                    acknowledgement
+                )
+                channels[channel.rawValue] = state
+                return (sequence, state.lastOutgoingAcknowledgement)
+            }
+            try writeFrame(
+                calls,
+                descriptor,
+                channel: channel,
+                sequence: frameState.0,
+                acknowledgement: frameState.1,
+                payload: payload
+            )
         }
     }
-    private func cancelSubscriptions() {
+    private func cancelSubscription(_ subscriptionID: String) {
+        let snapshot = lock.withLock { () -> (Task<Void, Never>?, [CheckedContinuation<Void, any Error>]) in
+            let task = subscriptionTasks.removeValue(forKey: subscriptionID)
+            let matching = acknowledgementWaiters.filter {
+                $0.value.subscriptionID == subscriptionID
+            }
+            for key in matching.keys { acknowledgementWaiters.removeValue(forKey: key) }
+            return (task, matching.values.map(\.continuation))
+        }
+        snapshot.0?.cancel()
+        snapshot.1.forEach {
+            $0.resume(throwing: HostDataPlaneClientError.requestCancelled)
+        }
+    }
+    private func cancelSubscriptions() -> [Task<Void, Never>] {
         let snapshot = lock.withLock { () -> ([Task<Void, Never>], [CheckedContinuation<Void, any Error>]) in
             let tasks = Array(subscriptionTasks.values)
             let waiters = acknowledgementWaiters.values.map(\.continuation)
@@ -643,7 +716,10 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
             return (tasks, waiters)
         }
         snapshot.0.forEach { $0.cancel() }
-        snapshot.1.forEach { $0.resume() }
+        snapshot.1.forEach {
+            $0.resume(throwing: HostDataPlaneClientError.requestCancelled)
+        }
+        return snapshot.0
     }
 }
 
@@ -708,10 +784,11 @@ func readFrame(_ calls: any UnixDomainSocketSystemCalls, _ descriptor: Int32) th
 
 func readFrameAsync(
     _ calls: any UnixDomainSocketSystemCalls,
-    _ descriptor: Int32
+    _ descriptor: Int32,
+    queue: DispatchQueue
 ) async throws -> Frame {
     try await withCheckedThrowingContinuation { continuation in
-        DispatchQueue.global().async {
+        queue.async {
             do { continuation.resume(returning: try readFrame(calls, descriptor)) }
             catch { continuation.resume(throwing: error) }
         }
@@ -724,10 +801,11 @@ private struct HostDataPlaneMalformedFrameError: Error {
 
 private func readServerFrameAsync(
     _ calls: any UnixDomainSocketSystemCalls,
-    _ descriptor: Int32
+    _ descriptor: Int32,
+    queue: DispatchQueue
 ) async throws -> Frame {
     try await withCheckedThrowingContinuation { continuation in
-        DispatchQueue.global().async {
+        queue.async {
             do {
                 let headerData = try readExactly(
                     calls,

@@ -3,6 +3,48 @@ import CockpitHostCore
 import CockpitProtocol
 import CockpitTypes
 
+package final class HostShutdownCoordinator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    private let ticketIssuer: HostDataPlaneTicketIssuer
+    private let dataPlaneServer: HostDataPlaneServer
+    private let invalidateListener: () -> Void
+    private let stopProcess: () -> Void
+
+    package init(
+        ticketIssuer: HostDataPlaneTicketIssuer,
+        dataPlaneServer: HostDataPlaneServer,
+        invalidateListener: @escaping () -> Void,
+        stopProcess: @escaping () -> Void
+    ) {
+        self.ticketIssuer = ticketIssuer
+        self.dataPlaneServer = dataPlaneServer
+        self.invalidateListener = invalidateListener
+        self.stopProcess = stopProcess
+    }
+
+    package func shutdown() async {
+        let begins = lock.withLock {
+            guard !started else { return false }
+            started = true
+            return true
+        }
+        guard begins else { return }
+        await ticketIssuer.stopIssuingTickets()
+        await dataPlaneServer.shutdown()
+        invalidateListener()
+        stopProcess()
+    }
+
+    package func handleTermination() {
+        Task { await shutdown() }
+    }
+
+    package var eventHandler: @Sendable () -> Void {
+        { [weak self] in self?.handleTermination() }
+    }
+}
+
 public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable {
     public typealias HandshakeHandler =
         @Sendable (CPHandshakeRequest) throws -> CPHandshakeResponse
@@ -36,7 +78,7 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
             guard message.unknownFields.data.isEmpty, message.hasContext else {
                 throw CocoaError(.coderInvalidValue)
             }
-            context = try WorkspaceMessages.decode(message.context, negotiatedVersion: .current)
+            context = try exactTicketRequestContext(message.context)
         } catch {
             reply.complete(data: nil, error: ticketError(code: 2))
             return
@@ -85,6 +127,23 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
 
 private func ticketError(code: Int) -> NSError {
     NSError(domain: "dev.cockpit.host-data-plane-ticket", code: code, userInfo: [:])
+}
+
+private func exactTicketRequestContext(_ wire: CPRequestContext) throws -> RequestContext {
+    guard wire.activeContextGeneration > 0,
+          wire.activeContextGeneration <= documentJavaScriptMaximum else {
+        throw CocoaError(.coderInvalidValue)
+    }
+    let decoded = try WorkspaceMessages.decode(wire, negotiatedVersion: .current)
+    let canonical = try WorkspaceMessages.encode(decoded, negotiatedVersion: .current)
+    guard wire.clientInstanceID == canonical.clientInstanceID,
+          wire.windowID == canonical.windowID,
+          wire.workspaceContextID.kind == canonical.workspaceContextID.kind,
+          wire.environmentID == canonical.environmentID,
+          wire.requestID == canonical.requestID else {
+        throw CocoaError(.coderInvalidValue)
+    }
+    return decoded
 }
 
 private final class XPCWorkspaceReply: @unchecked Sendable {
