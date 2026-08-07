@@ -40,7 +40,15 @@ actor FileOperationCoordinator {
                 try Task.checkCancellation()
             }
             let lease = try await fileTreeProvider.acquireExternalMutationLease()
-            let documentMutationLease = await documentRegistry?.acquireInternalMutationLease()
+            let documentMutationLease: DocumentInternalMutationLease?
+            if let relocation {
+                documentMutationLease = await documentRegistry?.acquireInternalMutationLease(
+                    from: relocation.source,
+                    to: relocation.destination
+                )
+            } else {
+                documentMutationLease = await documentRegistry?.acquireInternalMutationLease()
+            }
             do {
                 try Task.checkCancellation()
                 let physical = try await rootHandle.perform(operation)

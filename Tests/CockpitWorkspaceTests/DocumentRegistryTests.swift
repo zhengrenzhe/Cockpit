@@ -49,7 +49,65 @@ import CockpitTypes
     #expect((await actor.snapshot()).text == "after")
 }
 
-final class DocumentRegistryFixture {
+@Test func documentRegistryConcurrentOpenIsSingleFlight() async throws {
+    let fixture = try DocumentRegistryFixture()
+    defer { fixture.remove() }
+    let path = try RelativePath("document.txt")
+    try Data("content".utf8).write(to: fixture.root.appendingPathComponent(path.string))
+    await fixture.repository.blockNextFindOrCreate()
+
+    let first = Task { try await fixture.registry.open(at: path) }
+    await fixture.repository.waitUntilFindOrCreateBlocks()
+    let second = Task { try await fixture.registry.open(at: path) }
+    for _ in 0..<20 { await Task.yield() }
+    await fixture.repository.releaseFindOrCreate()
+
+    let firstActor = try await first.value
+    let secondActor = try await second.value
+    #expect(firstActor === secondActor)
+    #expect(await fixture.repository.findOrCreateCount == 1)
+    _ = try await firstActor.acquireEditLease(client: ClientInstanceID())
+    await #expect(throws: DocumentProtocolError.leaseHeld) {
+        _ = try await secondActor.acquireEditLease(client: ClientInstanceID())
+    }
+}
+
+@Test func documentRegistryMutationScopeDefersDestinationOpenUntilRelocation() async throws {
+    let fixture = try DocumentRegistryFixture()
+    defer { fixture.remove() }
+    let source = try RelativePath("old.txt")
+    let destination = try RelativePath("new.txt")
+    try Data("content".utf8).write(to: fixture.root.appendingPathComponent(source.string))
+    let original = try await fixture.registry.open(at: source)
+    let originalID = (await original.snapshot()).documentID
+    let findCountBeforeMutation = await fixture.repository.findOrCreateCount
+    let lease = await fixture.registry.acquireInternalMutationLease(
+        from: source,
+        to: destination
+    )
+    try FileManager.default.moveItem(
+        at: fixture.root.appendingPathComponent(source.string),
+        to: fixture.root.appendingPathComponent(destination.string)
+    )
+
+    let destinationOpen = Task { try await fixture.registry.open(at: destination) }
+    for _ in 0..<50 { await Task.yield() }
+    #expect(await fixture.repository.findOrCreateCount == findCountBeforeMutation)
+    try await fixture.repository.relocateDocumentLocators(
+        in: fixture.environmentID,
+        from: source,
+        to: destination
+    )
+    await fixture.registry.relocateOpenDocuments(from: source, to: destination)
+    await fixture.registry.releaseInternalMutationLease(lease)
+
+    let moved = try await destinationOpen.value
+    #expect(moved === original)
+    #expect((await moved.snapshot()).documentID == originalID)
+    #expect(await fixture.repository.documentCount == 2)
+}
+
+final class DocumentRegistryFixture: @unchecked Sendable {
     let root: URL
     let recoveryRoot: URL
     let environmentID = EnvironmentID()

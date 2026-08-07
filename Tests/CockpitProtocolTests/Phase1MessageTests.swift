@@ -113,6 +113,32 @@ import CockpitTypes
     }
 }
 
+@Test func documentEditingSnapshotAndAcknowledgementRejectSequenceAboveVersion() throws {
+    let documentID = DocumentID(try protocolUUID(23))
+    #expect(throws: DocumentProtocolError.invalidValue) {
+        _ = try EditAcknowledgement(
+            validatingDocumentID: documentID,
+            clientSequence: 2,
+            documentVersion: 1
+        )
+    }
+    #expect(throws: DocumentProtocolError.invalidValue) {
+        _ = try DocumentSnapshot(
+            validatingDocumentID: documentID,
+            environmentID: EnvironmentID(try protocolUUID(24)),
+            relativePath: RelativePath("document.txt"),
+            text: "",
+            documentVersion: 1,
+            persistedVersion: 0,
+            lastAcceptedClientSequence: 2,
+            dirtyState: .dirty,
+            observedDiskFingerprint: nil,
+            currentLease: nil,
+            maintenance: []
+        )
+    }
+}
+
 @Test func documentRecoveryMapperRejectsFrozenMalformedFieldsAndUnknownFields() throws {
     let record = try DocumentRecoveryRecord(
         documentID: DocumentID(try #require(UUID(uuidString: "00000000-0000-0000-0000-abcdefabcdef"))),

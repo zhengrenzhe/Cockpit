@@ -116,7 +116,8 @@ public struct EditAcknowledgement: Hashable, Sendable {
     ) throws {
         guard clientSequence > 0,
               clientSequence <= documentJavaScriptMaximum,
-              documentVersion <= documentJavaScriptMaximum
+              documentVersion <= documentJavaScriptMaximum,
+              clientSequence <= documentVersion
         else { throw DocumentProtocolError.invalidValue }
         self.documentID = documentID
         self.clientSequence = clientSequence
@@ -153,6 +154,7 @@ public struct DocumentSnapshot: Hashable, Sendable {
         guard documentVersion <= documentJavaScriptMaximum,
               persistedVersion <= documentVersion,
               lastAcceptedClientSequence <= documentJavaScriptMaximum,
+              lastAcceptedClientSequence <= documentVersion,
               !text.contains("\r"),
               !text.contains("\0"),
               currentLease?.documentID == documentID || currentLease == nil

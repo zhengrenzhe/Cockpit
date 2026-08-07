@@ -239,6 +239,159 @@ import CockpitTypes
     #expect(saved.maintenance.contains(.compactionDeferred))
 }
 
+@Test func documentActorDiscardMetadataFailureCommitsCheckpointStateAndFailsClosed() async throws {
+    let fixture = try DocumentActorFixture(text: "disk")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    _ = try await actor.apply(EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: lease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 4, length: 0, replacement: " dirty")]
+    ))
+    try Data("replacement".utf8).write(to: fixture.documentURL)
+    await fixture.repository.failNextCompareAndSet()
+
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await actor.discard()
+    }
+    let committed = await actor.snapshot()
+    #expect(committed.text == "replacement")
+    #expect(committed.documentVersion == 2)
+    #expect(committed.persistedVersion == 2)
+    #expect(committed.dirtyState == .clean)
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await actor.apply(EditTransaction(
+            validatingDocumentID: fixture.metadata.documentID,
+            editLeaseID: lease.id,
+            baseVersion: 1,
+            clientSequence: 2,
+            changes: [try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "lost")]
+        ))
+    }
+
+    let restarted = try await fixture.openActor()
+    let repaired = await restarted.snapshot()
+    #expect(repaired.text == "replacement")
+    #expect(repaired.documentVersion == 2)
+    #expect(repaired.persistedVersion == 2)
+    #expect(repaired.dirtyState == .clean)
+}
+
+@Test func documentActorRejectsRecordsWithoutValidCheckpoint() async throws {
+    for corruptCheckpoint in [false, true] {
+        let fixture = try DocumentActorFixture(text: "disk")
+        defer { fixture.remove() }
+        if corruptCheckpoint {
+            try Data("corrupt-checkpoint".utf8).write(to: fixture.checkpointURL)
+        }
+        let transaction = try EditTransaction(
+            validatingDocumentID: fixture.metadata.documentID,
+            editLeaseID: EditLeaseID(),
+            baseVersion: 0,
+            clientSequence: 1,
+            changes: [try UTF16TextEdit(validatingOffset: 4, length: 0, replacement: " accepted")]
+        )
+        try await fixture.recoveryLog.append(
+            documentVersion: 1,
+            clientSequence: 1,
+            utf8EditPayload: DocumentEditing.encodeRecoveryPayload(transaction)
+        )
+        await #expect(throws: DocumentProtocolError.recoveryRequired) {
+            _ = try await fixture.openActor()
+        }
+        if corruptCheckpoint {
+            #expect(try Data(contentsOf: fixture.checkpointURL) == Data("corrupt-checkpoint".utf8))
+        } else {
+            #expect(!FileManager.default.fileExists(atPath: fixture.checkpointURL.path))
+        }
+    }
+}
+
+@Test func documentActorRecoveredLastRetryPrecedesReplacementLeaseValidation() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let first = try await fixture.openActor()
+    let historicalLease = try await first.acquireEditLease(client: fixture.clientID)
+    let transaction = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: historicalLease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "d")]
+    )
+    let acknowledgement = try await first.apply(transaction)
+
+    let restarted = try await fixture.openActor()
+    #expect(try await restarted.apply(transaction) == acknowledgement)
+    _ = try await restarted.acquireEditLease(client: ClientInstanceID())
+    #expect(try await restarted.apply(transaction) == acknowledgement)
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await restarted.apply(EditTransaction(
+            validatingDocumentID: fixture.metadata.documentID,
+            editLeaseID: historicalLease.id,
+            baseVersion: 1,
+            clientSequence: 2,
+            changes: [try UTF16TextEdit(validatingOffset: 4, length: 0, replacement: "e")]
+        ))
+    }
+    #expect((try await fixture.recoveryLog.recover()).records.count == 1)
+}
+
+@Test func documentActorRecoveryStopsAtSemanticCorruptionAndKeepsPrefix() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    _ = try await fixture.openActor()
+    let leaseID = EditLeaseID()
+    let first = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: leaseID,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "d")]
+    )
+    let corrupt = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: leaseID,
+        baseVersion: 0,
+        clientSequence: 2,
+        changes: [try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "bad")]
+    )
+    let later = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: leaseID,
+        baseVersion: 1,
+        clientSequence: 3,
+        changes: [try UTF16TextEdit(validatingOffset: 4, length: 0, replacement: "later")]
+    )
+    for (version, transaction) in [(UInt64(1), first), (2, corrupt), (3, later)] {
+        try await fixture.recoveryLog.append(
+            documentVersion: version,
+            clientSequence: transaction.clientSequence,
+            utf8EditPayload: DocumentEditing.encodeRecoveryPayload(transaction)
+        )
+    }
+
+    let recovered = try await fixture.openActor()
+    let snapshot = await recovered.snapshot()
+    #expect(snapshot.text == "abcd")
+    #expect(snapshot.documentVersion == 1)
+    #expect(snapshot.lastAcceptedClientSequence == 1)
+    #expect(snapshot.maintenance.contains(.corruptRecoveryRecord))
+}
+
+@Test func documentActorDiscardMapsMissingFile() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    try FileManager.default.removeItem(at: fixture.documentURL)
+    await #expect(throws: DocumentProtocolError.fileMissing) {
+        _ = try await actor.discard()
+    }
+}
+
 private final class DocumentActorFixture: @unchecked Sendable {
     let root: URL
     let recoveryRoot: URL
@@ -249,6 +402,9 @@ private final class DocumentActorFixture: @unchecked Sendable {
     let repository: TestDocumentMetadataRepository
     let serving: WorkspaceRootHandle
     let recoveryLog: DocumentRecoveryLog
+    var checkpointURL: URL {
+        recoveryRoot.appendingPathComponent("\(metadata.documentID.description).checkpoint.ckdr")
+    }
 
     init(text: String, recoverySystemCalls: RecoveryLogSystemCalls? = nil) throws {
         root = URL(fileURLWithPath: "/private/tmp/cockpit-document-actor.\(UUID().uuidString)", isDirectory: true)
@@ -298,10 +454,21 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
     private var blockStarted: [CheckedContinuation<Void, Never>] = []
     private var releaseBlock: CheckedContinuation<Void, Never>?
     private(set) var compareAndSetCount = 0
+    private(set) var findOrCreateCount = 0
+    private var blockNextFind = false
+    private var findBlockStarted: [CheckedContinuation<Void, Never>] = []
+    private var releaseFindBlock: CheckedContinuation<Void, Never>?
 
     init(_ metadata: DocumentMetadata) { metadataByID = [metadata.documentID: metadata] }
 
-    func findOrCreateDocument(in environmentID: EnvironmentID, at path: RelativePath) throws -> DocumentMetadata {
+    func findOrCreateDocument(in environmentID: EnvironmentID, at path: RelativePath) async throws -> DocumentMetadata {
+        findOrCreateCount += 1
+        if blockNextFind {
+            blockNextFind = false
+            findBlockStarted.forEach { $0.resume() }
+            findBlockStarted.removeAll()
+            await withCheckedContinuation { releaseFindBlock = $0 }
+        }
         if let existing = metadataByID.values.first(where: {
             $0.environmentID == environmentID && $0.relativePath == path
         }) { return existing }
@@ -343,6 +510,30 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
         metadataByID[metadata.documentID] = metadata
     }
 
+    func relocateDocumentLocators(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) throws {
+        for (id, value) in metadataByID where value.environmentID == environmentID {
+            let replacement: String
+            if value.relativePath == source {
+                replacement = destination.string
+            } else if value.relativePath.string.hasPrefix(source.string + "/") {
+                replacement = destination.string + value.relativePath.string.dropFirst(source.string.count)
+            } else { continue }
+            metadataByID[id] = try DocumentMetadata(
+                validatingDocumentID: id,
+                environmentID: environmentID,
+                relativePath: RelativePath(replacement),
+                documentVersion: value.documentVersion,
+                persistedVersion: value.persistedVersion,
+                dirtyState: value.dirtyState,
+                editLeaseID: value.editLeaseID
+            )
+        }
+    }
+
     func failNextCompareAndSet() { failNext = true }
     func blockNextCompareAndSet() { blockNext = true }
     func waitUntilCompareAndSetBlocks() async {
@@ -350,6 +541,13 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
         await withCheckedContinuation { blockStarted.append($0) }
     }
     func releaseCompareAndSet() { releaseBlock?.resume(); releaseBlock = nil }
+    func blockNextFindOrCreate() { blockNextFind = true }
+    func waitUntilFindOrCreateBlocks() async {
+        if releaseFindBlock != nil { return }
+        await withCheckedContinuation { findBlockStarted.append($0) }
+    }
+    func releaseFindOrCreate() { releaseFindBlock?.resume(); releaseFindBlock = nil }
+    var documentCount: Int { metadataByID.count }
 }
 
 private final class DocumentActorRenameCounter: @unchecked Sendable {

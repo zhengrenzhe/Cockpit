@@ -82,6 +82,7 @@ public actor DocumentActor {
         var dirty: DocumentDirtyState
         var lastTransaction: EditTransaction?
         var lastAcknowledgement: EditAcknowledgement?
+        var didReplayRecord = false
 
         if let checkpoint = recovered.checkpoint {
             decoded = try DocumentCodec.decode(DocumentFileSnapshot(
@@ -96,22 +97,28 @@ public actor DocumentActor {
             persistedVersion = checkpoint.persistedDocumentVersion
             sequence = checkpoint.persistedClientSequence
             for record in recovered.records {
-                let transaction = try DocumentEditing.decodeRecoveryPayload(record.utf8EditPayload)
-                guard transaction.documentID == metadata.documentID,
-                      transaction.baseVersion == version,
-                      transaction.clientSequence == sequence + 1,
-                      record.documentVersion == version + 1,
-                      record.clientSequence == transaction.clientSequence
-                else { throw DocumentProtocolError.recoveryRequired }
-                restoredBuffer = try applying(transaction.changes, to: restoredBuffer)
-                version = record.documentVersion
-                sequence = record.clientSequence
-                lastTransaction = transaction
-                lastAcknowledgement = try EditAcknowledgement(
-                    validatingDocumentID: metadata.documentID,
-                    clientSequence: sequence,
-                    documentVersion: version
-                )
+                do {
+                    let transaction = try DocumentEditing.decodeRecoveryPayload(record.utf8EditPayload)
+                    guard transaction.documentID == metadata.documentID,
+                          transaction.baseVersion == version,
+                          transaction.clientSequence == sequence + 1,
+                          record.documentVersion == version + 1,
+                          record.clientSequence == transaction.clientSequence
+                    else { throw DocumentProtocolError.recoveryRequired }
+                    restoredBuffer = try applying(transaction.changes, to: restoredBuffer)
+                    version = record.documentVersion
+                    sequence = record.clientSequence
+                    lastTransaction = transaction
+                    lastAcknowledgement = try EditAcknowledgement(
+                        validatingDocumentID: metadata.documentID,
+                        clientSequence: sequence,
+                        documentVersion: version
+                    )
+                    didReplayRecord = true
+                } catch {
+                    maintenance.append(.corruptRecoveryRecord)
+                    break
+                }
             }
             decoded = DecodedDocument(
                 text: restoredBuffer.text,
@@ -122,20 +129,17 @@ public actor DocumentActor {
             if let disk {
                 if disk.fingerprint != checkpoint.diskFingerprint {
                     dirty = .conflict
-                } else if !recovered.records.isEmpty {
+                } else if didReplayRecord {
                     dirty = .dirty
-                } else if metadata.dirtyState == .clean,
-                          metadata.documentVersion == checkpoint.persistedDocumentVersion,
-                          metadata.persistedVersion == checkpoint.persistedDocumentVersion {
-                    dirty = .clean
                 } else {
-                    dirty = .conflict
+                    dirty = .clean
                 }
             } else {
                 dirty = .missing
             }
         } else {
-            guard metadata.documentVersion == 0,
+            guard recovered.records.isEmpty,
+                  metadata.documentVersion == 0,
                   metadata.persistedVersion == 0,
                   metadata.dirtyState == .clean
             else { throw DocumentProtocolError.recoveryRequired }
@@ -245,16 +249,15 @@ public actor DocumentActor {
         await enterOperation()
         defer { leaveOperation() }
         try requireOperational()
-        guard transaction.documentID == metadata.documentID,
-              transaction.editLeaseID == currentLease?.id
-        else { throw DocumentProtocolError.invalidLease }
-
         if transaction.clientSequence == lastAcceptedClientSequence {
             guard transaction == lastTransaction, let lastAcknowledgement else {
                 throw DocumentProtocolError.duplicateMismatch
             }
             return lastAcknowledgement
         }
+        guard transaction.documentID == metadata.documentID,
+              transaction.editLeaseID == currentLease?.id
+        else { throw DocumentProtocolError.invalidLease }
         let expectedSequence = lastAcceptedClientSequence + 1
         guard transaction.clientSequence == expectedSequence else {
             if transaction.clientSequence < expectedSequence { throw DocumentProtocolError.staleSequence }
@@ -382,33 +385,54 @@ public actor DocumentActor {
         await enterOperation()
         defer { leaveOperation() }
         try requireOperational()
-        let disk = try await documentServing.readDocument(at: metadata.relativePath)
+        let disk: DocumentFileSnapshot
+        do {
+            disk = try await documentServing.readDocument(at: metadata.relativePath)
+        } catch {
+            guard Self.isMissingFileError(error) else { throw error }
+            throw DocumentProtocolError.fileMissing
+        }
         let decoded = try DocumentCodec.decode(disk)
         guard metadata.documentVersion < documentJavaScriptMaximum else {
             throw DocumentProtocolError.invalidValue
         }
         let nextVersion = metadata.documentVersion + 1
-        if let diagnostic = try await recoveryLog.checkpoint(
+        let diagnostic = try await recoveryLog.checkpoint(
             persistedDocumentVersion: nextVersion,
             persistedClientSequence: lastAcceptedClientSequence,
             diskFingerprint: disk.fingerprint,
             persistedDocumentBytes: disk.data
-        ) { addMaintenance(Self.maintenanceState(diagnostic)) }
+        )
         let old = metadata
         let replacement = try replacingMetadata(
             documentVersion: nextVersion,
             persistedVersion: nextVersion,
             dirtyState: .clean
         )
-        try await metadataRepository.compareAndSetDocumentMetadata(
-            replacement,
-            expectedDocumentVersion: old.documentVersion,
-            expectedEditLeaseID: old.editLeaseID
+        let replacementBuffer = try DocumentTextBuffer(
+            validatingText: decoded.text,
+            lineEndings: decoded.lineEndings
         )
-        buffer = try DocumentTextBuffer(validatingText: decoded.text, lineEndings: decoded.lineEndings)
+        do {
+            try await metadataRepository.compareAndSetDocumentMetadata(
+                replacement,
+                expectedDocumentVersion: old.documentVersion,
+                expectedEditLeaseID: old.editLeaseID
+            )
+        } catch {
+            buffer = replacementBuffer
+            signature = decoded.signature
+            observedFingerprint = disk.fingerprint
+            metadata = replacement
+            if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
+            recoveryRequired = true
+            throw DocumentProtocolError.recoveryRequired
+        }
+        buffer = replacementBuffer
         signature = decoded.signature
         observedFingerprint = disk.fingerprint
         metadata = replacement
+        if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
         return snapshot()
     }
 
