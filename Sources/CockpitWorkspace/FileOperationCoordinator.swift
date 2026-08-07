@@ -31,15 +31,6 @@ actor FileOperationCoordinator {
             if let recoveryRequired { throw recoveryRequired }
             try Task.checkCancellation()
             let relocation = try operation.validatedRelocation
-            if let relocation {
-                try await documentLocatorUpdater.preflightDocumentLocatorRelocation(
-                    in: environmentID,
-                    from: relocation.source,
-                    to: relocation.destination
-                )
-                try Task.checkCancellation()
-            }
-            let lease = try await fileTreeProvider.acquireExternalMutationLease()
             let documentMutationLease: DocumentInternalMutationLease?
             if let relocation {
                 documentMutationLease = await documentRegistry?.acquireInternalMutationLease(
@@ -50,6 +41,16 @@ actor FileOperationCoordinator {
                 documentMutationLease = await documentRegistry?.acquireInternalMutationLease()
             }
             do {
+                if let relocation {
+                    try await documentLocatorUpdater.preflightDocumentLocatorRelocation(
+                        in: environmentID,
+                        from: relocation.source,
+                        to: relocation.destination
+                    )
+                    try Task.checkCancellation()
+                }
+                let lease = try await fileTreeProvider.acquireExternalMutationLease()
+                do {
                 try Task.checkCancellation()
                 let physical = try await rootHandle.perform(operation)
                 let completion = Task { [documentLocatorUpdater, environmentID, fileTreeProvider, documentRegistry] in
@@ -91,15 +92,23 @@ actor FileOperationCoordinator {
                     )
                     recoveryRequired = fatal
                     if let documentMutationLease {
-                        await documentRegistry?.releaseInternalMutationLease(documentMutationLease)
+                        await documentRegistry?.failInternalMutationLease(documentMutationLease)
                     }
                     throw fatal
                 }
-            } catch {
-                await fileTreeProvider.cancelExternalMutation(lease)
-                if let fatal = error as? FileOperationRecoveryRequiredError {
-                    recoveryRequired = fatal
+                } catch {
+                    await fileTreeProvider.cancelExternalMutation(lease)
+                    if let fatal = error as? FileOperationRecoveryRequiredError {
+                        recoveryRequired = fatal
+                        if let documentMutationLease {
+                            await documentRegistry?.failInternalMutationLease(documentMutationLease)
+                        }
+                    } else if let documentMutationLease {
+                        await documentRegistry?.releaseInternalMutationLease(documentMutationLease)
+                    }
+                    throw error
                 }
+            } catch {
                 if let documentMutationLease {
                     await documentRegistry?.releaseInternalMutationLease(documentMutationLease)
                 }

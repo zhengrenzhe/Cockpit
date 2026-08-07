@@ -280,6 +280,48 @@ import CockpitTypes
     #expect(repaired.dirtyState == .clean)
 }
 
+@Test func documentActorDiscardPostRenameCheckpointFailureFailsClosed() async throws {
+    let fsyncFailure = DocumentActorDirectoryFsyncFailure()
+    let fixture = try DocumentActorFixture(
+        text: "disk",
+        recoverySystemCalls: RecoveryLogSystemCalls(
+            write: { Darwin.write($0, $1, $2) },
+            fsync: { fsyncFailure.call($0) },
+            rename: { Darwin.rename($0, $1) }
+        )
+    )
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    _ = try await actor.apply(EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: lease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 4, length: 0, replacement: " dirty")]
+    ))
+    try Data("replacement".utf8).write(to: fixture.documentURL)
+    fsyncFailure.failNextDirectorySync()
+
+    await #expect(throws: (any Error).self) { _ = try await actor.discard() }
+    #expect(FileManager.default.fileExists(atPath: fixture.checkpointURL.path))
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await actor.apply(EditTransaction(
+            validatingDocumentID: fixture.metadata.documentID,
+            editLeaseID: lease.id,
+            baseVersion: 1,
+            clientSequence: 2,
+            changes: [try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "lost")]
+        ))
+    }
+
+    let restarted = try await fixture.openActor()
+    let snapshot = await restarted.snapshot()
+    #expect(snapshot.text == "replacement")
+    #expect(snapshot.documentVersion == 2)
+    #expect(snapshot.lastAcceptedClientSequence == 1)
+}
+
 @Test func documentActorRejectsRecordsWithoutValidCheckpoint() async throws {
     for corruptCheckpoint in [false, true] {
         let fixture = try DocumentActorFixture(text: "disk")
@@ -380,6 +422,51 @@ import CockpitTypes
     #expect(snapshot.documentVersion == 1)
     #expect(snapshot.lastAcceptedClientSequence == 1)
     #expect(snapshot.maintenance.contains(.corruptRecoveryRecord))
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await recovered.acquireEditLease(client: ClientInstanceID())
+    }
+
+    let restarted = try await fixture.openActor()
+    let restartedSnapshot = await restarted.snapshot()
+    #expect(restartedSnapshot.text == "abcd")
+    #expect(restartedSnapshot.maintenance.contains(.corruptRecoveryRecord))
+}
+
+@Test func documentActorFirstSemanticCorruptRecordFailsClosed() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    _ = try await fixture.openActor()
+    let leaseID = EditLeaseID()
+    let corrupt = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: leaseID,
+        baseVersion: 1,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "bad")]
+    )
+    let later = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: leaseID,
+        baseVersion: 1,
+        clientSequence: 2,
+        changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "later")]
+    )
+    for (version, transaction) in [(UInt64(1), corrupt), (2, later)] {
+        try await fixture.recoveryLog.append(
+            documentVersion: version,
+            clientSequence: transaction.clientSequence,
+            utf8EditPayload: DocumentEditing.encodeRecoveryPayload(transaction)
+        )
+    }
+
+    let recovered = try await fixture.openActor()
+    let snapshot = await recovered.snapshot()
+    #expect(snapshot.text == "abc")
+    #expect(snapshot.documentVersion == 0)
+    #expect(snapshot.maintenance.contains(.corruptRecoveryRecord))
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await recovered.acquireEditLease(client: ClientInstanceID())
+    }
 }
 
 @Test func documentActorDiscardMapsMissingFile() async throws {
@@ -390,6 +477,32 @@ import CockpitTypes
     await #expect(throws: DocumentProtocolError.fileMissing) {
         _ = try await actor.discard()
     }
+}
+
+@Test func documentActorSaveMetadataFailureRestartsInConflict() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    _ = try await actor.apply(EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: lease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "d")]
+    ))
+    let dirty = await actor.snapshot()
+    await fixture.repository.failNextCompareAndSet()
+
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await actor.save(expectedFingerprint: try #require(dirty.observedDiskFingerprint))
+    }
+    let restarted = try await fixture.openActor()
+    let snapshot = await restarted.snapshot()
+    #expect(snapshot.text == "abcd")
+    #expect(snapshot.documentVersion == 1)
+    #expect(snapshot.persistedVersion == 1)
+    #expect(snapshot.dirtyState == .conflict)
 }
 
 private final class DocumentActorFixture: @unchecked Sendable {
@@ -458,6 +571,10 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
     private var blockNextFind = false
     private var findBlockStarted: [CheckedContinuation<Void, Never>] = []
     private var releaseFindBlock: CheckedContinuation<Void, Never>?
+    private var relocationError: NSError?
+    private var blockRelocation = false
+    private var relocationBlockStarted: [CheckedContinuation<Void, Never>] = []
+    private var releaseRelocationBlock: CheckedContinuation<Void, Never>?
 
     init(_ metadata: DocumentMetadata) { metadataByID = [metadata.documentID: metadata] }
 
@@ -514,7 +631,17 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
         in environmentID: EnvironmentID,
         from source: RelativePath,
         to destination: RelativePath
-    ) throws {
+    ) async throws {
+        if blockRelocation {
+            blockRelocation = false
+            relocationBlockStarted.forEach { $0.resume() }
+            relocationBlockStarted.removeAll()
+            await withCheckedContinuation { releaseRelocationBlock = $0 }
+        }
+        if let relocationError {
+            self.relocationError = nil
+            throw relocationError
+        }
         for (id, value) in metadataByID where value.environmentID == environmentID {
             let replacement: String
             if value.relativePath == source {
@@ -547,6 +674,15 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
         await withCheckedContinuation { findBlockStarted.append($0) }
     }
     func releaseFindOrCreate() { releaseFindBlock?.resume(); releaseFindBlock = nil }
+    func blockNextRelocation(error: NSError) {
+        blockRelocation = true
+        relocationError = error
+    }
+    func waitUntilRelocationBlocks() async {
+        if releaseRelocationBlock != nil { return }
+        await withCheckedContinuation { relocationBlockStarted.append($0) }
+    }
+    func releaseRelocation() { releaseRelocationBlock?.resume(); releaseRelocationBlock = nil }
     var documentCount: Int { metadataByID.count }
 }
 
@@ -556,4 +692,27 @@ private final class DocumentActorRenameCounter: @unchecked Sendable {
     private let failAt: Int
     init(failAt: Int) { self.failAt = failAt }
     func nextShouldFail() -> Bool { lock.withLock { count += 1; return count == failAt } }
+}
+
+private final class DocumentActorDirectoryFsyncFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+
+    func failNextDirectorySync() {
+        lock.withLock { armed = true }
+    }
+
+    func call(_ descriptor: Int32) -> Int32 {
+        lock.withLock {
+            var status = stat()
+            if armed,
+               fstat(descriptor, &status) == 0,
+               status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
+                armed = false
+                errno = EIO
+                return -1
+            }
+            return Darwin.fsync(descriptor)
+        }
+    }
 }

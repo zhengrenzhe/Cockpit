@@ -44,7 +44,8 @@ public actor DocumentActor {
         lastAcceptedClientSequence: UInt64,
         maintenance: [DocumentMaintenanceState],
         lastTransaction: EditTransaction?,
-        lastAcknowledgement: EditAcknowledgement?
+        lastAcknowledgement: EditAcknowledgement?,
+        recoveryRequired: Bool
     ) {
         self.metadata = metadata
         self.documentServing = documentServing
@@ -58,6 +59,7 @@ public actor DocumentActor {
         self.maintenance = maintenance
         self.lastTransaction = lastTransaction
         self.lastAcknowledgement = lastAcknowledgement
+        self.recoveryRequired = recoveryRequired
     }
 
     public static func open(
@@ -83,6 +85,12 @@ public actor DocumentActor {
         var lastTransaction: EditTransaction?
         var lastAcknowledgement: EditAcknowledgement?
         var didReplayRecord = false
+        var encounteredRecoveryCorruption = recovered.diagnostics.contains { diagnostic in
+            switch diagnostic {
+            case .truncatedTail, .corruptRecord: true
+            case .compactionDeferred: false
+            }
+        }
 
         if let checkpoint = recovered.checkpoint {
             decoded = try DocumentCodec.decode(DocumentFileSnapshot(
@@ -117,6 +125,7 @@ public actor DocumentActor {
                     didReplayRecord = true
                 } catch {
                     maintenance.append(.corruptRecoveryRecord)
+                    encounteredRecoveryCorruption = true
                     break
                 }
             }
@@ -131,6 +140,10 @@ public actor DocumentActor {
                     dirty = .conflict
                 } else if didReplayRecord {
                     dirty = .dirty
+                } else if checkpoint.persistedDocumentVersion == metadata.documentVersion,
+                          metadata.persistedVersion < checkpoint.persistedDocumentVersion,
+                          metadata.dirtyState != .clean {
+                    dirty = .conflict
                 } else {
                     dirty = .clean
                 }
@@ -180,7 +193,8 @@ public actor DocumentActor {
             lastAcceptedClientSequence: sequence,
             maintenance: Array(Set(maintenance)).sorted { $0.rawValue < $1.rawValue },
             lastTransaction: lastTransaction,
-            lastAcknowledgement: lastAcknowledgement
+            lastAcknowledgement: lastAcknowledgement,
+            recoveryRequired: encounteredRecoveryCorruption
         )
     }
 
@@ -397,12 +411,18 @@ public actor DocumentActor {
             throw DocumentProtocolError.invalidValue
         }
         let nextVersion = metadata.documentVersion + 1
-        let diagnostic = try await recoveryLog.checkpoint(
-            persistedDocumentVersion: nextVersion,
-            persistedClientSequence: lastAcceptedClientSequence,
-            diskFingerprint: disk.fingerprint,
-            persistedDocumentBytes: disk.data
-        )
+        let diagnostic: DocumentRecoveryDiagnostic?
+        do {
+            diagnostic = try await recoveryLog.checkpoint(
+                persistedDocumentVersion: nextVersion,
+                persistedClientSequence: lastAcceptedClientSequence,
+                diskFingerprint: disk.fingerprint,
+                persistedDocumentBytes: disk.data
+            )
+        } catch {
+            recoveryRequired = true
+            throw error
+        }
         let old = metadata
         let replacement = try replacingMetadata(
             documentVersion: nextVersion,

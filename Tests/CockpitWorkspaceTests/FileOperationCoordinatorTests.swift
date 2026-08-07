@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 @testable import CockpitWorkspace
 
@@ -188,6 +189,60 @@ import CockpitTypes
         _ = try await coordinator.perform(.createFile(parent: .root, name: "blocked.txt"))
     }
     #expect(!FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent("blocked.txt").path))
+}
+
+@Test func documentRegistryCoordinatorFailureRejectsDestinationOpenWithoutNewIdentity() async throws {
+    let fixture = try CoordinatorTemporaryDirectory()
+    defer { fixture.remove() }
+    let recoveryRoot = fixture.url.appendingPathComponent("recovery", isDirectory: true)
+    try FileManager.default.createDirectory(at: recoveryRoot, withIntermediateDirectories: false)
+    try Data("original".utf8).write(to: fixture.url.appendingPathComponent("old.txt"))
+    let environmentID = EnvironmentID()
+    let metadata = try DocumentMetadata(
+        validatingDocumentID: DocumentID(),
+        environmentID: environmentID,
+        relativePath: RelativePath("old.txt"),
+        documentVersion: 0,
+        persistedVersion: 0,
+        dirtyState: .clean,
+        editLeaseID: nil
+    )
+    let repository = TestDocumentMetadataRepository(metadata)
+    let rootHandle = WorkspaceRootHandle(rootURL: fixture.url)
+    let registry = DocumentRegistry(
+        environmentID: environmentID,
+        documentServing: rootHandle,
+        metadataRepository: repository,
+        recoveryRoot: recoveryRoot
+    )
+    let original = try await registry.open(at: RelativePath("old.txt"))
+    let originalID = (await original.snapshot()).documentID
+    let provider = FileTreeProvider(environmentID: environmentID, rootURL: fixture.url)
+    _ = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
+    let expected = NSError(domain: "Task9.Registry", code: 91)
+    await repository.blockNextRelocation(error: expected)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: rootHandle,
+        documentLocatorUpdater: repository,
+        fileTreeProvider: provider,
+        documentRegistry: registry
+    )
+
+    let operation = Task {
+        try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
+    }
+    await repository.waitUntilRelocationBlocks()
+    let destinationOpen = Task { try await registry.open(at: RelativePath("new.txt")) }
+    for _ in 0..<50 { await Task.yield() }
+    await repository.releaseRelocation()
+
+    await #expect(throws: FileOperationRecoveryRequiredError.self) { _ = try await operation.value }
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await destinationOpen.value
+    }
+    #expect(await repository.documentCount == 1)
+    #expect((await original.snapshot()).documentID == originalID)
 }
 
 @Test func cancellationWhileWaitingForTreeLeaseNeverStartsThePhysicalMutation() async throws {

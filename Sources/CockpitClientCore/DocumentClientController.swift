@@ -12,6 +12,7 @@ public enum DocumentClientControllerState: Hashable, Sendable {
 public actor DocumentClientController {
     private struct PendingEdit {
         let id: UUID
+        let order: UInt64
         let changes: [UTF16TextEdit]
         let continuation: CheckedContinuation<EditAcknowledgement, Error>
     }
@@ -19,6 +20,28 @@ public actor DocumentClientController {
     private struct InFlightEdit {
         let pending: PendingEdit
         let transaction: EditTransaction
+    }
+
+    private struct ControlWaiter {
+        let id: UUID
+        let order: UInt64
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private enum SubmitRequestState {
+        case registering
+        case queued
+        case inFlight
+        case completed
+        case cancelled
+    }
+
+    private enum ControlRequestState {
+        case registering
+        case queued
+        case active
+        case completed
+        case cancelled
     }
 
     public private(set) var state: DocumentClientControllerState = .closed
@@ -32,8 +55,11 @@ public actor DocumentClientController {
     private var pendingEdits: [PendingEdit] = []
     private var inFlight: InFlightEdit?
     private var sendTask: Task<Void, Never>?
-    private var cancelledRequestIDs: Set<UUID> = []
-    private var drainWaiters: [CheckedContinuation<Void, Error>] = []
+    private var controlWaiters: [ControlWaiter] = []
+    private var activeControlID: UUID?
+    private var submitRequestStates: [UUID: SubmitRequestState] = [:]
+    private var controlRequestStates: [UUID: ControlRequestState] = [:]
+    private var nextOperationOrder: UInt64 = 0
 
     public init(
         clientInstanceID: ClientInstanceID,
@@ -49,7 +75,11 @@ public actor DocumentClientController {
         at path: RelativePath,
         requestWriteAccess: Bool
     ) async throws -> DocumentSnapshot {
+        let controlID = try await acquireControl()
+        defer { releaseControl(controlID) }
+        try Task.checkCancellation()
         let snapshot = try await transport.openDocument(in: environmentID, at: path)
+        try Task.checkCancellation()
         self.environmentID = environmentID
         self.path = path
         authoritativeSnapshot = snapshot
@@ -58,6 +88,7 @@ public actor DocumentClientController {
                 documentID: snapshot.documentID,
                 client: clientInstanceID
             )
+            try Task.checkCancellation()
             lease = acquired
             let ready = try snapshotWithLease(snapshot, lease: acquired)
             authoritativeSnapshot = ready
@@ -72,18 +103,28 @@ public actor DocumentClientController {
     public func submit(_ changes: [UTF16TextEdit]) async throws -> EditAcknowledgement {
         try Task.checkCancellation()
         let id = UUID()
+        submitRequestStates[id] = .registering
+        defer { submitRequestStates.removeValue(forKey: id) }
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                enqueue(PendingEdit(id: id, changes: changes, continuation: continuation))
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<EditAcknowledgement, Error>) in
+                enqueue(PendingEdit(
+                    id: id,
+                    order: takeOperationOrder(),
+                    changes: changes,
+                    continuation: continuation
+                ))
             }
         } onCancel: {
-            Task { await self.cancelQueuedEdit(id) }
+            Task { await self.cancelSubmit(id) }
         }
     }
 
     public func flush() async throws -> UInt64 {
         try requireReady()
-        try await waitForDrain()
+        let controlID = try await acquireControl()
+        defer { releaseControl(controlID) }
+        try Task.checkCancellation()
+        try requireReady()
         return try await flushTransport()
     }
 
@@ -92,17 +133,21 @@ public actor DocumentClientController {
         guard let current = authoritativeSnapshot else {
             throw DocumentProtocolError.invalidValue
         }
+        let controlID = try await acquireControl()
+        defer { releaseControl(controlID) }
+        try Task.checkCancellation()
         let replacement = try await transport.snapshot(documentID: current.documentID)
+        try Task.checkCancellation()
         if requestWriteAccess {
             let acquired = try await transport.acquireEditLease(
                 documentID: replacement.documentID,
                 client: clientInstanceID
             )
+            try Task.checkCancellation()
             lease = acquired
             let ready = try snapshotWithLease(replacement, lease: acquired)
             authoritativeSnapshot = ready
             state = .ready(ready)
-            startSendingIfPossible()
         } else {
             lease = nil
             authoritativeSnapshot = replacement
@@ -114,14 +159,22 @@ public actor DocumentClientController {
     @discardableResult
     public func save(expectedFingerprint: DiskFingerprint) async throws -> DocumentSnapshot {
         try requireReady()
-        try await waitForDrain()
+        let controlID = try await acquireControl()
+        defer { releaseControl(controlID) }
+        try Task.checkCancellation()
+        try requireReady()
         _ = try await flushTransport()
+        try Task.checkCancellation()
         guard let current = authoritativeSnapshot else { throw DocumentProtocolError.invalidValue }
         do {
             let replacement = try await transport.save(
                 documentID: current.documentID,
                 expectedFingerprint: expectedFingerprint
             )
+            if Task.isCancelled {
+                enterResynchronizing()
+                throw CancellationError()
+            }
             let ready = try snapshotWithLease(replacement, lease: lease)
             authoritativeSnapshot = ready
             state = .ready(ready)
@@ -136,56 +189,83 @@ public actor DocumentClientController {
     public func discard() async throws -> DocumentSnapshot {
         if case .resynchronizing = state { throw DocumentProtocolError.resynchronizing }
         if case .closed = state { throw DocumentProtocolError.invalidValue }
-        if case .ready = state { try await waitForDrain() }
+        let controlID = try await acquireControl()
+        defer { releaseControl(controlID) }
+        try Task.checkCancellation()
+        if case .resynchronizing = state { throw DocumentProtocolError.resynchronizing }
         guard let current = authoritativeSnapshot else { throw DocumentProtocolError.invalidValue }
-        let replacement = try await transport.discard(documentID: current.documentID)
-        if let lease {
-            let ready = try snapshotWithLease(replacement, lease: lease)
-            authoritativeSnapshot = ready
-            state = .ready(ready)
-        } else {
-            authoritativeSnapshot = replacement
-            state = .readOnly(replacement)
+        do {
+            let replacement = try await transport.discard(documentID: current.documentID)
+            if Task.isCancelled {
+                enterResynchronizing()
+                throw CancellationError()
+            }
+            if let lease {
+                let ready = try snapshotWithLease(replacement, lease: lease)
+                authoritativeSnapshot = ready
+                state = .ready(ready)
+            } else {
+                authoritativeSnapshot = replacement
+                state = .readOnly(replacement)
+            }
+            return replacement
+        } catch {
+            if Self.isAuthoritative(error) { enterResynchronizing() }
+            throw error
         }
-        return replacement
     }
 
     private func enqueue(_ pending: PendingEdit) {
-        if cancelledRequestIDs.remove(pending.id) != nil {
+        if case .cancelled = submitRequestStates[pending.id] {
+            submitRequestStates[pending.id] = .completed
             pending.continuation.resume(throwing: CancellationError())
             return
         }
         do {
             try requireReady()
         } catch {
+            submitRequestStates[pending.id] = .completed
             pending.continuation.resume(throwing: error)
             return
         }
+        submitRequestStates[pending.id] = .queued
         pendingEdits.append(pending)
-        startSendingIfPossible()
+        scheduleNextOperation()
     }
 
-    private func startSendingIfPossible() {
-        guard sendTask == nil,
-              inFlight == nil,
-              !pendingEdits.isEmpty,
-              case .ready = state
-        else { return }
+    private func scheduleNextOperation() {
+        guard sendTask == nil, inFlight == nil, activeControlID == nil else { return }
+        let nextEdit = pendingEdits.first
+        let nextControl = controlWaiters.first
+
+        if let nextControl,
+           nextEdit == nil
+            || nextControl.order < nextEdit!.order
+            || !isReadyState {
+            controlWaiters.removeFirst()
+            activeControlID = nextControl.id
+            controlRequestStates[nextControl.id] = .active
+            nextControl.continuation.resume()
+            return
+        }
+        guard nextEdit != nil, isReadyState else { return }
         sendTask = Task { await self.sendNext() }
     }
 
     private func sendNext() async {
         guard inFlight == nil,
               !pendingEdits.isEmpty,
+              activeControlID == nil,
               case .ready = state,
               let snapshot = authoritativeSnapshot,
               let lease
         else {
             sendTask = nil
-            finishDrainIfPossible()
+            scheduleNextOperation()
             return
         }
         let pending = pendingEdits.removeFirst()
+        submitRequestStates[pending.id] = .inFlight
         let transaction: EditTransaction
         do {
             transaction = try EditTransaction(
@@ -196,13 +276,15 @@ public actor DocumentClientController {
                 changes: pending.changes
             )
         } catch {
+            submitRequestStates[pending.id] = .completed
             pending.continuation.resume(throwing: error)
             sendTask = nil
-            startSendingIfPossible()
+            scheduleNextOperation()
             return
         }
         let current = InFlightEdit(pending: pending, transaction: transaction)
         inFlight = current
+        var retriedAfterTransientFailure = false
         do {
             let acknowledgement: EditAcknowledgement
             do {
@@ -211,6 +293,7 @@ public actor DocumentClientController {
                 guard !Self.isAuthoritative(error), !(error is CancellationError) else {
                     throw error
                 }
+                retriedAfterTransientFailure = true
                 acknowledgement = try await transport.apply(transaction)
             }
             let updated = try DocumentSnapshot(
@@ -229,42 +312,82 @@ public actor DocumentClientController {
             authoritativeSnapshot = updated
             state = .ready(updated)
             inFlight = nil
+            submitRequestStates[current.pending.id] = .completed
             current.pending.continuation.resume(returning: acknowledgement)
         } catch {
             inFlight = nil
+            submitRequestStates[current.pending.id] = .completed
             current.pending.continuation.resume(throwing: error)
-            if Self.isAuthoritative(error) { enterResynchronizing() }
+            if Self.isAuthoritative(error) || retriedAfterTransientFailure {
+                enterResynchronizing()
+            }
         }
         sendTask = nil
-        finishDrainIfPossible()
-        startSendingIfPossible()
+        scheduleNextOperation()
     }
 
-    private func cancelQueuedEdit(_ id: UUID) {
-        if let index = pendingEdits.firstIndex(where: { $0.id == id }) {
-            pendingEdits.remove(at: index).continuation.resume(throwing: CancellationError())
-            finishDrainIfPossible()
-        } else if inFlight?.pending.id != id {
-            cancelledRequestIDs.insert(id)
+    private func cancelSubmit(_ id: UUID) {
+        guard let requestState = submitRequestStates[id] else { return }
+        switch requestState {
+        case .registering:
+            submitRequestStates[id] = .cancelled
+        case .queued:
+            guard let index = pendingEdits.firstIndex(where: { $0.id == id }) else { return }
+            let pending = pendingEdits.remove(at: index)
+            submitRequestStates[id] = .completed
+            pending.continuation.resume(throwing: CancellationError())
+            scheduleNextOperation()
+        case .inFlight, .completed, .cancelled:
+            return
         }
     }
 
-    private func waitForDrain() async throws {
-        if pendingEdits.isEmpty, inFlight == nil { return }
-        try await withCheckedThrowingContinuation { drainWaiters.append($0) }
+    private func acquireControl() async throws -> UUID {
+        try Task.checkCancellation()
+        let id = UUID()
+        controlRequestStates[id] = .registering
+        defer { controlRequestStates.removeValue(forKey: id) }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if case .cancelled = controlRequestStates[id] {
+                    controlRequestStates[id] = .completed
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                controlRequestStates[id] = .queued
+                controlWaiters.append(ControlWaiter(
+                    id: id,
+                    order: takeOperationOrder(),
+                    continuation: continuation
+                ))
+                scheduleNextOperation()
+            }
+        } onCancel: {
+            Task { await self.cancelControl(id) }
+        }
+        return id
     }
 
-    private func finishDrainIfPossible() {
-        guard pendingEdits.isEmpty, inFlight == nil else { return }
-        let waiters = drainWaiters
-        drainWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+    private func cancelControl(_ id: UUID) {
+        guard let requestState = controlRequestStates[id] else { return }
+        switch requestState {
+        case .registering:
+            controlRequestStates[id] = .cancelled
+        case .queued:
+            guard let index = controlWaiters.firstIndex(where: { $0.id == id }) else { return }
+            let waiter = controlWaiters.remove(at: index)
+            controlRequestStates[id] = .completed
+            waiter.continuation.resume(throwing: CancellationError())
+            scheduleNextOperation()
+        case .active, .completed, .cancelled:
+            return
+        }
     }
 
-    private func failDrainWaitersForResynchronization() {
-        let waiters = drainWaiters
-        drainWaiters.removeAll()
-        waiters.forEach { $0.resume(throwing: DocumentProtocolError.resynchronizing) }
+    private func releaseControl(_ id: UUID) {
+        guard activeControlID == id else { return }
+        activeControlID = nil
+        scheduleNextOperation()
     }
 
     private func flushTransport() async throws -> UInt64 {
@@ -283,7 +406,6 @@ public actor DocumentClientController {
 
     private func enterResynchronizing() {
         state = .resynchronizing
-        failDrainWaitersForResynchronization()
     }
 
     private func requireReady() throws {
@@ -299,6 +421,17 @@ public actor DocumentClientController {
         case .closed:
             throw DocumentProtocolError.invalidValue
         }
+    }
+
+    private var isReadyState: Bool {
+        if case .ready = state { return true }
+        return false
+    }
+
+    private func takeOperationOrder() -> UInt64 {
+        let value = nextOperationOrder
+        nextOperationOrder += 1
+        return value
     }
 
     private func snapshotWithLease(
