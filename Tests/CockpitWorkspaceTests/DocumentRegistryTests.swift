@@ -147,12 +147,42 @@ import CockpitTypes
         #expect(await serving.cancelledReadCount == 1)
 
         let replacement = Task { try await fixture.registry.open(at: path) }
-        for _ in 0..<100 where await serving.readCount < 2 {
+        for _ in 0..<100 where await fixture.repository.findOrCreateCount < 2 {
             try await Task.sleep(for: .milliseconds(1))
         }
-        #expect(await serving.readCount == 2)
+        #expect(await fixture.repository.findOrCreateCount == 2)
+        #expect(await serving.readCount == 1)
+
         await serving.releaseRead()
-        _ = try await replacement.value
+        let actor = try await replacement.value
+        #expect(await serving.readCount == 2)
+
+        let clientID = ClientInstanceID()
+        let lease = try await actor.acquireEditLease(client: clientID)
+        let beforeEdit = await actor.snapshot()
+        let acknowledgement = try await actor.apply(EditTransaction(
+            validatingDocumentID: beforeEdit.documentID,
+            editLeaseID: lease.id,
+            baseVersion: beforeEdit.documentVersion,
+            clientSequence: beforeEdit.lastAcceptedClientSequence + 1,
+            changes: [try UTF16TextEdit(
+                validatingOffset: UInt64(beforeEdit.text.utf16.count),
+                length: 0,
+                replacement: "!"
+            )]
+        ))
+        #expect(acknowledgement.documentVersion == 1)
+
+        let restartedRegistry = DocumentRegistry(
+            environmentID: fixture.environmentID,
+            documentServing: WorkspaceRootHandle(rootURL: fixture.root),
+            metadataRepository: fixture.repository,
+            recoveryRoot: fixture.recoveryRoot
+        )
+        let restarted = try await restartedRegistry.open(at: path)
+        let recovered = await restarted.snapshot()
+        #expect(recovered.text == "content!")
+        #expect(recovered.documentVersion == acknowledgement.documentVersion)
     }
 }
 

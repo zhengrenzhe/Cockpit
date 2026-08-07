@@ -267,83 +267,94 @@ public actor DocumentRegistry {
             in: environmentID,
             at: path
         )
-        try Task.checkCancellation()
-        try requireOperational()
-        guard let locatorFlight = locatorFlights[path], locatorFlight.id == flightID else {
-            throw CancellationError()
-        }
-        try validatePublication(at: path, locatorBarrierEpoch: locatorFlight.barrierEpoch)
-        if let actor = byPath[path] { return actor }
-        if let actor = byID[metadata.documentID] { return actor }
-
         let owner = LocatorFlightIdentity(path: path, id: flightID)
-        var actorFlight: ActorOpenFlight
-        if var existing = actorFlights[metadata.documentID] {
-            existing.owners.insert(owner)
-            actorFlights[metadata.documentID] = existing
-            activeActorOpenWork[existing.id]?.paths.insert(path)
-            actorFlight = existing
-        } else {
-            let documentServing = documentServing
-            let metadataRepository = metadataRepository
-            let recoveryRoot = recoveryRoot
-            let id = UUID()
-            let task = Task {
-                try Task.checkCancellation()
-                let actor = try await DocumentActor.open(
-                    metadata: metadata,
-                    documentServing: documentServing,
-                    recoveryLog: DocumentRecoveryLog(
-                        rootURL: recoveryRoot,
-                        documentID: metadata.documentID
-                    ),
-                    metadataRepository: metadataRepository
-                )
-                try Task.checkCancellation()
-                return actor
+        while true {
+            try Task.checkCancellation()
+            try requireOperational()
+            guard let locatorFlight = locatorFlights[path], locatorFlight.id == flightID else {
+                throw CancellationError()
             }
-            actorFlight = ActorOpenFlight(id: id, task: task, owners: [owner])
-            actorFlights[metadata.documentID] = actorFlight
-            activeActorOpenWork[id] = ActiveActorOpenWork(paths: [path])
-        }
-        guard var currentLocatorFlight = locatorFlights[path],
-              currentLocatorFlight.id == flightID
-        else {
-            detachActorFlightOwner(
-                owner,
-                from: ActorFlightReference(documentID: metadata.documentID, id: actorFlight.id)
-            )
-            throw CancellationError()
-        }
-        let actorReference = ActorFlightReference(
-            documentID: metadata.documentID,
-            id: actorFlight.id
-        )
-        currentLocatorFlight.actorFlight = actorReference
-        locatorFlights[path] = currentLocatorFlight
+            try validatePublication(at: path, locatorBarrierEpoch: locatorFlight.barrierEpoch)
+            if let actor = byPath[path] { return actor }
+            if let actor = byID[metadata.documentID] { return actor }
 
-        let actor: DocumentActor
-        do {
-            actor = try await actorFlight.task.value
-        } catch {
+            var actorFlight: ActorOpenFlight
+            if var existing = actorFlights[metadata.documentID] {
+                if existing.owners.isEmpty {
+                    let retiringReference = ActorFlightReference(
+                        documentID: metadata.documentID,
+                        id: existing.id
+                    )
+                    _ = try? await existing.task.value
+                    finishActorOpenWork(retiringReference)
+                    continue
+                }
+                existing.owners.insert(owner)
+                actorFlights[metadata.documentID] = existing
+                activeActorOpenWork[existing.id]?.paths.insert(path)
+                actorFlight = existing
+            } else {
+                let documentServing = documentServing
+                let metadataRepository = metadataRepository
+                let recoveryRoot = recoveryRoot
+                let id = UUID()
+                let task = Task {
+                    try Task.checkCancellation()
+                    let actor = try await DocumentActor.open(
+                        metadata: metadata,
+                        documentServing: documentServing,
+                        recoveryLog: DocumentRecoveryLog(
+                            rootURL: recoveryRoot,
+                            documentID: metadata.documentID
+                        ),
+                        metadataRepository: metadataRepository
+                    )
+                    try Task.checkCancellation()
+                    return actor
+                }
+                actorFlight = ActorOpenFlight(id: id, task: task, owners: [owner])
+                actorFlights[metadata.documentID] = actorFlight
+                activeActorOpenWork[id] = ActiveActorOpenWork(paths: [path])
+            }
+            guard var currentLocatorFlight = locatorFlights[path],
+                  currentLocatorFlight.id == flightID
+            else {
+                detachActorFlightOwner(
+                    owner,
+                    from: ActorFlightReference(documentID: metadata.documentID, id: actorFlight.id)
+                )
+                throw CancellationError()
+            }
+            let actorReference = ActorFlightReference(
+                documentID: metadata.documentID,
+                id: actorFlight.id
+            )
+            currentLocatorFlight.actorFlight = actorReference
+            locatorFlights[path] = currentLocatorFlight
+
+            let actor: DocumentActor
+            do {
+                actor = try await actorFlight.task.value
+            } catch {
+                finishActorOpenWork(actorReference)
+                throw error
+            }
             finishActorOpenWork(actorReference)
-            throw error
+            try Task.checkCancellation()
+            try requireOperational()
+            guard let publishingFlight = locatorFlights[path], publishingFlight.id == flightID else {
+                throw CancellationError()
+            }
+            try validatePublication(
+                at: path,
+                locatorBarrierEpoch: publishingFlight.barrierEpoch
+            )
+            if let existing = byPath[path] { return existing }
+            if let existing = byID[metadata.documentID] { return existing }
+            byPath[path] = actor
+            byID[metadata.documentID] = actor
+            return actor
         }
-        finishActorOpenWork(actorReference)
-        try Task.checkCancellation()
-        try requireOperational()
-        guard let publishingFlight = locatorFlights[path], publishingFlight.id == flightID else {
-            throw CancellationError()
-        }
-        try validatePublication(
-            at: path,
-            locatorBarrierEpoch: publishingFlight.barrierEpoch
-        )
-        if let existing = byPath[path] { return existing }
-        if let existing = byID[metadata.documentID] { return existing }
-        byPath[path] = actor
-        byID[metadata.documentID] = actor
-        return actor
     }
 
     private func completeLocatorFlight(
@@ -428,7 +439,7 @@ public actor DocumentRegistry {
         else { return }
         actorFlight.owners.remove(owner)
         if actorFlight.owners.isEmpty {
-            actorFlights.removeValue(forKey: reference.documentID)
+            actorFlights[reference.documentID] = actorFlight
             actorFlight.task.cancel()
         } else {
             actorFlights[reference.documentID] = actorFlight
