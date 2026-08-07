@@ -45,12 +45,17 @@ private struct ActorOpenFlight {
     var owners: Set<LocatorFlightIdentity>
 }
 
+private struct ActorRetirementWaiter {
+    let reference: ActorFlightReference
+    let continuation: CheckedContinuation<Void, Error>
+}
+
 private struct LocatorFlightIdentity: Hashable, Sendable {
     let path: RelativePath
     let id: UUID
 }
 
-private struct ActorFlightReference: Sendable {
+private struct ActorFlightReference: Hashable, Sendable {
     let documentID: DocumentID
     let id: UUID
 }
@@ -86,6 +91,7 @@ public actor DocumentRegistry {
     private var queuedScopes: Set<WorkspaceDirectory> = []
     private var locatorFlights: [RelativePath: LocatorOpenFlight] = [:]
     private var actorFlights: [DocumentID: ActorOpenFlight] = [:]
+    private var retirementWaiters: [LocatorFlightIdentity: ActorRetirementWaiter] = [:]
     private var activeActorOpenWork: [UUID: ActiveActorOpenWork] = [:]
     private var openRequestStates: [UUID: OpenRequestState] = [:]
     private var openWaiters: [DocumentOpenWaiter] = []
@@ -285,8 +291,12 @@ public actor DocumentRegistry {
                         documentID: metadata.documentID,
                         id: existing.id
                     )
-                    _ = try? await existing.task.value
-                    finishActorOpenWork(retiringReference)
+                    guard var currentLocatorFlight = locatorFlights[path],
+                          currentLocatorFlight.id == flightID
+                    else { throw CancellationError() }
+                    currentLocatorFlight.actorFlight = retiringReference
+                    locatorFlights[path] = currentLocatorFlight
+                    try await waitForActorRetirement(owner, from: retiringReference)
                     continue
                 }
                 existing.owners.insert(owner)
@@ -434,23 +444,106 @@ public actor DocumentRegistry {
         _ owner: LocatorFlightIdentity,
         from reference: ActorFlightReference
     ) {
+        cancelActorRetirementWaiter(owner, from: reference)
         guard var actorFlight = actorFlights[reference.documentID],
               actorFlight.id == reference.id
         else { return }
-        actorFlight.owners.remove(owner)
-        if actorFlight.owners.isEmpty {
-            actorFlights[reference.documentID] = actorFlight
-            actorFlight.task.cancel()
-        } else {
-            actorFlights[reference.documentID] = actorFlight
+        let removedOwner = actorFlight.owners.remove(owner) != nil
+        actorFlights[reference.documentID] = actorFlight
+        guard removedOwner, actorFlight.owners.isEmpty else { return }
+
+        actorFlight.task.cancel()
+        let task = actorFlight.task
+        Task {
+            _ = await task.result
+            self.completeActorRetirement(reference)
         }
     }
 
     private func finishActorOpenWork(_ reference: ActorFlightReference) {
-        if actorFlights[reference.documentID]?.id == reference.id {
-            actorFlights.removeValue(forKey: reference.documentID)
+        guard let actorFlight = actorFlights[reference.documentID],
+              actorFlight.id == reference.id
+        else {
+            activeActorOpenWork.removeValue(forKey: reference.id)
+            resumeMutationAcquisitions()
+            return
         }
+        guard !actorFlight.owners.isEmpty else { return }
+        actorFlights.removeValue(forKey: reference.documentID)
         activeActorOpenWork.removeValue(forKey: reference.id)
+        resumeMutationAcquisitions()
+    }
+
+    private func waitForActorRetirement(
+        _ owner: LocatorFlightIdentity,
+        from reference: ActorFlightReference
+    ) async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                registerActorRetirementWaiter(
+                    owner,
+                    from: reference,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { await self.cancelActorRetirementWaiter(owner, from: reference) }
+        }
+        try Task.checkCancellation()
+    }
+
+    private func registerActorRetirementWaiter(
+        _ owner: LocatorFlightIdentity,
+        from reference: ActorFlightReference,
+        continuation: CheckedContinuation<Void, Error>
+    ) {
+        guard let locatorFlight = locatorFlights[owner.path],
+              locatorFlight.id == owner.id
+        else {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        guard let actorFlight = actorFlights[reference.documentID],
+              actorFlight.id == reference.id,
+              actorFlight.owners.isEmpty
+        else {
+            continuation.resume()
+            return
+        }
+        guard retirementWaiters[owner] == nil else {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        retirementWaiters[owner] = ActorRetirementWaiter(
+            reference: reference,
+            continuation: continuation
+        )
+    }
+
+    private func cancelActorRetirementWaiter(
+        _ owner: LocatorFlightIdentity,
+        from reference: ActorFlightReference
+    ) {
+        guard retirementWaiters[owner]?.reference == reference,
+              let waiter = retirementWaiters.removeValue(forKey: owner)
+        else { return }
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func completeActorRetirement(_ reference: ActorFlightReference) {
+        guard let actorFlight = actorFlights[reference.documentID],
+              actorFlight.id == reference.id,
+              actorFlight.owners.isEmpty
+        else { return }
+
+        actorFlights.removeValue(forKey: reference.documentID)
+        activeActorOpenWork.removeValue(forKey: reference.id)
+        let waiters = retirementWaiters.filter { $0.value.reference == reference }
+        for (owner, waiter) in waiters {
+            retirementWaiters.removeValue(forKey: owner)
+            waiter.continuation.resume()
+        }
         resumeMutationAcquisitions()
     }
 
