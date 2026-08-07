@@ -3,12 +3,13 @@ import SQLite3
 import Testing
 @testable import CockpitPersistence
 
-@Test func workspaceMigrationV1CreatesOnlyTheApprovedTables() async throws {
+@Test func workspaceMigrationsCreateOnlyTheApprovedTables() async throws {
     try await withMigrationDatabase { databaseURL in
         let connection = try SQLiteConnection(databaseURL: databaseURL)
         try await connection.applyMigrations(WorkspaceMigrations.all)
 
         #expect(try await connection.tableNames() == [
+            "client_workspace_states",
             "conversation_deletions",
             "conversations",
             "documents",
@@ -16,6 +17,72 @@ import Testing
             "projects",
             "schema_migrations",
         ])
+    }
+}
+
+@Test func workspaceMigrationUpgradesV1DataToV2AndCreatesExactClientStateSchema() async throws {
+    try await withMigrationDatabase { databaseURL in
+        let connection = try SQLiteConnection(databaseURL: databaseURL)
+        try await connection.applyMigrations([WorkspaceMigrations.all[0]])
+        try await connection.withImmediateTransaction { connection in
+            try connection.execute(
+                """
+                INSERT INTO projects (
+                    id, display_name, root_bookmark, canonical_root_identity,
+                    base_environment_id, created_at
+                ) VALUES ('project-v1', 'Persisted', X'01', 'root-v1', 'environment-v1', 1)
+                """
+            )
+            try connection.execute(
+                """
+                INSERT INTO environments (
+                    id, project_id, kind, workspace_root, workspace_root_identity,
+                    git_common_directory, worktree_branch
+                ) VALUES ('environment-v1', 'project-v1', 'direct', '/tmp/project', 'root-v1', NULL, NULL)
+                """
+            )
+        }
+
+        try await connection.applyMigrations(WorkspaceMigrations.all)
+
+        #expect(try await connection.textValue(for: "SELECT display_name FROM projects") == "Persisted")
+        #expect(try await connection.query("SELECT version FROM schema_migrations ORDER BY version").compactMap { integer(in: $0, at: 0) } == [1, 2])
+        let tableInfo = try await connection.query("PRAGMA table_info(client_workspace_states)")
+        #expect(tableInfo.compactMap { text(in: $0, at: 1) } == [
+            "device_id", "window_id", "context_kind", "context_id", "state_json",
+        ])
+        #expect(tableInfo.compactMap { integer(in: $0, at: 5) } == [1, 2, 3, 4, 0])
+        await #expect(throws: (any Error).self) {
+            try await connection.execute(
+                """
+                INSERT INTO client_workspace_states (
+                    device_id, window_id, context_kind, context_id, state_json
+                ) VALUES ('device', 'window', 'environment', 'context', '{}')
+                """
+            )
+        }
+    }
+}
+
+@Test func failedV2MigrationLeavesV1DataWithoutV2TableOrVersion() async throws {
+    try await withMigrationDatabase { databaseURL in
+        let connection = try SQLiteConnection(databaseURL: databaseURL)
+        try await connection.applyMigrations([WorkspaceMigrations.all[0]])
+        let brokenV2 = SQLiteMigration(
+            version: 2,
+            statements: [
+                "CREATE TABLE client_workspace_states (id TEXT PRIMARY KEY)",
+                "THIS IS NOT SQL",
+            ]
+        )
+
+        await #expect(throws: (any Error).self) {
+            try await connection.applyMigrations([brokenV2])
+        }
+
+        #expect(try await connection.tableNames().contains("client_workspace_states") == false)
+        #expect(try await connection.query("SELECT version FROM schema_migrations ORDER BY version").compactMap { integer(in: $0, at: 0) } == [1])
+        #expect(try await connection.tableNames().contains("projects"))
     }
 }
 

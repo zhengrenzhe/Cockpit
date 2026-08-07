@@ -295,6 +295,7 @@ private struct FailingProjectRootResolver: ProjectRootResolving {
 private actor InMemoryWorkspaceRepository: WorkspaceRepository {
     private var projects: [Project] = []
     private var conversations: [Conversation] = []
+    private var clientStates: [ClientWorkspaceStateKey: ClientWorkspaceState] = [:]
 
     var createdConversationCount: Int { conversations.count }
 
@@ -378,5 +379,14 @@ private actor InMemoryWorkspaceRepository: WorkspaceRepository {
                 workspaceRootIdentity: project.canonicalRootIdentity
             )
         }
+    }
+
+    func loadClientState(_ key: ClientWorkspaceStateKey) throws -> ClientWorkspaceState? {
+        try clientStates[key]?.validated()
+    }
+
+    func saveClientState(_ state: ClientWorkspaceState) throws {
+        let valid = try state.validated()
+        clientStates[valid.key] = valid
     }
 }

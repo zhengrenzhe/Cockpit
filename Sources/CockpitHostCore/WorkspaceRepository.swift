@@ -138,4 +138,6 @@ public protocol WorkspaceRepository: Sendable {
     func listConversations(projectID: ProjectID) async throws -> [Conversation]
     func renameConversation(id: ConversationID, title: String) async throws
     func resolve(_ contextID: WorkspaceContextID) async throws -> ResolvedWorkspaceContext
+    func loadClientState(_ key: ClientWorkspaceStateKey) async throws -> ClientWorkspaceState?
+    func saveClientState(_ state: ClientWorkspaceState) async throws
 }

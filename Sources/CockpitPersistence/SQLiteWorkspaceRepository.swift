@@ -206,6 +206,77 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         }
     }
 
+    public func loadClientState(
+        _ key: ClientWorkspaceStateKey
+    ) async throws -> ClientWorkspaceState? {
+        let context = Self.storageContext(key.workspaceContextID)
+        let rows = try await connection.query(
+            """
+            SELECT device_id, window_id, context_kind, context_id,
+                   CAST(state_json AS BLOB)
+            FROM client_workspace_states
+            WHERE device_id = ? AND window_id = ?
+              AND context_kind = ? AND context_id = ?
+            """,
+            bindings: [
+                .text(key.deviceID.description),
+                .text(key.windowID.description),
+                .text(context.kind),
+                .text(context.id),
+            ]
+        )
+        guard let row = rows.first else { return nil }
+        guard rows.count == 1,
+              row[safe: 0]?.text == key.deviceID.description,
+              row[safe: 1]?.text == key.windowID.description,
+              row[safe: 2]?.text == context.kind,
+              row[safe: 3]?.text == context.id,
+              let data = row[safe: 4]?.blob,
+              String(data: data, encoding: .utf8) != nil
+        else {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+        do {
+            let state = try JSONDecoder().decode(ClientWorkspaceState.self, from: data)
+            let valid = try state.validated()
+            guard valid.key == key else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            return valid
+        } catch let error as WorkspaceRepositoryError {
+            throw error
+        } catch {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+    }
+
+    public func saveClientState(_ state: ClientWorkspaceState) async throws {
+        let valid = try state.validated()
+        let data = try JSONEncoder().encode(valid)
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+        let context = Self.storageContext(valid.key.workspaceContextID)
+        try await connection.withImmediateTransaction { connection in
+            try connection.execute(
+                """
+                INSERT INTO client_workspace_states (
+                    device_id, window_id, context_kind, context_id, state_json
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (device_id, window_id, context_kind, context_id)
+                DO UPDATE SET state_json = excluded.state_json
+                """,
+                bindings: [
+                    .text(valid.key.deviceID.description),
+                    .text(valid.key.windowID.description),
+                    .text(context.kind),
+                    .text(context.id),
+                    .text(json),
+                ]
+            )
+        }
+    }
+
     private static func project(from row: [SQLiteColumn]) throws -> Project {
         guard let id = projectID(row[safe: 0]),
               let displayName = row[safe: 1]?.text,
@@ -287,6 +358,15 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
     private static func deletionOperationID(_ column: SQLiteColumn?) -> DeletionOperationID? {
         guard let text = column?.text, let uuid = UUID(uuidString: text) else { return nil }
         return DeletionOperationID(uuid)
+    }
+
+    private static func storageContext(
+        _ contextID: WorkspaceContextID
+    ) -> (kind: String, id: String) {
+        switch contextID {
+        case let .project(id): ("project", id.description)
+        case let .conversation(id): ("conversation", id.description)
+        }
     }
 }
 

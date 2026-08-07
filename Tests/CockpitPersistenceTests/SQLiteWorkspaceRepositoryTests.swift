@@ -203,6 +203,138 @@ import CockpitTypes
     }
 }
 
+@Test func clientWorkspaceLayoutsRoundTripIndependentlyAcrossProjectAndConversations() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let firstConversation = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "First")
+        )
+        let secondConversation = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "Second")
+        )
+        let deviceID = DeviceID()
+        let windowID = WindowID()
+        let documentID = DocumentID()
+        let projectState = try makeWorkspaceState(
+            deviceID: deviceID, windowID: windowID, contextID: .project(project.id),
+            documentID: documentID, tabID: TabID(), cursorLine: 3,
+            collapsed: false, leadingWidth: 210, trailingWidth: 330, scroll: 11
+        )
+        let firstState = try makeWorkspaceState(
+            deviceID: deviceID, windowID: windowID, contextID: .conversation(firstConversation.id),
+            documentID: documentID, tabID: TabID(), cursorLine: 7,
+            collapsed: true, leadingWidth: 180, trailingWidth: 410, scroll: 22
+        )
+        let secondState = try makeWorkspaceState(
+            deviceID: deviceID, windowID: windowID, contextID: .conversation(secondConversation.id),
+            documentID: documentID, tabID: TabID(), cursorLine: 12,
+            collapsed: false, leadingWidth: 260, trailingWidth: 290, scroll: 33
+        )
+
+        try await repository.saveClientState(projectState)
+        try await repository.saveClientState(firstState)
+        try await repository.saveClientState(secondState)
+        #expect(await repository.close() == SQLITE_OK)
+
+        let reopened = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        #expect(try await reopened.loadClientState(projectState.key) == projectState)
+        #expect(try await reopened.loadClientState(firstState.key) == firstState)
+        #expect(try await reopened.loadClientState(secondState.key) == secondState)
+        #expect(try await reopened.loadClientState(ClientWorkspaceStateKey(
+            deviceID: DeviceID(),
+            windowID: windowID,
+            workspaceContextID: .project(project.id)
+        )) == nil)
+    }
+}
+
+@Test func clientWorkspaceStateSaveValidatesAndUpsertsOneExactKey() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let state = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: .project(ProjectID()),
+            documentID: DocumentID(), tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 4
+        )
+        try await repository.saveClientState(state)
+        var replacement = state
+        replacement.sidebar.isCollapsed = true
+        replacement.splitView.leadingPaneWidth = 250
+        try await repository.saveClientState(replacement)
+
+        let inspection = try SQLiteConnection(databaseURL: databaseURL)
+        #expect(try await inspection.integerValue(for: "SELECT COUNT(*) FROM client_workspace_states") == 1)
+        #expect(try await repository.loadClientState(state.key) == replacement)
+
+        var invalid = state
+        invalid.tabs.append(state.tabs[0])
+        await #expect(throws: CockpitDomainValidationError.duplicateTabID) {
+            try await repository.saveClientState(invalid)
+        }
+        #expect(try await inspection.integerValue(for: "SELECT COUNT(*) FROM client_workspace_states") == 1)
+    }
+}
+
+@Test func clientWorkspaceStateLoadRejectsSQLJSONKeyMismatchAndMalformedStoredValues() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let requestedKey = ClientWorkspaceStateKey(
+            deviceID: DeviceID(),
+            windowID: WindowID(),
+            workspaceContextID: .project(ProjectID())
+        )
+        let otherState = try makeWorkspaceState(
+            deviceID: requestedKey.deviceID,
+            windowID: requestedKey.windowID,
+            contextID: .project(ProjectID()),
+            documentID: DocumentID(), tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 4
+        )
+        let inspection = try SQLiteConnection(databaseURL: databaseURL)
+
+        try await replaceStoredState(
+            connection: inspection,
+            key: requestedKey,
+            storedValue: .blob(try JSONEncoder().encode(otherState))
+        )
+        await #expect(throws: WorkspaceRepositoryError.invalidStoredValue) {
+            _ = try await repository.loadClientState(requestedKey)
+        }
+
+        try await replaceStoredState(connection: inspection, key: requestedKey, storedValue: .blob(Data([0xFF])))
+        await #expect(throws: WorkspaceRepositoryError.invalidStoredValue) {
+            _ = try await repository.loadClientState(requestedKey)
+        }
+
+        try await replaceStoredState(connection: inspection, key: requestedKey, storedValue: .text("{"))
+        await #expect(throws: WorkspaceRepositoryError.invalidStoredValue) {
+            _ = try await repository.loadClientState(requestedKey)
+        }
+
+        let valid = try makeWorkspaceState(
+            deviceID: requestedKey.deviceID,
+            windowID: requestedKey.windowID,
+            contextID: requestedKey.workspaceContextID,
+            documentID: DocumentID(), tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 4
+        )
+        let validData = try JSONEncoder().encode(valid)
+        var object = try #require(JSONSerialization.jsonObject(with: validData) as? [String: Any])
+        var split = try #require(object["splitView"] as? [String: Any])
+        split["trailingPaneWidth"] = -1
+        object["splitView"] = split
+        try await replaceStoredState(
+            connection: inspection,
+            key: requestedKey,
+            storedValue: .blob(try JSONSerialization.data(withJSONObject: object))
+        )
+        await #expect(throws: WorkspaceRepositoryError.invalidStoredValue) {
+            _ = try await repository.loadClientState(requestedKey)
+        }
+    }
+}
+
 private func makeProjectInput() -> NewProject {
     NewProject(
         displayName: "Cockpit",
@@ -210,6 +342,76 @@ private func makeProjectInput() -> NewProject {
         canonicalRootIdentity: "file-id:cockpit",
         workspaceRoot: "/Users/example/Cockpit",
         gitCommonDirectory: "/Users/example/Cockpit/.git"
+    )
+}
+
+private func makeWorkspaceState(
+    deviceID: DeviceID,
+    windowID: WindowID,
+    contextID: WorkspaceContextID,
+    documentID: DocumentID,
+    tabID: TabID,
+    cursorLine: UInt64,
+    collapsed: Bool,
+    leadingWidth: Double,
+    trailingWidth: Double,
+    scroll: Double
+) throws -> ClientWorkspaceState {
+    let cursor = try TextPosition(validatingLine: cursorLine, column: 2)
+    let selection = try TextRange(
+        validatingAnchor: cursor,
+        active: TextPosition(validatingLine: cursorLine, column: 8)
+    )
+    let tab = try TabRecord(
+        validatingID: tabID,
+        resource: .file(documentID),
+        fileViewState: DocumentViewState(
+            validatingCursor: cursor,
+            selections: [selection],
+            firstVisibleLine: cursorLine,
+            horizontalScrollOffset: scroll
+        )
+    )
+    return try ClientWorkspaceState(
+        validatingKey: ClientWorkspaceStateKey(
+            deviceID: deviceID,
+            windowID: windowID,
+            workspaceContextID: contextID
+        ),
+        tabs: [tab],
+        selectedTabID: tabID,
+        sidebar: SidebarState(isCollapsed: collapsed),
+        splitView: SplitViewState(
+            validatingLeadingPaneWidth: leadingWidth,
+            trailingPaneWidth: trailingWidth
+        )
+    )
+}
+
+private func replaceStoredState(
+    connection: SQLiteConnection,
+    key: ClientWorkspaceStateKey,
+    storedValue: SQLiteValue
+) async throws {
+    let context: (kind: String, id: String)
+    switch key.workspaceContextID {
+    case let .project(id): context = ("project", id.description)
+    case let .conversation(id): context = ("conversation", id.description)
+    }
+    try await connection.execute("DELETE FROM client_workspace_states")
+    try await connection.execute(
+        """
+        INSERT INTO client_workspace_states (
+            device_id, window_id, context_kind, context_id, state_json
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        bindings: [
+            .text(key.deviceID.description),
+            .text(key.windowID.description),
+            .text(context.kind),
+            .text(context.id),
+            storedValue,
+        ]
     )
 }
 

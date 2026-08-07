@@ -229,3 +229,176 @@ public struct RequestContext: Hashable, Codable, Sendable {
         try container.encode(valid.requestID, forKey: .requestID)
     }
 }
+
+public struct ClientWorkspaceStateKey: Hashable, Codable, Sendable {
+    public let deviceID: DeviceID
+    public let windowID: WindowID
+    public let workspaceContextID: WorkspaceContextID
+
+    public init(
+        deviceID: DeviceID,
+        windowID: WindowID,
+        workspaceContextID: WorkspaceContextID
+    ) {
+        self.deviceID = deviceID
+        self.windowID = windowID
+        self.workspaceContextID = workspaceContextID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case deviceID, windowID, workspaceContextID
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            deviceID: try container.decode(DeviceID.self, forKey: .deviceID),
+            windowID: try container.decode(WindowID.self, forKey: .windowID),
+            workspaceContextID: try container.decode(WorkspaceContextID.self, forKey: .workspaceContextID)
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        let valid = Self(
+            deviceID: deviceID,
+            windowID: windowID,
+            workspaceContextID: workspaceContextID
+        )
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(valid.deviceID, forKey: .deviceID)
+        try container.encode(valid.windowID, forKey: .windowID)
+        try container.encode(valid.workspaceContextID, forKey: .workspaceContextID)
+    }
+}
+
+public struct SidebarState: Hashable, Codable, Sendable {
+    public var isCollapsed: Bool
+
+    public init(isCollapsed: Bool) {
+        self.isCollapsed = isCollapsed
+    }
+
+    private enum CodingKeys: String, CodingKey { case isCollapsed }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(isCollapsed: try container.decode(Bool.self, forKey: .isCollapsed))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        let valid = Self(isCollapsed: isCollapsed)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(valid.isCollapsed, forKey: .isCollapsed)
+    }
+}
+
+public struct SplitViewState: Hashable, Codable, Sendable {
+    public var leadingPaneWidth: Double
+    public var trailingPaneWidth: Double
+
+    public init(
+        validatingLeadingPaneWidth leadingPaneWidth: Double,
+        trailingPaneWidth: Double
+    ) throws {
+        guard leadingPaneWidth.isFinite,
+              leadingPaneWidth >= 0,
+              trailingPaneWidth.isFinite,
+              trailingPaneWidth >= 0
+        else {
+            throw CockpitDomainValidationError.invalidSplitViewWidth
+        }
+        self.leadingPaneWidth = leadingPaneWidth
+        self.trailingPaneWidth = trailingPaneWidth
+    }
+
+    public func validated() throws -> Self {
+        try Self(
+            validatingLeadingPaneWidth: leadingPaneWidth,
+            trailingPaneWidth: trailingPaneWidth
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case leadingPaneWidth, trailingPaneWidth
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            validatingLeadingPaneWidth: container.decode(Double.self, forKey: .leadingPaneWidth),
+            trailingPaneWidth: container.decode(Double.self, forKey: .trailingPaneWidth)
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        let valid = try validated()
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(valid.leadingPaneWidth, forKey: .leadingPaneWidth)
+        try container.encode(valid.trailingPaneWidth, forKey: .trailingPaneWidth)
+    }
+}
+
+public struct ClientWorkspaceState: Hashable, Codable, Sendable {
+    public let key: ClientWorkspaceStateKey
+    public var tabs: [TabRecord]
+    public var selectedTabID: TabID?
+    public var sidebar: SidebarState
+    public var splitView: SplitViewState
+
+    public init(
+        validatingKey key: ClientWorkspaceStateKey,
+        tabs: [TabRecord],
+        selectedTabID: TabID?,
+        sidebar: SidebarState,
+        splitView: SplitViewState
+    ) throws {
+        let validTabs = try tabs.map { try $0.validated() }
+        let tabIDs = Set(validTabs.map(\.id))
+        guard tabIDs.count == validTabs.count else {
+            throw CockpitDomainValidationError.duplicateTabID
+        }
+        if let selectedTabID, !tabIDs.contains(selectedTabID) {
+            throw CockpitDomainValidationError.selectedTabNotFound
+        }
+        self.key = key
+        self.tabs = validTabs
+        self.selectedTabID = selectedTabID
+        self.sidebar = SidebarState(isCollapsed: sidebar.isCollapsed)
+        self.splitView = try splitView.validated()
+    }
+
+    public func validated() throws -> Self {
+        try Self(
+            validatingKey: key,
+            tabs: tabs,
+            selectedTabID: selectedTabID,
+            sidebar: sidebar,
+            splitView: splitView
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case key, tabs, selectedTabID, sidebar, splitView
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            validatingKey: container.decode(ClientWorkspaceStateKey.self, forKey: .key),
+            tabs: container.decode([TabRecord].self, forKey: .tabs),
+            selectedTabID: container.decodeIfPresent(TabID.self, forKey: .selectedTabID),
+            sidebar: container.decode(SidebarState.self, forKey: .sidebar),
+            splitView: container.decode(SplitViewState.self, forKey: .splitView)
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        let valid = try validated()
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(valid.key, forKey: .key)
+        try container.encode(valid.tabs, forKey: .tabs)
+        try container.encodeIfPresent(valid.selectedTabID, forKey: .selectedTabID)
+        try container.encode(valid.sidebar, forKey: .sidebar)
+        try container.encode(valid.splitView, forKey: .splitView)
+    }
+}
