@@ -180,7 +180,7 @@ public actor DocumentClientController {
             state = .ready(ready)
             return replacement
         } catch {
-            if Self.isAuthoritative(error) { enterResynchronizing() }
+            enterResynchronizing()
             throw error
         }
     }
@@ -210,7 +210,7 @@ public actor DocumentClientController {
             }
             return replacement
         } catch {
-            if Self.isAuthoritative(error) { enterResynchronizing() }
+            enterResynchronizing()
             throw error
         }
     }
@@ -318,7 +318,9 @@ public actor DocumentClientController {
             inFlight = nil
             submitRequestStates[current.pending.id] = .completed
             current.pending.continuation.resume(throwing: error)
-            if Self.isAuthoritative(error) || retriedAfterTransientFailure {
+            if Self.isAuthoritative(error)
+                || retriedAfterTransientFailure
+                || error is CancellationError {
                 enterResynchronizing()
             }
         }

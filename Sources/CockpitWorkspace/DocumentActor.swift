@@ -290,11 +290,16 @@ public actor DocumentActor {
         let candidate = try Self.applying(transaction.changes, to: buffer)
         let nextVersion = metadata.documentVersion + 1
         let payload = try DocumentEditing.encodeRecoveryPayload(transaction)
-        try await recoveryLog.append(
-            documentVersion: nextVersion,
-            clientSequence: transaction.clientSequence,
-            utf8EditPayload: payload
-        )
+        do {
+            try await recoveryLog.append(
+                documentVersion: nextVersion,
+                clientSequence: transaction.clientSequence,
+                utf8EditPayload: payload
+            )
+        } catch {
+            recoveryRequired = true
+            throw error
+        }
 
         let oldMetadata = metadata
         let acknowledgement = try EditAcknowledgement(

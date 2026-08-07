@@ -33,14 +33,15 @@ actor FileOperationCoordinator {
             let relocation = try operation.validatedRelocation
             let documentMutationLease: DocumentInternalMutationLease?
             if let relocation {
-                documentMutationLease = await documentRegistry?.acquireInternalMutationLease(
+                documentMutationLease = try await documentRegistry?.acquireInternalMutationLease(
                     from: relocation.source,
                     to: relocation.destination
                 )
             } else {
-                documentMutationLease = await documentRegistry?.acquireInternalMutationLease()
+                documentMutationLease = try await documentRegistry?.acquireInternalMutationLease()
             }
             do {
+                try Task.checkCancellation()
                 if let relocation {
                     try await documentLocatorUpdater.preflightDocumentLocatorRelocation(
                         in: environmentID,

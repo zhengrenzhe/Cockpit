@@ -125,6 +125,47 @@ import CockpitTypes
     }
 }
 
+@Test func documentActorAppendFailureFailsClosedBeforeAnyAcknowledgement() async throws {
+    let writeFailure = DocumentActorAppendWriteFailure()
+    let fixture = try DocumentActorFixture(
+        text: "abc",
+        recoverySystemCalls: RecoveryLogSystemCalls(
+            write: { writeFailure.call($0, $1, $2) },
+            fsync: { Darwin.fsync($0) },
+            rename: { Darwin.rename($0, $1) }
+        )
+    )
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    let transaction = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: lease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "d")]
+    )
+    writeFailure.failAfterNextPrefix()
+
+    await #expect(throws: (any Error).self) { _ = try await actor.apply(transaction) }
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await actor.apply(transaction)
+    }
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await actor.transferEditLease(from: lease.id, to: ClientInstanceID())
+    }
+
+    let restarted = try await fixture.openActor()
+    let snapshot = await restarted.snapshot()
+    #expect(snapshot.text == "abc")
+    #expect(snapshot.documentVersion == 0)
+    #expect(snapshot.lastAcceptedClientSequence == 0)
+    #expect(snapshot.maintenance.contains(.truncatedRecoveryTail))
+    await #expect(throws: DocumentProtocolError.recoveryRequired) {
+        _ = try await restarted.acquireEditLease(client: ClientInstanceID())
+    }
+}
+
 @Test func documentActorSaveAndDiscardUseCheckpointedExactBytes() async throws {
     let fixture = try DocumentActorFixture(text: "a\r\nb")
     defer { fixture.remove() }
@@ -713,6 +754,35 @@ private final class DocumentActorDirectoryFsyncFailure: @unchecked Sendable {
                 return -1
             }
             return Darwin.fsync(descriptor)
+        }
+    }
+}
+
+private final class DocumentActorAppendWriteFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var shouldWritePrefix = false
+    private var shouldFail = false
+
+    func failAfterNextPrefix() {
+        lock.withLock {
+            shouldWritePrefix = true
+            shouldFail = false
+        }
+    }
+
+    func call(_ descriptor: Int32, _ pointer: UnsafeRawPointer, _ count: Int) -> Int {
+        lock.withLock {
+            if shouldWritePrefix {
+                shouldWritePrefix = false
+                shouldFail = true
+                return Darwin.write(descriptor, pointer, min(3, count))
+            }
+            if shouldFail {
+                shouldFail = false
+                errno = EIO
+                return -1
+            }
+            return Darwin.write(descriptor, pointer, count)
         }
     }
 }

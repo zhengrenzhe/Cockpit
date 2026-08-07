@@ -175,6 +175,32 @@ import CockpitTypes
     #expect(try await second.value.clientSequence == 2)
 }
 
+@Test func documentClientControllerIssuedApplyCancellationRequiresResynchronization() async throws {
+    let fixture = try ClientDocumentFixture()
+    let transport = RecordingDocumentDataTransport(snapshot: fixture.snapshot, lease: fixture.lease)
+    await transport.dropNextCommittedApplyReplyAsCancellation()
+    let controller = DocumentClientController(clientInstanceID: fixture.clientID, transport: transport)
+    _ = try await controller.open(in: fixture.environmentID, at: fixture.path, requestWriteAccess: true)
+
+    let first = Task { try await controller.submit([
+        try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "first")
+    ]) }
+    let second = Task { try await controller.submit([
+        try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "second")
+    ]) }
+    await #expect(throws: CancellationError.self) { _ = try await first.value }
+    for _ in 0..<50 { await Task.yield() }
+    #expect(await transport.recordedTransactions.count == 1)
+    guard case .resynchronizing = await controller.state else {
+        Issue.record("Expected issued apply cancellation to resynchronize")
+        second.cancel()
+        return
+    }
+
+    _ = try await controller.resynchronize(requestWriteAccess: true)
+    #expect(try await second.value.clientSequence == 2)
+}
+
 @Test func documentClientControllerCancelledDrainNeverCallsControlTransport() async throws {
     do {
         let fixture = try ClientDocumentFixture()
@@ -278,6 +304,70 @@ import CockpitTypes
 
     _ = try await controller.resynchronize(requestWriteAccess: true)
     #expect(try await edit.value.clientSequence == 1)
+}
+
+@Test func documentClientControllerDroppedMutationRepliesRequireResynchronization() async throws {
+    for droppedReply in ClientDroppedReply.allCases {
+        do {
+            let fixture = try ClientDocumentFixture()
+            let transport = RecordingDocumentDataTransport(snapshot: fixture.snapshot, lease: fixture.lease)
+            let controller = DocumentClientController(clientInstanceID: fixture.clientID, transport: transport)
+            _ = try await controller.open(
+                in: fixture.environmentID,
+                at: fixture.path,
+                requestWriteAccess: true
+            )
+            await transport.blockNextSaveAfterCommit(dropping: droppedReply)
+
+            let save = Task { try await controller.save(expectedFingerprint: try clientFingerprint()) }
+            await transport.waitUntilSaveBlocks()
+            let edit = Task { try await controller.submit([
+                try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "after-save")
+            ]) }
+            await transport.releaseBlockedSave()
+            await expectDroppedReply(droppedReply) { _ = try await save.value }
+            for _ in 0..<50 { await Task.yield() }
+            guard case .resynchronizing = await controller.state else {
+                Issue.record("Expected dropped save reply to resynchronize")
+                edit.cancel()
+                continue
+            }
+            #expect(await transport.recordedTransactions.isEmpty)
+
+            _ = try await controller.resynchronize(requestWriteAccess: true)
+            #expect(try await edit.value.clientSequence == 1)
+        }
+
+        do {
+            let fixture = try ClientDocumentFixture()
+            let transport = RecordingDocumentDataTransport(snapshot: fixture.snapshot, lease: fixture.lease)
+            let controller = DocumentClientController(clientInstanceID: fixture.clientID, transport: transport)
+            _ = try await controller.open(
+                in: fixture.environmentID,
+                at: fixture.path,
+                requestWriteAccess: true
+            )
+            await transport.blockNextDiscardAfterCommit(dropping: droppedReply)
+
+            let discard = Task { try await controller.discard() }
+            await transport.waitUntilDiscardBlocks()
+            let edit = Task { try await controller.submit([
+                try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "after-discard")
+            ]) }
+            await transport.releaseBlockedDiscard()
+            await expectDroppedReply(droppedReply) { _ = try await discard.value }
+            for _ in 0..<50 { await Task.yield() }
+            guard case .resynchronizing = await controller.state else {
+                Issue.record("Expected dropped discard reply to resynchronize")
+                edit.cancel()
+                continue
+            }
+            #expect(await transport.recordedTransactions.isEmpty)
+
+            _ = try await controller.resynchronize(requestWriteAccess: true)
+            #expect(try await edit.value.clientSequence == 1)
+        }
+    }
 }
 
 @Test func documentClientControllerCompletedSubmitCancellationRetainsNoRequestIDs() async throws {
@@ -388,6 +478,11 @@ private struct ClientDocumentFixture {
     }
 }
 
+private enum ClientDroppedReply: CaseIterable, Sendable {
+    case ordinaryError
+    case cancellation
+}
+
 private actor RecordingDocumentDataTransport: DocumentDataTransport {
     private var authoritativeSnapshot: DocumentSnapshot
     private let lease: EditLease
@@ -396,6 +491,7 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
     private var saveError: DocumentProtocolError?
     private var transientApplyFailures = 0
     private var droppedCommittedApplyReplies = 0
+    private var droppedCommittedApplyCancellationReplies = 0
     private var lastCommittedTransaction: EditTransaction?
     private var lastCommittedAcknowledgement: EditAcknowledgement?
     private var shouldBlockNextApply = false
@@ -410,10 +506,12 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
     private(set) var flushCount = 0
     private(set) var saveCount = 0
     private var shouldBlockNextSave = false
+    private var droppedSaveReply: ClientDroppedReply?
     private var saveBlockWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseSaveBlock: CheckedContinuation<Void, Never>?
     private var shouldBlockNextDiscard = false
     private var blockedDiscardError: DocumentProtocolError?
+    private var droppedDiscardReply: ClientDroppedReply?
     private var discardBlockWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseDiscardBlock: CheckedContinuation<Void, Never>?
 
@@ -452,6 +550,10 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
         }
         if let applyError { throw applyError }
         if transaction == lastCommittedTransaction, let acknowledgement = lastCommittedAcknowledgement {
+            if droppedCommittedApplyCancellationReplies > 0 {
+                droppedCommittedApplyCancellationReplies -= 1
+                throw CancellationError()
+            }
             if droppedCommittedApplyReplies > 0 {
                 droppedCommittedApplyReplies -= 1
                 throw CocoaError(.fileReadUnknown)
@@ -474,7 +576,7 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
         maximumConcurrentApplyCount = max(maximumConcurrentApplyCount, activeApplyCount)
         await Task.yield()
         activeApplyCount -= 1
-        let version = transaction.clientSequence
+        let version = authoritativeSnapshot.documentVersion + 1
         authoritativeSnapshot = try DocumentSnapshot(
             validatingDocumentID: authoritativeSnapshot.documentID,
             environmentID: authoritativeSnapshot.environmentID,
@@ -495,6 +597,10 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
         )
         lastCommittedTransaction = transaction
         lastCommittedAcknowledgement = acknowledgement
+        if droppedCommittedApplyCancellationReplies > 0 {
+            droppedCommittedApplyCancellationReplies -= 1
+            throw CancellationError()
+        }
         if droppedCommittedApplyReplies > 0 {
             droppedCommittedApplyReplies -= 1
             throw CocoaError(.fileReadUnknown)
@@ -518,6 +624,26 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
             await withCheckedContinuation { releaseSaveBlock = $0 }
         }
         if let saveError { throw saveError }
+        if let droppedSaveReply {
+            self.droppedSaveReply = nil
+            authoritativeSnapshot = try DocumentSnapshot(
+                validatingDocumentID: authoritativeSnapshot.documentID,
+                environmentID: authoritativeSnapshot.environmentID,
+                relativePath: authoritativeSnapshot.relativePath,
+                text: authoritativeSnapshot.text,
+                documentVersion: authoritativeSnapshot.documentVersion,
+                persistedVersion: authoritativeSnapshot.documentVersion,
+                lastAcceptedClientSequence: authoritativeSnapshot.lastAcceptedClientSequence,
+                dirtyState: .clean,
+                observedDiskFingerprint: authoritativeSnapshot.observedDiskFingerprint,
+                currentLease: lease,
+                maintenance: authoritativeSnapshot.maintenance
+            )
+            switch droppedSaveReply {
+            case .ordinaryError: throw CocoaError(.fileReadUnknown)
+            case .cancellation: throw CancellationError()
+            }
+        }
         return authoritativeSnapshot
     }
 
@@ -531,6 +657,27 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
             if let blockedDiscardError {
                 self.blockedDiscardError = nil
                 throw blockedDiscardError
+            }
+        }
+        if let droppedDiscardReply {
+            self.droppedDiscardReply = nil
+            let nextVersion = authoritativeSnapshot.documentVersion + 1
+            authoritativeSnapshot = try DocumentSnapshot(
+                validatingDocumentID: authoritativeSnapshot.documentID,
+                environmentID: authoritativeSnapshot.environmentID,
+                relativePath: authoritativeSnapshot.relativePath,
+                text: "discarded",
+                documentVersion: nextVersion,
+                persistedVersion: nextVersion,
+                lastAcceptedClientSequence: authoritativeSnapshot.lastAcceptedClientSequence,
+                dirtyState: .clean,
+                observedDiskFingerprint: authoritativeSnapshot.observedDiskFingerprint,
+                currentLease: lease,
+                maintenance: authoritativeSnapshot.maintenance
+            )
+            switch droppedDiscardReply {
+            case .ordinaryError: throw CocoaError(.fileReadUnknown)
+            case .cancellation: throw CancellationError()
             }
         }
         return authoritativeSnapshot
@@ -548,9 +695,16 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
     func releaseBlockedApply() { releaseApplyBlock?.resume(); releaseApplyBlock = nil }
     func failTransientApply(times: Int) { transientApplyFailures = times }
     func dropApplyRepliesAfterCommit(times: Int) { droppedCommittedApplyReplies = times }
+    func dropNextCommittedApplyReplyAsCancellation() {
+        droppedCommittedApplyCancellationReplies = 1
+    }
     func setFlushError(_ error: DocumentProtocolError?) { flushError = error }
     func setSaveError(_ error: DocumentProtocolError?) { saveError = error }
     func blockNextSave() { shouldBlockNextSave = true }
+    func blockNextSaveAfterCommit(dropping reply: ClientDroppedReply) {
+        shouldBlockNextSave = true
+        droppedSaveReply = reply
+    }
     func waitUntilSaveBlocks() async {
         if releaseSaveBlock != nil { return }
         await withCheckedContinuation { saveBlockWaiters.append($0) }
@@ -560,11 +714,32 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
         shouldBlockNextDiscard = true
         blockedDiscardError = error
     }
+    func blockNextDiscardAfterCommit(dropping reply: ClientDroppedReply) {
+        shouldBlockNextDiscard = true
+        droppedDiscardReply = reply
+    }
     func waitUntilDiscardBlocks() async {
         if releaseDiscardBlock != nil { return }
         await withCheckedContinuation { discardBlockWaiters.append($0) }
     }
     func releaseBlockedDiscard() { releaseDiscardBlock?.resume(); releaseDiscardBlock = nil }
+}
+
+private func expectDroppedReply(
+    _ reply: ClientDroppedReply,
+    operation: () async throws -> Void
+) async {
+    do {
+        try await operation()
+        Issue.record("Expected dropped mutation reply")
+    } catch {
+        switch reply {
+        case .ordinaryError:
+            #expect(error is CocoaError)
+        case .cancellation:
+            #expect(error is CancellationError)
+        }
+    }
 }
 
 private func clientFingerprint() throws -> DiskFingerprint {

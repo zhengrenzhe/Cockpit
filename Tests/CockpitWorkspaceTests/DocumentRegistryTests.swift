@@ -40,7 +40,7 @@ import CockpitTypes
     let file = fixture.root.appendingPathComponent("document.txt")
     try Data("before".utf8).write(to: file)
     let actor = try await fixture.registry.open(at: RelativePath("document.txt"))
-    let lease = await fixture.registry.acquireInternalMutationLease()
+    let lease = try await fixture.registry.acquireInternalMutationLease()
     try Data("after".utf8).write(to: file)
 
     await fixture.registry.handleExternalChanges(in: [.root])
@@ -110,6 +110,52 @@ import CockpitTypes
     #expect(await serving.readCount == 1)
 }
 
+@Test func documentRegistryActorFlightCancellationTracksLiveOwners() async throws {
+    do {
+        let fixture = try DocumentRegistryFixture(blockActorOpen: true)
+        defer { fixture.remove() }
+        let path = try RelativePath("document.txt")
+        try Data("content".utf8).write(to: fixture.root.appendingPathComponent(path.string))
+        let serving = try #require(fixture.blockingServing)
+
+        let cancelled = Task { try await fixture.registry.open(at: path) }
+        await serving.waitUntilReadBlocks()
+        let live = Task { try await fixture.registry.open(at: path) }
+        for _ in 0..<50 { await Task.yield() }
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await cancelled.value }
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await serving.cancelledReadCount == 0)
+        #expect(await serving.readCount == 1)
+
+        await serving.releaseRead()
+        _ = try await live.value
+    }
+
+    do {
+        let fixture = try DocumentRegistryFixture(blockActorOpen: true)
+        defer { fixture.remove() }
+        let path = try RelativePath("document.txt")
+        try Data("content".utf8).write(to: fixture.root.appendingPathComponent(path.string))
+        let serving = try #require(fixture.blockingServing)
+
+        let cancelled = Task { try await fixture.registry.open(at: path) }
+        await serving.waitUntilReadBlocks()
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await cancelled.value }
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await serving.cancelledReadCount == 1)
+
+        let replacement = Task { try await fixture.registry.open(at: path) }
+        for _ in 0..<100 where await serving.readCount < 2 {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await serving.readCount == 2)
+        await serving.releaseRead()
+        _ = try await replacement.value
+    }
+}
+
 @Test func documentRegistryPrecancelledOpenNeverStartsFlight() async throws {
     let fixture = try DocumentRegistryFixture()
     defer { fixture.remove() }
@@ -137,7 +183,7 @@ import CockpitTypes
     let original = try await fixture.registry.open(at: source)
     let originalID = (await original.snapshot()).documentID
     let findCountBeforeMutation = await fixture.repository.findOrCreateCount
-    let lease = await fixture.registry.acquireInternalMutationLease(
+    let lease = try await fixture.registry.acquireInternalMutationLease(
         from: source,
         to: destination
     )
@@ -174,7 +220,10 @@ import CockpitTypes
     await serving.waitUntilReadBlocks()
     let acquired = DocumentRegistryCompletionFlag()
     let lease = Task {
-        let value = await fixture.registry.acquireInternalMutationLease(from: source, to: destination)
+        let value = try await fixture.registry.acquireInternalMutationLease(
+            from: source,
+            to: destination
+        )
         await acquired.markCompleted()
         return value
     }
@@ -183,7 +232,7 @@ import CockpitTypes
 
     await serving.releaseRead()
     _ = try await startedOpen.value
-    let heldLease = await lease.value
+    let heldLease = try await lease.value
     #expect(await acquired.isCompleted)
     await fixture.registry.releaseInternalMutationLease(heldLease)
 }
@@ -193,7 +242,10 @@ import CockpitTypes
     defer { fixture.remove() }
     let source = try RelativePath("old.txt")
     let destination = try RelativePath("new.txt")
-    let lease = await fixture.registry.acquireInternalMutationLease(from: source, to: destination)
+    let lease = try await fixture.registry.acquireInternalMutationLease(
+        from: source,
+        to: destination
+    )
     let waiting = Task { try await fixture.registry.open(at: destination) }
     for _ in 0..<50 { await Task.yield() }
 
@@ -203,6 +255,114 @@ import CockpitTypes
         _ = try await fixture.registry.open(at: destination)
     }
     #expect(await fixture.repository.findOrCreateCount == 0)
+}
+
+@Test func documentRegistryMutationBarrierOwnsCancellationWorkAndPublication() async throws {
+    do {
+        let fixture = try DocumentRegistryFixture(blockActorOpen: true)
+        defer { fixture.remove() }
+        let source = try RelativePath("old.txt")
+        let destination = try RelativePath("new.txt")
+        try Data("destination".utf8).write(to: fixture.root.appendingPathComponent(destination.string))
+        let serving = try #require(fixture.blockingServing)
+        let blockedOpen = Task { try await fixture.registry.open(at: destination) }
+        await serving.waitUntilReadBlocks()
+
+        let acquisitionCompleted = DocumentRegistryCompletionFlag()
+        let acquisition = Task {
+            do {
+                let lease = try await fixture.registry.acquireInternalMutationLease(
+                    from: source,
+                    to: destination
+                )
+                await acquisitionCompleted.markCompleted()
+                return lease
+            } catch {
+                await acquisitionCompleted.markCompleted()
+                throw error
+            }
+        }
+        for _ in 0..<50 { await Task.yield() }
+        acquisition.cancel()
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await acquisitionCompleted.isCompleted)
+
+        await serving.releaseRead()
+        _ = try await blockedOpen.value
+        var leakedLease: DocumentInternalMutationLease?
+        do {
+            leakedLease = try await acquisition.value
+            Issue.record("Expected mutation acquisition cancellation")
+        } catch {
+            #expect(error is CancellationError)
+        }
+
+        let reopened = Task { try await fixture.registry.open(at: destination) }
+        let reopenedCompleted = DocumentRegistryCompletionFlag()
+        let observedReopen = Task {
+            do {
+                _ = try await reopened.value
+                await reopenedCompleted.markCompleted()
+            } catch {
+                await reopenedCompleted.markCompleted()
+                throw error
+            }
+        }
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await reopenedCompleted.isCompleted)
+        if !(await reopenedCompleted.isCompleted) { reopened.cancel() }
+        _ = try? await observedReopen.value
+        if let leakedLease { await fixture.registry.releaseInternalMutationLease(leakedLease) }
+    }
+
+    do {
+        let fixture = try DocumentRegistryFixture(blockActorOpen: true)
+        defer { fixture.remove() }
+        let path = try RelativePath("document.txt")
+        let destination = try RelativePath("renamed.txt")
+        try Data("content".utf8).write(to: fixture.root.appendingPathComponent(path.string))
+        let serving = try #require(fixture.blockingServing)
+        let cancelled = Task { try await fixture.registry.open(at: path) }
+        await serving.waitUntilReadBlocks()
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await cancelled.value }
+
+        let acquired = DocumentRegistryCompletionFlag()
+        let writer = Task {
+            let lease = try await fixture.registry.acquireInternalMutationLease(
+                from: path,
+                to: destination
+            )
+            await acquired.markCompleted()
+            return lease
+        }
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await acquired.isCompleted == false)
+
+        await serving.releaseRead()
+        let lease = try await writer.value
+        await fixture.registry.releaseInternalMutationLease(lease)
+    }
+
+    do {
+        let fixture = try DocumentRegistryFixture(blockActorOpen: true)
+        defer { fixture.remove() }
+        let path = try RelativePath("document.txt")
+        try Data("content".utf8).write(to: fixture.root.appendingPathComponent(path.string))
+        let serving = try #require(fixture.blockingServing)
+        let opening = Task { try await fixture.registry.open(at: path) }
+        await serving.waitUntilReadBlocks()
+        let failureLease = try await fixture.registry.acquireInternalMutationLease(
+            from: RelativePath("unrelated-old.txt"),
+            to: RelativePath("unrelated-new.txt")
+        )
+        await fixture.registry.failInternalMutationLease(failureLease)
+        await serving.releaseRead()
+
+        await #expect(throws: DocumentProtocolError.recoveryRequired) {
+            _ = try await opening.value
+        }
+    }
 }
 
 final class DocumentRegistryFixture: @unchecked Sendable {
@@ -253,7 +413,9 @@ fileprivate actor BlockingDocumentServing: DocumentServing {
     private var shouldBlockNextRead = true
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
     private var readRelease: CheckedContinuation<Void, Never>?
+    private let cancellationProbe = DocumentRegistryCancellationProbe()
     private(set) var readCount = 0
+    var cancelledReadCount: Int { cancellationProbe.count }
 
     init(base: WorkspaceRootHandle) { self.base = base }
 
@@ -263,7 +425,12 @@ fileprivate actor BlockingDocumentServing: DocumentServing {
             shouldBlockNextRead = false
             readWaiters.forEach { $0.resume() }
             readWaiters.removeAll()
-            await withCheckedContinuation { readRelease = $0 }
+            let cancellationProbe = cancellationProbe
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { readRelease = $0 }
+            } onCancel: {
+                cancellationProbe.record()
+            }
         }
         return try await base.readDocument(at: path)
     }
@@ -304,4 +471,11 @@ private actor DocumentRegistryStartGate {
 private actor DocumentRegistryCompletionFlag {
     private(set) var isCompleted = false
     func markCompleted() { isCompleted = true }
+}
+
+private final class DocumentRegistryCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+    var count: Int { lock.withLock { storage } }
+    func record() { lock.withLock { storage += 1 } }
 }

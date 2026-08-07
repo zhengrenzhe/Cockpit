@@ -33,13 +33,35 @@ private struct DocumentOpenWaiter {
 
 private struct LocatorOpenFlight {
     let id: UUID
+    let barrierEpoch: UInt64
     var task: Task<Void, Never>?
     var waiters: [UUID: CheckedContinuation<DocumentActor, Error>]
+    var actorFlight: ActorFlightReference?
 }
 
 private struct ActorOpenFlight {
     let id: UUID
     let task: Task<DocumentActor, Error>
+    var owners: Set<LocatorFlightIdentity>
+}
+
+private struct LocatorFlightIdentity: Hashable, Sendable {
+    let path: RelativePath
+    let id: UUID
+}
+
+private struct ActorFlightReference: Sendable {
+    let documentID: DocumentID
+    let id: UUID
+}
+
+private struct ActiveActorOpenWork: Sendable {
+    var paths: Set<RelativePath>
+}
+
+private struct InternalMutationLeaseState: Sendable {
+    let scope: DocumentMutationScope
+    let epoch: UInt64
 }
 
 private enum OpenRequestState {
@@ -56,11 +78,15 @@ public actor DocumentRegistry {
     private let recoveryRoot: URL
     private var byPath: [RelativePath: DocumentActor] = [:]
     private var byID: [DocumentID: DocumentActor] = [:]
-    private var internalMutationLeases: [UUID: DocumentMutationScope] = [:]
-    private var mutationAcquisitionWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var internalMutationLeases: [UUID: InternalMutationLeaseState] = [:]
+    private var mutationAcquisitionWaiters: [
+        UUID: CheckedContinuation<DocumentInternalMutationLease, Error>
+    ] = [:]
+    private var mutationEpoch: UInt64 = 0
     private var queuedScopes: Set<WorkspaceDirectory> = []
     private var locatorFlights: [RelativePath: LocatorOpenFlight] = [:]
     private var actorFlights: [DocumentID: ActorOpenFlight] = [:]
+    private var activeActorOpenWork: [UUID: ActiveActorOpenWork] = [:]
     private var openRequestStates: [UUID: OpenRequestState] = [:]
     private var openWaiters: [DocumentOpenWaiter] = []
     private var recoveryRequired = false
@@ -97,15 +123,15 @@ public actor DocumentRegistry {
         }
     }
 
-    public func acquireInternalMutationLease() async -> DocumentInternalMutationLease {
-        await acquireInternalMutationLease(scope: .all)
+    public func acquireInternalMutationLease() async throws -> DocumentInternalMutationLease {
+        try await acquireInternalMutationLease(scope: .all)
     }
 
     public func acquireInternalMutationLease(
         from source: RelativePath,
         to destination: RelativePath
-    ) async -> DocumentInternalMutationLease {
-        await acquireInternalMutationLease(scope: .relocation(
+    ) async throws -> DocumentInternalMutationLease {
+        try await acquireInternalMutationLease(scope: .relocation(
             source: source,
             destination: destination
         ))
@@ -113,20 +139,18 @@ public actor DocumentRegistry {
 
     public func releaseInternalMutationLease(_ lease: DocumentInternalMutationLease) async {
         guard internalMutationLeases.removeValue(forKey: lease.id) != nil else { return }
-        resumeMutationAcquisitions()
-        resumeUnblockedOpens()
-        guard internalMutationLeases.isEmpty, !queuedScopes.isEmpty else { return }
-        let scopes = queuedScopes
-        queuedScopes.removeAll()
-        await reconcile(scopes: scopes)
+        await finishInternalMutationLeaseRemoval()
     }
 
     public func failInternalMutationLease(_ lease: DocumentInternalMutationLease) {
         guard internalMutationLeases.removeValue(forKey: lease.id) != nil else { return }
         recoveryRequired = true
-        let acquisitionWaiters = mutationAcquisitionWaiters.values
+        let acquisitionWaiters = mutationAcquisitionWaiters
         mutationAcquisitionWaiters.removeAll()
-        acquisitionWaiters.forEach { $0.resume() }
+        for (leaseID, continuation) in acquisitionWaiters {
+            internalMutationLeases.removeValue(forKey: leaseID)
+            continuation.resume(throwing: DocumentProtocolError.recoveryRequired)
+        }
         let waiters = openWaiters
         openWaiters.removeAll()
         waiters.forEach { $0.continuation.resume(throwing: DocumentProtocolError.recoveryRequired) }
@@ -190,8 +214,10 @@ public actor DocumentRegistry {
         let flightID = UUID()
         locatorFlights[path] = LocatorOpenFlight(
             id: flightID,
+            barrierEpoch: mutationEpoch,
             task: nil,
-            waiters: [requestID: continuation]
+            waiters: [requestID: continuation],
+            actorFlight: nil
         )
         let task = Task { await self.runLocatorFlight(path: path, flightID: flightID) }
         locatorFlights[path]?.task = task
@@ -211,6 +237,12 @@ public actor DocumentRegistry {
             if flight.waiters.isEmpty {
                 locatorFlights.removeValue(forKey: path)
                 flight.task?.cancel()
+                if let actorFlight = flight.actorFlight {
+                    detachActorFlightOwner(
+                        LocatorFlightIdentity(path: path, id: flight.id),
+                        from: actorFlight
+                    )
+                }
                 resumeMutationAcquisitions()
             } else {
                 locatorFlights[path] = flight
@@ -236,12 +268,20 @@ public actor DocumentRegistry {
             at: path
         )
         try Task.checkCancellation()
-        guard locatorFlights[path]?.id == flightID else { throw CancellationError() }
+        try requireOperational()
+        guard let locatorFlight = locatorFlights[path], locatorFlight.id == flightID else {
+            throw CancellationError()
+        }
+        try validatePublication(at: path, locatorBarrierEpoch: locatorFlight.barrierEpoch)
         if let actor = byPath[path] { return actor }
         if let actor = byID[metadata.documentID] { return actor }
 
-        let actorFlight: ActorOpenFlight
-        if let existing = actorFlights[metadata.documentID] {
+        let owner = LocatorFlightIdentity(path: path, id: flightID)
+        var actorFlight: ActorOpenFlight
+        if var existing = actorFlights[metadata.documentID] {
+            existing.owners.insert(owner)
+            actorFlights[metadata.documentID] = existing
+            activeActorOpenWork[existing.id]?.paths.insert(path)
             actorFlight = existing
         } else {
             let documentServing = documentServing
@@ -249,7 +289,8 @@ public actor DocumentRegistry {
             let recoveryRoot = recoveryRoot
             let id = UUID()
             let task = Task {
-                try await DocumentActor.open(
+                try Task.checkCancellation()
+                let actor = try await DocumentActor.open(
                     metadata: metadata,
                     documentServing: documentServing,
                     recoveryLog: DocumentRecoveryLog(
@@ -258,24 +299,46 @@ public actor DocumentRegistry {
                     ),
                     metadataRepository: metadataRepository
                 )
+                try Task.checkCancellation()
+                return actor
             }
-            actorFlight = ActorOpenFlight(id: id, task: task)
+            actorFlight = ActorOpenFlight(id: id, task: task, owners: [owner])
             actorFlights[metadata.documentID] = actorFlight
+            activeActorOpenWork[id] = ActiveActorOpenWork(paths: [path])
         }
+        guard var currentLocatorFlight = locatorFlights[path],
+              currentLocatorFlight.id == flightID
+        else {
+            detachActorFlightOwner(
+                owner,
+                from: ActorFlightReference(documentID: metadata.documentID, id: actorFlight.id)
+            )
+            throw CancellationError()
+        }
+        let actorReference = ActorFlightReference(
+            documentID: metadata.documentID,
+            id: actorFlight.id
+        )
+        currentLocatorFlight.actorFlight = actorReference
+        locatorFlights[path] = currentLocatorFlight
+
         let actor: DocumentActor
         do {
             actor = try await actorFlight.task.value
         } catch {
-            if actorFlights[metadata.documentID]?.id == actorFlight.id {
-                actorFlights.removeValue(forKey: metadata.documentID)
-            }
+            finishActorOpenWork(actorReference)
             throw error
         }
-        if actorFlights[metadata.documentID]?.id == actorFlight.id {
-            actorFlights.removeValue(forKey: metadata.documentID)
-        }
+        finishActorOpenWork(actorReference)
         try Task.checkCancellation()
-        guard locatorFlights[path]?.id == flightID else { throw CancellationError() }
+        try requireOperational()
+        guard let publishingFlight = locatorFlights[path], publishingFlight.id == flightID else {
+            throw CancellationError()
+        }
+        try validatePublication(
+            at: path,
+            locatorBarrierEpoch: publishingFlight.barrierEpoch
+        )
         if let existing = byPath[path] { return existing }
         if let existing = byID[metadata.documentID] { return existing }
         byPath[path] = actor
@@ -299,27 +362,121 @@ public actor DocumentRegistry {
 
     private func acquireInternalMutationLease(
         scope: DocumentMutationScope
-    ) async -> DocumentInternalMutationLease {
+    ) async throws -> DocumentInternalMutationLease {
+        try Task.checkCancellation()
+        try requireOperational()
+        mutationEpoch += 1
         let lease = DocumentInternalMutationLease(id: UUID())
-        internalMutationLeases[lease.id] = scope
-        if hasActiveFlight(intersecting: scope) {
-            await withCheckedContinuation { mutationAcquisitionWaiters[lease.id] = $0 }
+        internalMutationLeases[lease.id] = InternalMutationLeaseState(
+            scope: scope,
+            epoch: mutationEpoch
+        )
+        guard hasActiveFlight(intersecting: scope) else {
+            do {
+                try Task.checkCancellation()
+                return lease
+            } catch {
+                await abandonInternalMutationLease(lease.id)
+                throw error
+            }
         }
-        return lease
+        do {
+            let acquired = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    mutationAcquisitionWaiters[lease.id] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelMutationAcquisition(lease.id) }
+            }
+            try Task.checkCancellation()
+            try requireOperational()
+            return acquired
+        } catch {
+            await abandonInternalMutationLease(lease.id)
+            throw error
+        }
     }
 
     private func resumeMutationAcquisitions() {
-        for (leaseID, continuation) in mutationAcquisitionWaiters {
-            guard let scope = internalMutationLeases[leaseID],
-                  !hasActiveFlight(intersecting: scope)
-            else { continue }
+        guard !recoveryRequired else { return }
+        let ready = mutationAcquisitionWaiters.compactMap {
+            leaseID, continuation -> (UUID, CheckedContinuation<DocumentInternalMutationLease, Error>)? in
+            guard let state = internalMutationLeases[leaseID],
+                  !hasActiveFlight(intersecting: state.scope)
+            else { return nil }
+            return (leaseID, continuation)
+        }
+        for (leaseID, continuation) in ready {
             mutationAcquisitionWaiters.removeValue(forKey: leaseID)
-            continuation.resume()
+            continuation.resume(returning: DocumentInternalMutationLease(id: leaseID))
         }
     }
 
     private func hasActiveFlight(intersecting scope: DocumentMutationScope) -> Bool {
         locatorFlights.keys.contains { scope.contains($0) }
+            || activeActorOpenWork.values.contains { work in
+                work.paths.contains { scope.contains($0) }
+            }
+    }
+
+    private func detachActorFlightOwner(
+        _ owner: LocatorFlightIdentity,
+        from reference: ActorFlightReference
+    ) {
+        guard var actorFlight = actorFlights[reference.documentID],
+              actorFlight.id == reference.id
+        else { return }
+        actorFlight.owners.remove(owner)
+        if actorFlight.owners.isEmpty {
+            actorFlights.removeValue(forKey: reference.documentID)
+            actorFlight.task.cancel()
+        } else {
+            actorFlights[reference.documentID] = actorFlight
+        }
+    }
+
+    private func finishActorOpenWork(_ reference: ActorFlightReference) {
+        if actorFlights[reference.documentID]?.id == reference.id {
+            actorFlights.removeValue(forKey: reference.documentID)
+        }
+        activeActorOpenWork.removeValue(forKey: reference.id)
+        resumeMutationAcquisitions()
+    }
+
+    private func validatePublication(
+        at path: RelativePath,
+        locatorBarrierEpoch: UInt64
+    ) throws {
+        let predatesFlight = internalMutationLeases.values.contains { state in
+            state.scope.contains(path) && state.epoch <= locatorBarrierEpoch
+        }
+        if predatesFlight { throw CancellationError() }
+    }
+
+    private func cancelMutationAcquisition(_ leaseID: UUID) async {
+        guard let continuation = mutationAcquisitionWaiters.removeValue(forKey: leaseID) else {
+            return
+        }
+        let removed = internalMutationLeases.removeValue(forKey: leaseID) != nil
+        continuation.resume(throwing: CancellationError())
+        if removed { await finishInternalMutationLeaseRemoval() }
+    }
+
+    private func abandonInternalMutationLease(_ leaseID: UUID) async {
+        guard internalMutationLeases.removeValue(forKey: leaseID) != nil else { return }
+        await finishInternalMutationLeaseRemoval()
+    }
+
+    private func finishInternalMutationLeaseRemoval() async {
+        resumeMutationAcquisitions()
+        resumeUnblockedOpens()
+        guard !recoveryRequired,
+              internalMutationLeases.isEmpty,
+              !queuedScopes.isEmpty
+        else { return }
+        let scopes = queuedScopes
+        queuedScopes.removeAll()
+        await reconcile(scopes: scopes)
     }
 
     private func reconcile(scopes: Set<WorkspaceDirectory>) async {
@@ -381,7 +538,7 @@ public actor DocumentRegistry {
     }
 
     private func intersectsInternalMutation(_ path: RelativePath) -> Bool {
-        internalMutationLeases.values.contains { $0.contains(path) }
+        internalMutationLeases.values.contains { $0.scope.contains(path) }
     }
 
     private func requireOperational() throws {
