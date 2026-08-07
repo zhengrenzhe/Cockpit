@@ -97,7 +97,7 @@ import CockpitTypes
     let second = try #require(try await provider.reconcile(.root))
 
     let expectedFirstMutations: [FileTreeMutation] = try [
-        .remove(FileTreeEntryIdentity(environmentID: environmentID, path: RelativePath("b"))),
+        .remove(FileTreeEntryIdentity(validating: environmentID, path: RelativePath("b"))),
         .update(treeEntry(environmentID, "a", .symbolicLink)),
         .insert(treeEntry(environmentID, "d", .file)),
     ]
@@ -195,6 +195,48 @@ import CockpitTypes
     #expect(rootChanged == .allExpanded)
 }
 
+@Test func eventSourceStartFailureTerminatesCurrentAndFutureSubscribers() async throws {
+    let environmentID = EnvironmentID()
+    let provider = testProvider(environmentID, RecordingFileTreeFileSystem(entries: [.root: []]))
+    var current = provider.changes(environmentID: environmentID, after: 0).makeAsyncIterator()
+    let driver = RecordingEventStreamDriver(startResult: false)
+    let source = FileSystemEventSource(rootURL: URL(fileURLWithPath: "/recording"), driver: driver)
+    let reconciler = FileTreeReconciler(provider: provider, invalidations: source.invalidations)
+    defer { reconciler.cancel(); source.cancel() }
+
+    await #expect(throws: FileTreeProviderError.eventSourceUnavailable) { _ = try await current.next() }
+    var future = provider.changes(environmentID: environmentID, after: 0).makeAsyncIterator()
+    await #expect(throws: FileTreeProviderError.eventSourceUnavailable) { _ = try await future.next() }
+}
+
+@Test func reconciliationEnumerationFailureEndsCurrentSubscriberExplicitly() async throws {
+    let environmentID = EnvironmentID()
+    let fileSystem = RecordingFileTreeFileSystem(entries: [.root: []])
+    let provider = testProvider(environmentID, fileSystem)
+    _ = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
+    await fileSystem.setError(.filesystemEnumerationFailed, for: .root)
+    var iterator = provider.changes(environmentID: environmentID, after: 0).makeAsyncIterator()
+    let source = FakeFileSystemEventSource()
+    let reconciler = FileTreeReconciler(provider: provider, invalidations: source.invalidations)
+    defer { reconciler.cancel() }
+
+    source.send(.targeted([.root]))
+    await #expect(throws: FileTreeProviderError.filesystemEnumerationFailed) { _ = try await iterator.next() }
+}
+
+@Test func eventDriverOwnsCallbackUntilBalancedCancellation() async throws {
+    let driver = RecordingEventStreamDriver(startResult: true)
+    var source: FileSystemEventSource? = FileSystemEventSource(rootURL: URL(fileURLWithPath: "/recording"), driver: driver)
+    driver.send(paths: ["/recording/file"], flags: [FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsFile)])
+    var iterator = source!.invalidations.makeAsyncIterator()
+    #expect(try await iterator.next() == .targeted([.root]))
+    source?.cancel()
+    source = nil
+    #expect(driver.startCount == 1)
+    #expect(driver.cancelCount == 1)
+    #expect(driver.callbackReleased)
+}
+
 private func testProvider(
     _ environmentID: EnvironmentID,
     _ fileSystem: RecordingFileTreeFileSystem
@@ -213,11 +255,11 @@ private func waitForSubscriberCount(_ count: Int, provider: FileTreeProvider) as
 }
 
 private final class FakeFileSystemEventSource: @unchecked Sendable {
-    let invalidations: AsyncStream<FileSystemInvalidation>
-    private let continuation: AsyncStream<FileSystemInvalidation>.Continuation
+    let invalidations: AsyncThrowingStream<FileSystemInvalidation, Error>
+    private let continuation: AsyncThrowingStream<FileSystemInvalidation, Error>.Continuation
 
     init() {
-        (invalidations, continuation) = AsyncStream.makeStream()
+        (invalidations, continuation) = AsyncThrowingStream.makeStream()
     }
 
     func send(_ invalidation: FileSystemInvalidation) {
@@ -227,4 +269,21 @@ private final class FakeFileSystemEventSource: @unchecked Sendable {
     deinit {
         continuation.finish()
     }
+}
+
+private final class RecordingEventStreamDriver: FileSystemEventDriving, @unchecked Sendable {
+    private let startResult: Bool
+    private let lock = NSLock()
+    private var callback: (@Sendable ([String], [FSEventStreamEventFlags]) -> Void)?
+    private(set) var startCount = 0
+    private(set) var cancelCount = 0
+    var callbackReleased: Bool { lock.withLock { callback == nil } }
+
+    init(startResult: Bool) { self.startResult = startResult }
+    func start(rootURL: URL, callback: @escaping @Sendable ([String], [FSEventStreamEventFlags]) -> Void) -> Bool {
+        lock.withLock { startCount += 1; self.callback = callback }
+        return startResult
+    }
+    func cancel() { lock.withLock { cancelCount += 1; callback = nil } }
+    func send(paths: [String], flags: [FSEventStreamEventFlags]) { lock.withLock { callback }?(paths, flags) }
 }

@@ -159,6 +159,198 @@ import CockpitTypes
     #expect(first.root.canonicalRootIdentity == "first")
 }
 
+@Test func productionFilesystemNeverFollowsAnAncestorSwappedToASymbolicLink() async throws {
+    let root = try TemporaryDirectory()
+    let outside = try TemporaryDirectory()
+    defer { root.remove(); outside.remove() }
+    let safe = root.url.appendingPathComponent("safe", isDirectory: true)
+    try FileManager.default.createDirectory(at: safe, withIntermediateDirectories: false)
+    try Data("outside".utf8).write(to: outside.url.appendingPathComponent("secret.txt"))
+    let rootURL = root.url
+    let outsideURL = outside.url
+    let swap = OneShotAction {
+        try! FileManager.default.moveItem(at: safe, to: rootURL.appendingPathComponent("safe-old"))
+        try! FileManager.default.createSymbolicLink(at: safe, withDestinationURL: outsideURL)
+    }
+    let fileSystem = FoundationFileTreeFileSystem(beforeOpeningComponent: { _ in swap.run() })
+
+    await #expect(throws: FileTreeProviderError.symbolicLinkTraversal) {
+        _ = try await fileSystem.directChildren(
+            rootURL: root.url,
+            directory: .relative(RelativePath("safe"))
+        )
+    }
+    #expect(swap.didRun)
+}
+
+@Test func repeatedChildrenPublishesChangeBeforeReturningSnapshotAtTheNewRevision() async throws {
+    let environmentID = EnvironmentID()
+    let fileSystem = RecordingFileTreeFileSystem(entries: [.root: try [entry("old", .file)]])
+    let provider = FileTreeProvider(environmentID: environmentID, rootURL: URL(fileURLWithPath: "/recording"), fileSystem: fileSystem)
+    _ = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
+    var iterator = provider.changes(environmentID: environmentID, after: 0).makeAsyncIterator()
+    await fileSystem.setEntries(try [entry("new", .file)], for: .root)
+
+    let snapshot = try await provider.children(environmentID: environmentID, at: .root, generation: 2)
+    let delta = try #require(try await iterator.next())
+
+    #expect(snapshot.revision == 1)
+    #expect(snapshot.children.map(\.identity.path.string) == ["new"])
+    #expect(delta.revision == snapshot.revision)
+}
+
+@Test func publicFileTreeValuesRejectInvalidConstructionAndTamperedDecoding() async throws {
+    let environmentID = EnvironmentID()
+    let otherEnvironmentID = EnvironmentID()
+    let child = try treeEntry(environmentID, "dir/child", .file)
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeGeneration) {
+        _ = try FileTreeSnapshot(validating: environmentID, directory: .relative(RelativePath("dir")), generation: 0, revision: 0, children: [child])
+    }
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeEnvelope) {
+        _ = try FileTreeSnapshot(validating: environmentID, directory: .root, generation: 1, revision: 0, children: [child])
+    }
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeEnvelope) {
+        _ = try FileTreeSnapshot(validating: environmentID, directory: .relative(RelativePath("dir")), generation: 1, revision: 0, children: [try treeEntry(otherEnvironmentID, "dir/child", .file)])
+    }
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeEnvelope) {
+        _ = try FileTreeSnapshot(validating: environmentID, directory: .relative(RelativePath("dir")), generation: 1, revision: 0, children: [child, child])
+    }
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeDelta) {
+        _ = try FileTreeDelta(validating: environmentID, directory: .relative(RelativePath("dir")), revision: 0, mutations: [])
+    }
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeEnvelope) {
+        _ = try FileTreeDelta(validating: environmentID, directory: .relative(RelativePath("dir")), revision: 1, mutations: [.insert(try treeEntry(otherEnvironmentID, "dir/child", .file))])
+    }
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeEnvelope) {
+        _ = try FileTreeDelta(validating: environmentID, directory: .relative(RelativePath("dir")), revision: 1, mutations: [.insert(child), .update(child)])
+    }
+
+    let valid = try FileTreeSnapshot(validating: environmentID, directory: .relative(RelativePath("dir")), generation: 1, revision: 0, children: [child])
+    var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(valid)) as? [String: Any])
+    object["generation"] = 0
+    let tampered = try JSONSerialization.data(withJSONObject: object)
+    #expect(throws: CockpitDomainValidationError.invalidFileTreeGeneration) {
+        _ = try JSONDecoder().decode(FileTreeSnapshot.self, from: tampered)
+    }
+
+    let invalidDirectoryJSON = Data(#"{"relative":{"string":""}}"#.utf8)
+    #expect(throws: (any Error).self) {
+        _ = try JSONDecoder().decode(WorkspaceDirectory.self, from: invalidDirectoryJSON)
+    }
+}
+
+@Test func snapshotCapturesItsRevisionBeforeAWaitingReconcileRuns() async throws {
+    let environmentID = EnvironmentID()
+    let fileSystem = ControlledFileTreeFileSystem(responses: [
+        try [entry("old", .file)], try [entry("old", .file)], try [entry("new", .file)],
+    ])
+    let provider = FileTreeProvider(environmentID: environmentID, rootURL: URL(fileURLWithPath: "/recording"), fileSystem: fileSystem)
+    let first = Task { try await provider.children(environmentID: environmentID, at: .root, generation: 1) }
+    _ = await fileSystem.nextStarted(); await fileSystem.releaseNext(); _ = try await first.value
+
+    let repeated = Task { try await provider.children(environmentID: environmentID, at: .root, generation: 2) }
+    _ = await fileSystem.nextStarted()
+    let reconcile = Task { try await provider.reconcile(.root) }
+    await fileSystem.releaseNext()
+    _ = await fileSystem.nextStarted(); await fileSystem.releaseNext()
+
+    let snapshot = try await repeated.value
+    let delta = try #require(try await reconcile.value)
+    #expect(snapshot.revision == 0)
+    #expect(delta.revision == 1)
+}
+
+@Test func invalidationDuringFirstExpansionForcesOneFreshScan() async throws {
+    let environmentID = EnvironmentID()
+    let fileSystem = ControlledFileTreeFileSystem(responses: [
+        try [entry("stale", .file)], try [entry("fresh", .file)],
+    ])
+    let provider = FileTreeProvider(environmentID: environmentID, rootURL: URL(fileURLWithPath: "/recording"), fileSystem: fileSystem)
+    var changes = provider.changes(environmentID: environmentID, after: 0).makeAsyncIterator()
+    let expansion = Task { try await provider.children(environmentID: environmentID, at: .root, generation: 1) }
+    _ = await fileSystem.nextStarted()
+    #expect(await provider.expandedDirectories(affectedBy: .targeted([.root])).isEmpty)
+    await fileSystem.releaseNext()
+    _ = await fileSystem.nextStarted(); await fileSystem.releaseNext()
+
+    let snapshot = try await expansion.value
+    let delta = try #require(try await changes.next())
+    #expect(snapshot.children.map(\.identity.path.string) == ["fresh"])
+    #expect(snapshot.revision == 1)
+    #expect(delta.revision == 1)
+}
+
+@Test func cancelledScanDoesNotCommitAndProviderRetainsRootToken() async throws {
+    let environmentID = EnvironmentID()
+    let fileSystem = ControlledFileTreeFileSystem(responses: [
+        try [entry("old", .file)], try [entry("cancelled", .file)], try [entry("old", .file)],
+    ])
+    var weakToken: WeakToken!
+    do {
+        var token: TestLifetimeToken? = TestLifetimeToken()
+        weakToken = WeakToken(token)
+        let provider = FileTreeProvider(environmentID: environmentID, rootURL: URL(fileURLWithPath: "/recording"), rootAccessToken: token, fileSystem: fileSystem)
+        token = nil
+        let first = Task { try await provider.children(environmentID: environmentID, at: .root, generation: 1) }
+        _ = await fileSystem.nextStarted(); await fileSystem.releaseNext(); _ = try await first.value
+        let pair = AsyncThrowingStream<FileSystemInvalidation, Error>.makeStream()
+        let reconciler = FileTreeReconciler(provider: provider, invalidations: pair.stream)
+        pair.continuation.yield(.targeted([.root]))
+        _ = await fileSystem.nextStarted()
+        reconciler.cancel()
+        await fileSystem.releaseNext()
+        #expect(weakToken.value != nil)
+        let snapshotTask = Task { try await provider.children(environmentID: environmentID, at: .root, generation: 2) }
+        _ = await fileSystem.nextStarted(); await fileSystem.releaseNext()
+        #expect(try await snapshotTask.value.revision == 0)
+        pair.continuation.finish()
+    }
+    #expect(weakToken.value == nil)
+}
+
+private actor ControlledFileTreeFileSystem: FileTreeFileSystem {
+    private let responses: [[FileSystemEntryRecord]]
+    private var index = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var startedEvents: [Int] = []
+    private var startedWaiters: [CheckedContinuation<Int, Never>] = []
+
+    init(responses: [[FileSystemEntryRecord]]) {
+        self.responses = responses
+    }
+    func directChildren(rootURL: URL, directory: WorkspaceDirectory) async throws -> [FileSystemEntryRecord] {
+        let current = index; index += 1
+        if startedWaiters.isEmpty { startedEvents.append(current + 1) }
+        else { startedWaiters.removeFirst().resume(returning: current + 1) }
+        await withCheckedContinuation { waiters.append($0) }
+        return responses[current]
+    }
+    func nextStarted() async -> Int {
+        if !startedEvents.isEmpty { return startedEvents.removeFirst() }
+        return await withCheckedContinuation { startedWaiters.append($0) }
+    }
+    func releaseNext() { waiters.removeFirst().resume() }
+}
+
+private final class TestLifetimeToken: ProjectRootAccessToken, @unchecked Sendable {}
+private final class WeakToken: @unchecked Sendable {
+    weak var value: TestLifetimeToken?
+    init(_ value: TestLifetimeToken?) { self.value = value }
+}
+
+private final class OneShotAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let action: @Sendable () -> Void
+    private(set) var didRun = false
+    init(_ action: @escaping @Sendable () -> Void) { self.action = action }
+    func run() {
+        lock.lock(); defer { lock.unlock() }
+        guard !didRun else { return }
+        didRun = true
+        action()
+    }
+}
+
 func entry(_ path: String, _ kind: FileTreeEntryKind) throws -> FileSystemEntryRecord {
     FileSystemEntryRecord(relativePath: try RelativePath(path), kind: kind)
 }
@@ -168,9 +360,9 @@ func treeEntry(
     _ path: String,
     _ kind: FileTreeEntryKind
 ) throws -> FileTreeEntry {
-    FileTreeEntry(
-        identity: FileTreeEntryIdentity(
-            environmentID: environmentID,
+    try FileTreeEntry(
+        validating: FileTreeEntryIdentity(
+            validating: environmentID,
             path: try RelativePath(path)
         ),
         kind: kind
@@ -203,6 +395,10 @@ actor RecordingFileTreeFileSystem: FileTreeFileSystem {
 
     func setEntries(_ newEntries: [FileSystemEntryRecord], for directory: WorkspaceDirectory) {
         entries[directory] = newEntries
+    }
+
+    func setError(_ error: FileTreeProviderError, for directory: WorkspaceDirectory) {
+        errors[directory] = error
     }
 
     func recordedReads() -> [WorkspaceDirectory] {

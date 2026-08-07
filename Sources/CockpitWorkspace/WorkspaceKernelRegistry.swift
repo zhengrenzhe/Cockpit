@@ -12,7 +12,8 @@ public final class WorkspaceKernel: @unchecked Sendable {
         self.root = root
         let provider = FileTreeProvider(
             environmentID: environmentID,
-            rootURL: URL(fileURLWithPath: root.canonicalAbsolutePath, isDirectory: true)
+            rootURL: URL(fileURLWithPath: root.canonicalAbsolutePath, isDirectory: true),
+            rootAccessToken: root.accessToken
         )
         let eventSource = FileSystemEventSource(
             rootURL: URL(fileURLWithPath: root.canonicalAbsolutePath, isDirectory: true)

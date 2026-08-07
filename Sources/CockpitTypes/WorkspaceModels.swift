@@ -3,15 +3,46 @@ import Foundation
 public enum WorkspaceDirectory: Hashable, Codable, Sendable {
     case root
     case relative(RelativePath)
+
+    private enum CodingKeys: String, CodingKey { case root, relative }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let root = try container.decodeIfPresent(Bool.self, forKey: .root)
+        let relative = try container.decodeIfPresent(RelativePath.self, forKey: .relative)
+        switch (root, relative) {
+        case (true?, nil): self = .root
+        case (nil, let path?): self = .relative(try RelativePath(path.string))
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Exactly one workspace directory kind is required"))
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .root: try container.encode(true, forKey: .root)
+        case let .relative(path): try container.encode(try RelativePath(path.string), forKey: .relative)
+        }
+    }
 }
 
 public struct FileTreeEntryIdentity: Hashable, Codable, Sendable {
     public let environmentID: EnvironmentID
     public let path: RelativePath
 
-    public init(environmentID: EnvironmentID, path: RelativePath) {
+    public init(validating environmentID: EnvironmentID, path: RelativePath) throws {
         self.environmentID = environmentID
-        self.path = path
+        self.path = try RelativePath(path.string)
+    }
+
+    private enum CodingKeys: String, CodingKey { case environmentID, path }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(validating: container.decode(EnvironmentID.self, forKey: .environmentID), path: container.decode(RelativePath.self, forKey: .path))
+    }
+    public func encode(to encoder: Encoder) throws {
+        let valid = try Self(validating: environmentID, path: path)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(valid.environmentID, forKey: .environmentID)
+        try container.encode(valid.path, forKey: .path)
     }
 }
 
@@ -25,9 +56,20 @@ public struct FileTreeEntry: Hashable, Codable, Sendable {
     public let identity: FileTreeEntryIdentity
     public let kind: FileTreeEntryKind
 
-    public init(identity: FileTreeEntryIdentity, kind: FileTreeEntryKind) {
-        self.identity = identity
+    public init(validating identity: FileTreeEntryIdentity, kind: FileTreeEntryKind) throws {
+        self.identity = try FileTreeEntryIdentity(validating: identity.environmentID, path: identity.path)
         self.kind = kind
+    }
+    private enum CodingKeys: String, CodingKey { case identity, kind }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(validating: container.decode(FileTreeEntryIdentity.self, forKey: .identity), kind: container.decode(FileTreeEntryKind.self, forKey: .kind))
+    }
+    public func encode(to encoder: Encoder) throws {
+        let valid = try Self(validating: identity, kind: kind)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(valid.identity, forKey: .identity)
+        try container.encode(valid.kind, forKey: .kind)
     }
 }
 
@@ -39,17 +81,31 @@ public struct FileTreeSnapshot: Hashable, Codable, Sendable {
     public let children: [FileTreeEntry]
 
     public init(
-        environmentID: EnvironmentID,
+        validating environmentID: EnvironmentID,
         directory: WorkspaceDirectory,
         generation: UInt64,
         revision: UInt64,
         children: [FileTreeEntry]
-    ) {
+    ) throws {
+        guard generation > 0 else { throw CockpitDomainValidationError.invalidFileTreeGeneration }
+        guard Set(children.map(\.identity)).count == children.count,
+              children.allSatisfy({ $0.identity.environmentID == environmentID && directory.containsDirectChild($0.identity.path) })
+        else { throw CockpitDomainValidationError.invalidFileTreeEnvelope }
         self.environmentID = environmentID
         self.directory = directory
         self.generation = generation
         self.revision = revision
         self.children = children
+    }
+    private enum CodingKeys: String, CodingKey { case environmentID, directory, generation, revision, children }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(validating: c.decode(EnvironmentID.self, forKey: .environmentID), directory: c.decode(WorkspaceDirectory.self, forKey: .directory), generation: c.decode(UInt64.self, forKey: .generation), revision: c.decode(UInt64.self, forKey: .revision), children: c.decode([FileTreeEntry].self, forKey: .children))
+    }
+    public func encode(to encoder: Encoder) throws {
+        let v = try Self(validating: environmentID, directory: directory, generation: generation, revision: revision, children: children)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(v.environmentID, forKey: .environmentID); try c.encode(v.directory, forKey: .directory); try c.encode(v.generation, forKey: .generation); try c.encode(v.revision, forKey: .revision); try c.encode(v.children, forKey: .children)
     }
 }
 
@@ -66,19 +122,58 @@ public struct FileTreeDelta: Hashable, Codable, Sendable {
     public let mutations: [FileTreeMutation]
 
     public init(
-        environmentID: EnvironmentID,
+        validating environmentID: EnvironmentID,
         directory: WorkspaceDirectory,
         revision: UInt64,
         mutations: [FileTreeMutation]
-    ) {
+    ) throws {
+        guard revision > 0, !mutations.isEmpty else { throw CockpitDomainValidationError.invalidFileTreeDelta }
+        let identities = mutations.map(\.identity)
+        guard Set(identities).count == identities.count,
+              identities.allSatisfy({ $0.environmentID == environmentID && directory.containsDirectChild($0.path) })
+        else { throw CockpitDomainValidationError.invalidFileTreeEnvelope }
         self.environmentID = environmentID
         self.directory = directory
         self.revision = revision
         self.mutations = mutations
     }
+    private enum CodingKeys: String, CodingKey { case environmentID, directory, revision, mutations }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(validating: c.decode(EnvironmentID.self, forKey: .environmentID), directory: c.decode(WorkspaceDirectory.self, forKey: .directory), revision: c.decode(UInt64.self, forKey: .revision), mutations: c.decode([FileTreeMutation].self, forKey: .mutations))
+    }
+    public func encode(to encoder: Encoder) throws {
+        let v = try Self(validating: environmentID, directory: directory, revision: revision, mutations: mutations)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(v.environmentID, forKey: .environmentID); try c.encode(v.directory, forKey: .directory); try c.encode(v.revision, forKey: .revision); try c.encode(v.mutations, forKey: .mutations)
+    }
+}
+
+private extension WorkspaceDirectory {
+    func containsDirectChild(_ path: RelativePath) -> Bool {
+        let components = path.string.split(separator: "/")
+        switch self {
+        case .root: return components.count == 1
+        case let .relative(parent):
+            let parentComponents = parent.string.split(separator: "/")
+            return components.count == parentComponents.count + 1 && components.dropLast().elementsEqual(parentComponents)
+        }
+    }
+}
+
+private extension FileTreeMutation {
+    var identity: FileTreeEntryIdentity {
+        switch self {
+        case let .insert(entry), let .update(entry): return entry.identity
+        case let .remove(identity): return identity
+        }
+    }
 }
 
 public enum CockpitDomainValidationError: Error, Equatable, Sendable {
+    case invalidFileTreeGeneration
+    case invalidFileTreeEnvelope
+    case invalidFileTreeDelta
     case inconsistentWorkspaceContext
     case emptyWorkspaceRootIdentity
     case zeroActiveContextGeneration

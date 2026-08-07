@@ -5,6 +5,8 @@ public enum FileTreeProviderError: Error, Equatable, Sendable {
     case zeroGeneration
     case symbolicLinkTraversal
     case revisionUnavailable(requested: UInt64, current: UInt64)
+    case eventSourceUnavailable
+    case filesystemEnumerationFailed
 }
 
 public protocol FileTreeProviding: Sendable {

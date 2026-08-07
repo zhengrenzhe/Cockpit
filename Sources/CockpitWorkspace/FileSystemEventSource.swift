@@ -1,175 +1,93 @@
 import CoreServices
 import Foundation
+import CockpitHostCore
 import CockpitTypes
 
-enum FileSystemInvalidation: Equatable, Sendable {
-    case targeted([WorkspaceDirectory])
-    case allExpanded
+enum FileSystemInvalidation: Equatable, Sendable { case targeted([WorkspaceDirectory]); case allExpanded }
+
+protocol FileSystemEventDriving: AnyObject, Sendable {
+    func start(rootURL: URL, callback: @escaping @Sendable ([String], [FSEventStreamEventFlags]) -> Void) -> Bool
+    func cancel()
+}
+
+private final class CoreServicesEventStreamDriver: FileSystemEventDriving, @unchecked Sendable {
+    private final class CallbackBox: @unchecked Sendable {
+        let callback: @Sendable ([String], [FSEventStreamEventFlags]) -> Void
+        init(_ callback: @escaping @Sendable ([String], [FSEventStreamEventFlags]) -> Void) { self.callback = callback }
+    }
+    private let lock = NSLock()
+    private let callbackQueue = DispatchQueue(label: "com.openai.cockpit.file-tree-fsevents")
+    private var stream: FSEventStreamRef?
+    func start(rootURL: URL, callback: @escaping @Sendable ([String], [FSEventStreamEventFlags]) -> Void) -> Bool {
+        let box = CallbackBox(callback)
+        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(box).toOpaque(), retain: Self.retainContext, release: Self.releaseContext, copyDescription: nil)
+        let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot)
+        guard let created = FSEventStreamCreate(kCFAllocatorDefault, Self.callback, &context, [rootURL.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.05, flags) else { return false }
+        FSEventStreamSetDispatchQueue(created, callbackQueue)
+        guard FSEventStreamStart(created) else { FSEventStreamInvalidate(created); FSEventStreamRelease(created); return false }
+        lock.withLock { stream = created }
+        return true
+    }
+    func cancel() {
+        guard let value = lock.withLock({ let value = stream; stream = nil; return value }) else { return }
+        FSEventStreamStop(value)
+        FSEventStreamInvalidate(value)
+        FSEventStreamRelease(value)
+    }
+    deinit { cancel() }
+    private static let retainContext: CFAllocatorRetainCallBack = { info in
+        guard let info else { return nil }; _ = Unmanaged<CallbackBox>.fromOpaque(info).retain(); return UnsafeRawPointer(info)
+    }
+    private static let releaseContext: CFAllocatorReleaseCallBack = { info in
+        guard let info else { return }; Unmanaged<CallbackBox>.fromOpaque(info).release()
+    }
+    private static let callback: FSEventStreamCallback = { _, info, count, eventPaths, eventFlags, _ in
+        guard let info else { return }
+        let box = Unmanaged<CallbackBox>.fromOpaque(info).takeUnretainedValue()
+        let paths = unsafeBitCast(eventPaths, to: NSArray.self).compactMap { $0 as? String }
+        box.callback(paths, Array(UnsafeBufferPointer(start: eventFlags, count: count)))
+    }
 }
 
 final class FileSystemEventSource: @unchecked Sendable {
-    private final class CallbackBox: @unchecked Sendable {
-        let rootURL: URL
-        let continuation: AsyncStream<FileSystemInvalidation>.Continuation
-
-        init(
-            rootURL: URL,
-            continuation: AsyncStream<FileSystemInvalidation>.Continuation
-        ) {
-            self.rootURL = rootURL
-            self.continuation = continuation
-        }
-
-        func emit(paths: [String], flags: [FSEventStreamEventFlags]) {
-            guard let invalidation = FileSystemEventSource.map(
-                rootURL: rootURL,
-                paths: paths,
-                flags: flags
-            ) else { return }
-            if case .dropped = continuation.yield(invalidation) {
-                continuation.yield(.allExpanded)
-            }
-        }
-    }
-
-    let invalidations: AsyncStream<FileSystemInvalidation>
-    private let continuation: AsyncStream<FileSystemInvalidation>.Continuation
-    private let callbackBox: CallbackBox
+    let invalidations: AsyncThrowingStream<FileSystemInvalidation, Error>
+    private let continuation: AsyncThrowingStream<FileSystemInvalidation, Error>.Continuation
+    private let driver: any FileSystemEventDriving
     private let lock = NSLock()
-    private var eventStream: FSEventStreamRef?
-
-    init(rootURL: URL) {
-        let pair = AsyncStream<FileSystemInvalidation>.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        invalidations = pair.stream
-        continuation = pair.continuation
-        callbackBox = CallbackBox(rootURL: rootURL, continuation: pair.continuation)
-
-        var context = FSEventStreamContext(
-            version: 0,
-            info: Unmanaged.passUnretained(callbackBox).toOpaque(),
-            retain: nil,
-            release: nil,
-            copyDescription: nil
-        )
-        let createFlags = FSEventStreamCreateFlags(
-            kFSEventStreamCreateFlagUseCFTypes
-                | kFSEventStreamCreateFlagFileEvents
-                | kFSEventStreamCreateFlagWatchRoot
-        )
-        eventStream = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            Self.callback,
-            &context,
-            [rootURL.path] as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.05,
-            createFlags
-        )
-        guard let eventStream else {
-            continuation.finish()
-            return
+    private var cancelled = false
+    init(rootURL: URL, driver: any FileSystemEventDriving = CoreServicesEventStreamDriver()) {
+        let pair = AsyncThrowingStream<FileSystemInvalidation, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        invalidations = pair.stream; continuation = pair.continuation; self.driver = driver
+        let started = driver.start(rootURL: rootURL) { [continuation = pair.continuation] paths, flags in
+            guard let invalidation = Self.map(rootURL: rootURL, paths: paths, flags: flags) else { return }
+            if case .dropped = continuation.yield(invalidation) { continuation.yield(.allExpanded) }
         }
-        FSEventStreamSetDispatchQueue(
-            eventStream,
-            DispatchQueue(label: "com.openai.cockpit.file-tree-fsevents")
-        )
-        guard FSEventStreamStart(eventStream) else {
-            FSEventStreamInvalidate(eventStream)
-            FSEventStreamRelease(eventStream)
-            self.eventStream = nil
-            continuation.finish()
-            return
-        }
+        if !started { pair.continuation.finish(throwing: FileTreeProviderError.eventSourceUnavailable) }
     }
-
-    deinit {
-        cancel()
-    }
-
     func cancel() {
-        lock.lock()
-        let stream = eventStream
-        eventStream = nil
-        lock.unlock()
-        guard let stream else { return }
-        FSEventStreamStop(stream)
-        FSEventStreamInvalidate(stream)
-        FSEventStreamRelease(stream)
-        continuation.finish()
+        let perform = lock.withLock { if cancelled { return false }; cancelled = true; return true }
+        guard perform else { return }; driver.cancel(); continuation.finish()
     }
-
-    static func map(
-        rootURL: URL,
-        paths: [String],
-        flags: [FSEventStreamEventFlags]
-    ) -> FileSystemInvalidation? {
+    deinit { cancel() }
+    static func map(rootURL: URL, paths: [String], flags: [FSEventStreamEventFlags]) -> FileSystemInvalidation? {
         guard paths.count == flags.count else { return .allExpanded }
-        let conservativeFlags = FSEventStreamEventFlags(
-            kFSEventStreamEventFlagMustScanSubDirs
-                | kFSEventStreamEventFlagUserDropped
-                | kFSEventStreamEventFlagKernelDropped
-                | kFSEventStreamEventFlagEventIdsWrapped
-                | kFSEventStreamEventFlagRootChanged
-        )
-        if flags.contains(where: { $0 & conservativeFlags != 0 }) {
-            return .allExpanded
+        let conservative = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped | kFSEventStreamEventFlagRootChanged)
+        if flags.contains(where: { $0 & conservative != 0 }) { return .allExpanded }
+        let root = rootURL.standardizedFileURL.path; var result: Set<WorkspaceDirectory> = []
+        for (raw, flag) in zip(paths, flags) {
+            let path = URL(fileURLWithPath: raw).standardizedFileURL.path
+            let prefix = root.hasSuffix("/") ? root : root + "/"
+            let relative: String
+            if path == root { relative = "" } else { guard path.hasPrefix(prefix) else { continue }; relative = String(path.dropFirst(prefix.count)) }
+            let components = relative.split(separator: "/")
+            if components.count <= 1 { result.insert(.root) }
+            else if let parent = try? RelativePath(components.dropLast().joined(separator: "/")) { result.insert(.relative(parent)) }
+            if flag & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0, let directory = try? RelativePath(relative) { result.insert(.relative(directory)) }
         }
-
-        let rootPath = rootURL.standardizedFileURL.path
-        var directories: Set<WorkspaceDirectory> = []
-        for (path, flag) in zip(paths, flags) {
-            let eventPath = URL(fileURLWithPath: path).standardizedFileURL.path
-            guard let relative = relativePath(eventPath, under: rootPath) else { continue }
-            let components = relative.split(separator: "/").map(String.init)
-            if components.count <= 1 {
-                directories.insert(.root)
-            } else {
-                let parent = components.dropLast().joined(separator: "/")
-                if let path = try? RelativePath(parent) {
-                    directories.insert(.relative(path))
-                }
-            }
-            if flag & FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsDir) != 0,
-               !relative.isEmpty,
-               let path = try? RelativePath(relative) {
-                directories.insert(.relative(path))
-            }
-        }
-        guard !directories.isEmpty else { return nil }
-        return .targeted(directories.sorted(by: directoryPrecedes))
+        guard !result.isEmpty else { return nil }
+        return .targeted(result.sorted(by: directoryPrecedes))
     }
-
-    private static let callback: FSEventStreamCallback = {
-        _, info, count, eventPaths, eventFlags, _ in
-        guard let info else { return }
-        let box = Unmanaged<CallbackBox>.fromOpaque(info).takeUnretainedValue()
-        let pathArray = unsafeBitCast(eventPaths, to: NSArray.self)
-        let paths = pathArray.compactMap { $0 as? String }
-        let flags = Array(UnsafeBufferPointer(start: eventFlags, count: count))
-        box.emit(paths: paths, flags: flags)
-    }
-
-    private static func relativePath(_ path: String, under root: String) -> String? {
-        if path == root { return "" }
-        let prefix = root.hasSuffix("/") ? root : root + "/"
-        guard path.hasPrefix(prefix) else { return nil }
-        return String(path.dropFirst(prefix.count))
-    }
-
-    private static func directoryPrecedes(
-        _ lhs: WorkspaceDirectory,
-        _ rhs: WorkspaceDirectory
-    ) -> Bool {
-        switch (lhs, rhs) {
-        case (.root, .root): return false
-        case (.root, _): return true
-        case (_, .root): return false
-        case let (.relative(lhsPath), .relative(rhsPath)):
-            let comparison = lhsPath.string.localizedStandardCompare(rhsPath.string)
-            if comparison != .orderedSame { return comparison == .orderedAscending }
-            return lhsPath.string < rhsPath.string
-        }
+    private static func directoryPrecedes(_ l: WorkspaceDirectory, _ r: WorkspaceDirectory) -> Bool {
+        switch (l, r) { case (.root, .root): return false; case (.root, _): return true; case (_, .root): return false; case let (.relative(a), .relative(b)): let c = a.string.localizedStandardCompare(b.string); return c == .orderedSame ? a.string < b.string : c == .orderedAscending }
     }
 }
