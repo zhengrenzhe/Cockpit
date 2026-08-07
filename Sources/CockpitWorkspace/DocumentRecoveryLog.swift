@@ -25,31 +25,48 @@ public struct DocumentRecoveryResult: Sendable {
     }
 }
 
-enum DocumentRecoveryLogInjectedFailure: Sendable {
-    case appendSync
-    case compactionAfterCheckpointCommit
+struct RecoveryLogSystemCalls: @unchecked Sendable {
+    let write: @Sendable (Int32, UnsafeRawPointer, Int) -> Int
+    let fsync: @Sendable (Int32) -> Int32
+    let rename: @Sendable (String, String) -> Int32
+
+    init(
+        write: @escaping @Sendable (Int32, UnsafeRawPointer, Int) -> Int,
+        fsync: @escaping @Sendable (Int32) -> Int32,
+        rename: @escaping @Sendable (String, String) -> Int32
+    ) {
+        self.write = write
+        self.fsync = fsync
+        self.rename = rename
+    }
+
+    static let live = RecoveryLogSystemCalls(
+        write: { Darwin.write($0, $1, $2) },
+        fsync: { Darwin.fsync($0) },
+        rename: { Darwin.rename($0, $1) }
+    )
 }
 
 public final class DocumentRecoveryLog: @unchecked Sendable {
     private let rootURL: URL
     private let documentID: DocumentID
-    private let injectedFailure: DocumentRecoveryLogInjectedFailure?
+    private let systemCalls: RecoveryLogSystemCalls
     private let queue = DispatchQueue(label: "com.openai.cockpit.document-recovery")
 
     public init(rootURL: URL, documentID: DocumentID) {
         self.rootURL = rootURL.standardizedFileURL
         self.documentID = documentID
-        self.injectedFailure = nil
+        self.systemCalls = .live
     }
 
     init(
         rootURL: URL,
         documentID: DocumentID,
-        injectedFailure: DocumentRecoveryLogInjectedFailure
+        systemCalls: RecoveryLogSystemCalls
     ) {
         self.rootURL = rootURL.standardizedFileURL
         self.documentID = documentID
-        self.injectedFailure = injectedFailure
+        self.systemCalls = systemCalls
     }
 
     public func append(
@@ -75,11 +92,8 @@ public final class DocumentRecoveryLog: @unchecked Sendable {
             guard fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
                 throw Self.posixError(errno)
             }
-            try Self.writeAll(frame, descriptor: fd)
-            if self.injectedFailure == .appendSync {
-                throw Self.injectedError("append-fsync")
-            }
-            try Self.synchronize(fd)
+            try self.writeAll(frame, descriptor: fd)
+            try self.synchronize(fd)
         }
     }
 
@@ -101,10 +115,6 @@ public final class DocumentRecoveryLog: @unchecked Sendable {
             )
             let checkpointFrame = try DocumentMessages.encodeDelimited(checkpoint)
             try self.publishAtomically(checkpointFrame, to: self.checkpointURL)
-
-            if self.injectedFailure == .compactionAfterCheckpointCommit {
-                return .compactionDeferred
-            }
 
             do {
                 let recovered = try self.recoverSynchronously()
@@ -227,16 +237,16 @@ public final class DocumentRecoveryLog: @unchecked Sendable {
         guard fchmod(fd, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
             throw Self.posixError(errno)
         }
-        try Self.writeAll(data, descriptor: fd)
-        try Self.synchronize(fd)
-        guard rename(temporary.path, destination.path) == 0 else {
+        try writeAll(data, descriptor: fd)
+        try synchronize(fd)
+        guard systemCalls.rename(temporary.path, destination.path) == 0 else {
             throw Self.posixError(errno)
         }
         renamed = true
         let rootFD = open(rootURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard rootFD >= 0 else { throw Self.posixError(errno) }
         defer { close(rootFD) }
-        try Self.synchronize(rootFD)
+        try synchronize(rootFD)
     }
 
     private func readFile(_ url: URL) throws -> Data {
@@ -273,32 +283,32 @@ public final class DocumentRecoveryLog: @unchecked Sendable {
         }
     }
 
-    private static func writeAll(_ data: Data, descriptor: Int32) throws {
+    private func writeAll(_ data: Data, descriptor: Int32) throws {
         try data.withUnsafeBytes { bytes in
             guard let base = bytes.baseAddress else { return }
             var offset = 0
             while offset < bytes.count {
-                let count = Darwin.write(descriptor, base.advanced(by: offset), bytes.count - offset)
+                let count = systemCalls.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    bytes.count - offset
+                )
                 if count < 0, errno == EINTR { continue }
-                guard count > 0 else { throw posixError(count == 0 ? EIO : errno) }
+                guard count > 0 else { throw Self.posixError(count == 0 ? EIO : errno) }
                 offset += count
             }
         }
     }
 
-    private static func synchronize(_ descriptor: Int32) throws {
+    private func synchronize(_ descriptor: Int32) throws {
         while true {
-            if fsync(descriptor) == 0 { return }
+            if systemCalls.fsync(descriptor) == 0 { return }
             if errno == EINTR { continue }
-            throw posixError(errno)
+            throw Self.posixError(errno)
         }
     }
 
     private static func posixError(_ code: Int32) -> NSError {
         NSError(domain: NSPOSIXErrorDomain, code: Int(code))
-    }
-
-    private static func injectedError(_ operation: String) -> NSError {
-        NSError(domain: "CockpitDocumentRecoveryInjected", code: Int(EIO), userInfo: ["operation": operation])
     }
 }

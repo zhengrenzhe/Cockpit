@@ -1,10 +1,39 @@
 import Darwin
+import CryptoKit
 import Foundation
 import Testing
 import CockpitHostCore
 import CockpitProtocol
 import CockpitTypes
 @testable import CockpitWorkspace
+
+@Test func workspaceRootDocumentFingerprintMatchesIndependentFDStatAndLiteralSHA256() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let target = fixture.root.appendingPathComponent("fingerprint.txt")
+    try Data("original\r\n".utf8).write(to: target)
+    let descriptor = open(target.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+    defer { close(descriptor) }
+    var metadata = stat()
+    guard fstat(descriptor, &metadata) == 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+
+    let snapshot = try await WorkspaceRootHandle(rootURL: fixture.root)
+        .readDocument(at: RelativePath("fingerprint.txt"))
+    let digestHex = snapshot.fingerprint.contentSHA256.bytes
+        .map { String(format: "%02x", $0) }
+        .joined()
+
+    #expect(snapshot.fingerprint.deviceID == UInt64(metadata.st_dev))
+    #expect(snapshot.fingerprint.inode == UInt64(metadata.st_ino))
+    #expect(snapshot.fingerprint.byteCount == UInt64(metadata.st_size))
+    #expect(snapshot.fingerprint.modificationTimeSeconds == Int64(metadata.st_mtimespec.tv_sec))
+    #expect(snapshot.fingerprint.modificationTimeNanoseconds == UInt32(metadata.st_mtimespec.tv_nsec))
+    #expect(digestHex == "1eba4dbd9cfcf594a9a99c3fa2da9b50f05899d721aa7e82795793d78c0e7904")
+    #expect(Data(CryptoKit.SHA256.hash(data: snapshot.data)) == snapshot.fingerprint.contentSHA256.bytes)
+}
 
 @Test func workspaceRootDocumentReadsStableBytesAndAtomicallyWritesExpectedIdentity() async throws {
     let fixture = try FileOperationFixture()

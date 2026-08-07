@@ -69,6 +69,38 @@ import CockpitTypes
     }
 }
 
+@Test func documentRecoveryDelimitedVarintRejectsNonCanonicalAndOverflowWithoutTrapping() {
+    #expect(throws: DocumentDelimitedError.malformed) {
+        _ = try DocumentMessages.decodeDelimitedRecord(Data([0x80, 0x00]))
+    }
+    #expect(throws: DocumentDelimitedError.malformed) {
+        _ = try DocumentMessages.decodeDelimitedRecord(
+            Data([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02])
+        )
+    }
+    #expect(throws: DocumentDelimitedError.truncated) {
+        _ = try DocumentMessages.decodeDelimitedRecord(
+            Data([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F])
+        )
+    }
+}
+
+@Test func documentRecoveryFingerprintCodableRejectsInvalidNanoseconds() {
+    let json = Data(#"""
+    {
+      "deviceID": 1,
+      "inode": 2,
+      "byteCount": 3,
+      "modificationTimeSeconds": 4,
+      "modificationTimeNanoseconds": 1000000000,
+      "contentSHA256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }
+    """#.utf8)
+    #expect(throws: DecodingError.self) {
+        _ = try JSONDecoder().decode(DiskFingerprint.self, from: json)
+    }
+}
+
 private let protocol11 = ProtocolVersion(major: 1, minor: 1)
 
 private func protocolUUID(_ suffix: Int) throws -> UUID {

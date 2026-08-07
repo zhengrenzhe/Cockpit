@@ -339,9 +339,10 @@ private func unframe(_ data: Data) throws -> (body: Data, consumed: Int) {
         if byte & 0x80 == 0 {
             if prefixCount > 1, payload == 0 { throw DocumentDelimitedError.malformed }
             guard length <= UInt64(Int.max) else { throw DocumentDelimitedError.malformed }
+            guard length <= UInt64(data.count - prefixCount) else {
+                throw DocumentDelimitedError.truncated
+            }
             let end = prefixCount + Int(length)
-            guard end >= prefixCount else { throw DocumentDelimitedError.malformed }
-            guard data.count >= end else { throw DocumentDelimitedError.truncated }
             return (data.subdata(in: prefixCount..<end), end)
         }
         shift += 7
