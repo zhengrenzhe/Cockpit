@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 import CockpitClientCore
@@ -237,6 +238,61 @@ import CockpitTypes
     #expect(throws: (any Error).self) {
         _ = try JSONDecoder().decode(WorkspaceDirectory.self, from: invalidDirectoryJSON)
     }
+
+    let invalidPath = try JSONDecoder().decode(RelativePath.self, from: Data(#"{"string":""}"#.utf8))
+    let invalidDirectory = WorkspaceDirectory.relative(invalidPath)
+    #expect(throws: (any Error).self) {
+        _ = try FileTreeSnapshot(validating: environmentID, directory: invalidDirectory, generation: 1, revision: 0, children: [])
+    }
+    #expect(throws: (any Error).self) {
+        _ = try FileTreeDelta(validating: environmentID, directory: invalidDirectory, revision: 1, mutations: [.insert(try treeEntry(environmentID, "child", .file))])
+    }
+    #expect(throws: (any Error).self) {
+        _ = try JSONEncoder().encode(invalidDirectory)
+    }
+}
+
+@Test func gateCancellationAfterOwnershipNeverLeaksTheLock() async throws {
+    let controller = GateCancellationController(cancelOnGrant: 1)
+    let freeGate = FileTreeOperationGate(onOwnershipGranted: { controller.ownershipGranted() })
+    let freeTask = controller.task {
+        try await freeGate.acquire()
+        do { try Task.checkCancellation() }
+        catch { await freeGate.release(); throw error }
+        await freeGate.release()
+    }
+    await #expect(throws: CancellationError.self) { try await freeTask.value }
+    #expect(await freeGate.hasOwner == false)
+
+    let handoffController = GateCancellationController(cancelOnGrant: 2)
+    let handoffGate = FileTreeOperationGate(onOwnershipGranted: { handoffController.ownershipGranted() })
+    try await handoffGate.acquire()
+    let waiter = handoffController.task {
+        try await handoffGate.acquire()
+        do { try Task.checkCancellation() }
+        catch { await handoffGate.release(); throw error }
+        await handoffGate.release()
+    }
+    while await handoffGate.waiterCount != 1 { await Task.yield() }
+    await handoffGate.release()
+    await #expect(throws: CancellationError.self) { try await waiter.value }
+    #expect(await handoffGate.hasOwner == false)
+
+    try await handoffGate.acquire()
+    await handoffGate.release()
+}
+
+@Test func fdopendirFailureClosesTheSuccessfulDuplicateExactlyOnce() async throws {
+    let root = try TemporaryDirectory()
+    defer { root.remove() }
+    let api = RecordingDirectoryStreamAPI(duplicatedFD: 71, stream: nil)
+    let fileSystem = FoundationFileTreeFileSystem(directoryStreamAPI: api)
+
+    await #expect(throws: (any Error).self) {
+        _ = try await fileSystem.directChildren(rootURL: root.url, directory: .root)
+    }
+    #expect(api.duplicatedInputs.count == 1)
+    #expect(api.closedFDs == [71])
 }
 
 @Test func snapshotCapturesItsRevisionBeforeAWaitingReconcileRuns() async throws {
@@ -297,8 +353,12 @@ import CockpitTypes
         let reconciler = FileTreeReconciler(provider: provider, invalidations: pair.stream)
         pair.continuation.yield(.targeted([.root]))
         _ = await fileSystem.nextStarted()
-        reconciler.cancel()
+        let join = BlockingJoinProbe { reconciler.cancelAndWait() }
+        join.start()
+        await join.waitUntilStarted()
+        #expect(join.hasCompleted == false)
         await fileSystem.releaseNext()
+        await join.waitUntilCompleted()
         #expect(weakToken.value != nil)
         let snapshotTask = Task { try await provider.children(environmentID: environmentID, at: .root, generation: 2) }
         _ = await fileSystem.nextStarted(); await fileSystem.releaseNext()
@@ -336,6 +396,65 @@ private final class TestLifetimeToken: ProjectRootAccessToken, @unchecked Sendab
 private final class WeakToken: @unchecked Sendable {
     weak var value: TestLifetimeToken?
     init(_ value: TestLifetimeToken?) { self.value = value }
+}
+
+private final class GateCancellationController: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cancelOnGrant: Int
+    private var grants = 0
+    private var cancellation: (@Sendable () -> Void)?
+    init(cancelOnGrant: Int) { self.cancelOnGrant = cancelOnGrant }
+    func task(_ operation: @escaping @Sendable () async throws -> Void) -> Task<Void, Error> {
+        let pair = AsyncStream<Void>.makeStream()
+        let task = Task { var iterator = pair.stream.makeAsyncIterator(); _ = await iterator.next(); try await operation() }
+        lock.withLock { cancellation = { task.cancel() } }
+        pair.continuation.yield(); pair.continuation.finish()
+        return task
+    }
+    func ownershipGranted() {
+        let action: (@Sendable () -> Void)? = lock.withLock {
+            grants += 1
+            return grants == cancelOnGrant ? cancellation : nil
+        }
+        action?()
+    }
+}
+
+private final class RecordingDirectoryStreamAPI: DirectoryStreamAPI, @unchecked Sendable {
+    let duplicatedFD: Int32
+    let stream: UnsafeMutablePointer<DIR>?
+    private let lock = NSLock()
+    private(set) var duplicatedInputs: [Int32] = []
+    private(set) var closedFDs: [Int32] = []
+    init(duplicatedFD: Int32, stream: UnsafeMutablePointer<DIR>?) { self.duplicatedFD = duplicatedFD; self.stream = stream }
+    func duplicate(_ fd: Int32) -> Int32 { lock.withLock { duplicatedInputs.append(fd) }; return duplicatedFD }
+    func openStream(_ fd: Int32) -> UnsafeMutablePointer<DIR>? { stream }
+    func close(_ fd: Int32) { lock.withLock { closedFDs.append(fd) } }
+}
+
+private final class BlockingJoinProbe: @unchecked Sendable {
+    private let operation: @Sendable () -> Void
+    private let started = AsyncStream<Void>.makeStream()
+    private let completed = AsyncStream<Void>.makeStream()
+    private let lock = NSLock()
+    private var startedIterator: AsyncStream<Void>.Iterator
+    private var completedIterator: AsyncStream<Void>.Iterator
+    private(set) var hasCompleted = false
+    init(operation: @escaping @Sendable () -> Void) {
+        self.operation = operation
+        startedIterator = started.stream.makeAsyncIterator()
+        completedIterator = completed.stream.makeAsyncIterator()
+    }
+    func start() {
+        DispatchQueue.global().async { [self] in
+            started.continuation.yield()
+            operation()
+            lock.withLock { hasCompleted = true }
+            completed.continuation.yield()
+        }
+    }
+    func waitUntilStarted() async { _ = await startedIterator.next() }
+    func waitUntilCompleted() async { _ = await completedIterator.next() }
 }
 
 private final class OneShotAction: @unchecked Sendable {

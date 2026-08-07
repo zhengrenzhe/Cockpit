@@ -10,29 +10,92 @@ protocol FileSystemEventDriving: AnyObject, Sendable {
     func cancel()
 }
 
-private final class CoreServicesEventStreamDriver: FileSystemEventDriving, @unchecked Sendable {
+protocol FSEventStreamAPI: Sendable {
+    func create(
+        callback: @escaping FSEventStreamCallback,
+        context: inout FSEventStreamContext,
+        paths: CFArray,
+        sinceWhen: FSEventStreamEventId,
+        latency: CFTimeInterval,
+        flags: FSEventStreamCreateFlags
+    ) -> FSEventStreamRef?
+    func setDispatchQueue(_ stream: FSEventStreamRef, queue: DispatchQueue)
+    func start(_ stream: FSEventStreamRef) -> Bool
+    func stop(_ stream: FSEventStreamRef)
+    func invalidate(_ stream: FSEventStreamRef)
+    func release(_ stream: FSEventStreamRef)
+}
+
+private struct CoreServicesFSEventStreamAPI: FSEventStreamAPI {
+    func create(
+        callback: @escaping FSEventStreamCallback,
+        context: inout FSEventStreamContext,
+        paths: CFArray,
+        sinceWhen: FSEventStreamEventId,
+        latency: CFTimeInterval,
+        flags: FSEventStreamCreateFlags
+    ) -> FSEventStreamRef? {
+        FSEventStreamCreate(
+            kCFAllocatorDefault,
+            callback,
+            &context,
+            paths,
+            sinceWhen,
+            latency,
+            flags
+        )
+    }
+
+    func setDispatchQueue(_ stream: FSEventStreamRef, queue: DispatchQueue) {
+        FSEventStreamSetDispatchQueue(stream, queue)
+    }
+
+    func start(_ stream: FSEventStreamRef) -> Bool {
+        FSEventStreamStart(stream)
+    }
+
+    func stop(_ stream: FSEventStreamRef) {
+        FSEventStreamStop(stream)
+    }
+
+    func invalidate(_ stream: FSEventStreamRef) {
+        FSEventStreamInvalidate(stream)
+    }
+
+    func release(_ stream: FSEventStreamRef) {
+        FSEventStreamRelease(stream)
+    }
+}
+
+final class CoreServicesEventStreamDriver: FileSystemEventDriving, @unchecked Sendable {
     private final class CallbackBox: @unchecked Sendable {
         let callback: @Sendable ([String], [FSEventStreamEventFlags]) -> Void
         init(_ callback: @escaping @Sendable ([String], [FSEventStreamEventFlags]) -> Void) { self.callback = callback }
     }
     private let lock = NSLock()
     private let callbackQueue = DispatchQueue(label: "com.openai.cockpit.file-tree-fsevents")
+    private let api: any FSEventStreamAPI
     private var stream: FSEventStreamRef?
+
+    init(api: any FSEventStreamAPI = CoreServicesFSEventStreamAPI()) {
+        self.api = api
+    }
+
     func start(rootURL: URL, callback: @escaping @Sendable ([String], [FSEventStreamEventFlags]) -> Void) -> Bool {
         let box = CallbackBox(callback)
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(box).toOpaque(), retain: Self.retainContext, release: Self.releaseContext, copyDescription: nil)
         let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot)
-        guard let created = FSEventStreamCreate(kCFAllocatorDefault, Self.callback, &context, [rootURL.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.05, flags) else { return false }
-        FSEventStreamSetDispatchQueue(created, callbackQueue)
-        guard FSEventStreamStart(created) else { FSEventStreamInvalidate(created); FSEventStreamRelease(created); return false }
+        guard let created = api.create(callback: Self.callback, context: &context, paths: [rootURL.path] as CFArray, sinceWhen: FSEventStreamEventId(kFSEventStreamEventIdSinceNow), latency: 0.05, flags: flags) else { return false }
+        api.setDispatchQueue(created, queue: callbackQueue)
+        guard api.start(created) else { api.invalidate(created); api.release(created); return false }
         lock.withLock { stream = created }
         return true
     }
     func cancel() {
         guard let value = lock.withLock({ let value = stream; stream = nil; return value }) else { return }
-        FSEventStreamStop(value)
-        FSEventStreamInvalidate(value)
-        FSEventStreamRelease(value)
+        api.stop(value)
+        api.invalidate(value)
+        api.release(value)
     }
     deinit { cancel() }
     private static let retainContext: CFAllocatorRetainCallBack = { info in

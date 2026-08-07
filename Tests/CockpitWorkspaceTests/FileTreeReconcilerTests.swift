@@ -237,6 +237,27 @@ import CockpitTypes
     #expect(driver.callbackReleased)
 }
 
+@Test func coreServicesDriverExercisesBalancedContextAndLifecycleThroughLowLevelAPI() async throws {
+    let successAPI = RecordingFSEventStreamAPI(startResult: true)
+    let successDriver = CoreServicesEventStreamDriver(api: successAPI)
+    let received = AsyncStream<[String]>.makeStream()
+    #expect(successDriver.start(rootURL: URL(fileURLWithPath: "/recording")) { paths, _ in received.continuation.yield(paths) })
+    successAPI.emit(paths: ["/recording/file"], flags: [FSEventStreamEventFlags(kFSEventStreamEventFlagItemIsFile)])
+    var iterator = received.stream.makeAsyncIterator()
+    #expect(await iterator.next() == ["/recording/file"])
+    successDriver.cancel()
+    #expect(successAPI.operations == ["create", "setQueue", "start", "stop", "invalidate", "release"])
+    #expect(successAPI.retainCount == 1)
+    #expect(successAPI.releaseCount == 1)
+
+    let failureAPI = RecordingFSEventStreamAPI(startResult: false)
+    let failureDriver = CoreServicesEventStreamDriver(api: failureAPI)
+    #expect(failureDriver.start(rootURL: URL(fileURLWithPath: "/recording")) { _, _ in } == false)
+    #expect(failureAPI.operations == ["create", "setQueue", "start", "invalidate", "release"])
+    #expect(failureAPI.retainCount == 1)
+    #expect(failureAPI.releaseCount == 1)
+}
+
 private func testProvider(
     _ environmentID: EnvironmentID,
     _ fileSystem: RecordingFileTreeFileSystem
@@ -286,4 +307,45 @@ private final class RecordingEventStreamDriver: FileSystemEventDriving, @uncheck
     }
     func cancel() { lock.withLock { cancelCount += 1; callback = nil } }
     func send(paths: [String], flags: [FSEventStreamEventFlags]) { lock.withLock { callback }?(paths, flags) }
+}
+
+private final class RecordingFSEventStreamAPI: FSEventStreamAPI, @unchecked Sendable {
+    private let handle = OpaquePointer(bitPattern: 1)!
+    private let startResult: Bool
+    private let lock = NSLock()
+    private var callback: FSEventStreamCallback?
+    private var context: FSEventStreamContext?
+    private(set) var operations: [String] = []
+    private(set) var retainCount = 0
+    private(set) var releaseCount = 0
+    init(startResult: Bool) { self.startResult = startResult }
+    func create(callback: @escaping FSEventStreamCallback, context: inout FSEventStreamContext, paths: CFArray, sinceWhen: FSEventStreamEventId, latency: CFTimeInterval, flags: FSEventStreamCreateFlags) -> FSEventStreamRef? {
+        operations.append("create")
+        self.callback = callback
+        if let retain = context.retain, let info = context.info {
+            context.info = UnsafeMutableRawPointer(mutating: retain(info))
+            retainCount += 1
+        }
+        self.context = context
+        return handle
+    }
+    func setDispatchQueue(_ stream: FSEventStreamRef, queue: DispatchQueue) { operations.append("setQueue") }
+    func start(_ stream: FSEventStreamRef) -> Bool { operations.append("start"); return startResult }
+    func stop(_ stream: FSEventStreamRef) { operations.append("stop") }
+    func invalidate(_ stream: FSEventStreamRef) { operations.append("invalidate") }
+    func release(_ stream: FSEventStreamRef) {
+        operations.append("release")
+        if let release = context?.release, let info = context?.info { release(info); releaseCount += 1 }
+        context = nil
+    }
+    func emit(paths: [String], flags: [FSEventStreamEventFlags]) {
+        guard let callback, let info = context?.info else { return }
+        let array = paths as NSArray
+        flags.withUnsafeBufferPointer { flagBuffer in
+            var ids = Array(repeating: FSEventStreamEventId(1), count: paths.count)
+            ids.withUnsafeMutableBufferPointer { idBuffer in
+                callback(handle, info, paths.count, unsafeBitCast(array, to: UnsafeMutableRawPointer.self), flagBuffer.baseAddress!, idBuffer.baseAddress!)
+            }
+        }
+    }
 }

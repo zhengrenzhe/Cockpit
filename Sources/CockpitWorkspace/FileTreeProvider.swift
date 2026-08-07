@@ -13,23 +13,40 @@ protocol FileTreeFileSystem: Sendable {
     func directChildren(rootURL: URL, directory: WorkspaceDirectory) async throws -> [FileSystemEntryRecord]
 }
 
+protocol DirectoryStreamAPI: Sendable {
+    func duplicate(_ fd: Int32) -> Int32
+    func openStream(_ fd: Int32) -> UnsafeMutablePointer<DIR>?
+    func close(_ fd: Int32)
+}
+
+private struct DarwinDirectoryStreamAPI: DirectoryStreamAPI {
+    func duplicate(_ fd: Int32) -> Int32 { Darwin.dup(fd) }
+    func openStream(_ fd: Int32) -> UnsafeMutablePointer<DIR>? { Darwin.fdopendir(fd) }
+    func close(_ fd: Int32) { Darwin.close(fd) }
+}
+
 final class FoundationFileTreeFileSystem: FileTreeFileSystem, @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.openai.cockpit.file-tree-io")
     private let beforeOpeningComponent: @Sendable (String) -> Void
+    private let directoryStreamAPI: any DirectoryStreamAPI
 
-    init(beforeOpeningComponent: @escaping @Sendable (String) -> Void = { _ in }) {
+    init(
+        directoryStreamAPI: any DirectoryStreamAPI = DarwinDirectoryStreamAPI(),
+        beforeOpeningComponent: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
+        self.directoryStreamAPI = directoryStreamAPI
         self.beforeOpeningComponent = beforeOpeningComponent
     }
 
     func directChildren(rootURL: URL, directory: WorkspaceDirectory) async throws -> [FileSystemEntryRecord] {
         try await withCheckedThrowingContinuation { continuation in
-            queue.async { [beforeOpeningComponent] in
-                continuation.resume(with: Result { try Self.scan(rootURL: rootURL, directory: directory, beforeOpeningComponent: beforeOpeningComponent) })
+            queue.async { [beforeOpeningComponent, directoryStreamAPI] in
+                continuation.resume(with: Result { try Self.scan(rootURL: rootURL, directory: directory, directoryStreamAPI: directoryStreamAPI, beforeOpeningComponent: beforeOpeningComponent) })
             }
         }
     }
 
-    private static func scan(rootURL: URL, directory: WorkspaceDirectory, beforeOpeningComponent: @Sendable (String) -> Void) throws -> [FileSystemEntryRecord] {
+    private static func scan(rootURL: URL, directory: WorkspaceDirectory, directoryStreamAPI: any DirectoryStreamAPI, beforeOpeningComponent: @Sendable (String) -> Void) throws -> [FileSystemEntryRecord] {
         var directoryFD = open(rootURL.standardizedFileURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directoryFD >= 0 else { throw fileOpenError() }
         defer { close(directoryFD) }
@@ -48,7 +65,12 @@ final class FoundationFileTreeFileSystem: FileTreeFileSystem, @unchecked Sendabl
                 close(directoryFD); directoryFD = next
             }
         }
-        guard let stream = fdopendir(dup(directoryFD)) else { throw CocoaError(.fileReadUnknown) }
+        let duplicatedFD = directoryStreamAPI.duplicate(directoryFD)
+        guard duplicatedFD >= 0 else { throw CocoaError(.fileReadUnknown) }
+        guard let stream = directoryStreamAPI.openStream(duplicatedFD) else {
+            directoryStreamAPI.close(duplicatedFD)
+            throw CocoaError(.fileReadUnknown)
+        }
         defer { closedir(stream) }
         var result: [FileSystemEntryRecord] = []
         while let raw = readdir(stream) {
@@ -79,25 +101,30 @@ final class FoundationFileTreeFileSystem: FileTreeFileSystem, @unchecked Sendabl
     }
 }
 
-private actor FileTreeOperationGate {
+actor FileTreeOperationGate {
     private struct Waiter { let id: UUID; let continuation: CheckedContinuation<Bool, Never> }
     private var locked = false
     private var waiters: [Waiter] = []
+    private let onOwnershipGranted: @Sendable () -> Void
+    init(onOwnershipGranted: @escaping @Sendable () -> Void = {}) { self.onOwnershipGranted = onOwnershipGranted }
+    var hasOwner: Bool { locked }
+    var waiterCount: Int { waiters.count }
     func acquire() async throws {
         try Task.checkCancellation()
         let id = UUID()
         let acquired = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                if !locked { locked = true; continuation.resume(returning: true) }
+                if !locked { locked = true; onOwnershipGranted(); continuation.resume(returning: true) }
                 else { waiters.append(Waiter(id: id, continuation: continuation)) }
             }
         } onCancel: { Task { await self.cancel(id) } }
         guard acquired else { throw CancellationError() }
-        try Task.checkCancellation()
     }
     func release() {
         guard !waiters.isEmpty else { locked = false; return }
-        waiters.removeFirst().continuation.resume(returning: true)
+        let waiter = waiters.removeFirst()
+        onOwnershipGranted()
+        waiter.continuation.resume(returning: true)
     }
     private func cancel(_ id: UUID) {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
@@ -171,8 +198,10 @@ actor FileTreeProvider: FileTreeProviding {
     func children(environmentID: EnvironmentID, at directory: WorkspaceDirectory, generation: UInt64) async throws -> FileTreeSnapshot {
         guard environmentID == self.environmentID else { throw FileTreeProviderError.environmentMismatch }
         guard generation > 0 else { throw FileTreeProviderError.zeroGeneration }
-        try await gate.acquire(); inFlight.insert(directory)
+        try await gate.acquire()
         do {
+            try Task.checkCancellation()
+            inFlight.insert(directory)
             var current = try await enumerate(directory); try Task.checkCancellation()
             if let previous = expanded[directory] { try commit(previous: previous, current: current, directory: directory) }
             else { expanded[directory] = current }
@@ -198,6 +227,7 @@ actor FileTreeProvider: FileTreeProviding {
     func reconcile(_ directory: WorkspaceDirectory) async throws -> FileTreeDelta? {
         try await gate.acquire()
         do {
+            try Task.checkCancellation()
             guard let previous = expanded[directory] else { await gate.release(); return nil }
             let current = try await enumerate(directory); try Task.checkCancellation()
             let delta = try commit(previous: previous, current: current, directory: directory)

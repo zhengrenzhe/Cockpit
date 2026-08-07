@@ -4,6 +4,13 @@ public enum WorkspaceDirectory: Hashable, Codable, Sendable {
     case root
     case relative(RelativePath)
 
+    public func validated() throws -> Self {
+        switch self {
+        case .root: return .root
+        case let .relative(path): return .relative(try RelativePath(path.string))
+        }
+    }
+
     private enum CodingKeys: String, CodingKey { case root, relative }
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -87,6 +94,7 @@ public struct FileTreeSnapshot: Hashable, Codable, Sendable {
         revision: UInt64,
         children: [FileTreeEntry]
     ) throws {
+        let directory = try directory.validated()
         guard generation > 0 else { throw CockpitDomainValidationError.invalidFileTreeGeneration }
         guard Set(children.map(\.identity)).count == children.count,
               children.allSatisfy({ $0.identity.environmentID == environmentID && directory.containsDirectChild($0.identity.path) })
@@ -127,6 +135,7 @@ public struct FileTreeDelta: Hashable, Codable, Sendable {
         revision: UInt64,
         mutations: [FileTreeMutation]
     ) throws {
+        let directory = try directory.validated()
         guard revision > 0, !mutations.isEmpty else { throw CockpitDomainValidationError.invalidFileTreeDelta }
         let identities = mutations.map(\.identity)
         guard Set(identities).count == identities.count,

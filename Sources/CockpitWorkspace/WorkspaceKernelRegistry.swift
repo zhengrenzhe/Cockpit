@@ -27,8 +27,8 @@ public final class WorkspaceKernel: @unchecked Sendable {
     }
 
     deinit {
-        reconciler.cancel()
         eventSource.cancel()
+        reconciler.cancelAndWait()
     }
 }
 
