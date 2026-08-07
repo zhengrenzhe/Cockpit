@@ -132,11 +132,24 @@ public enum WorkspaceRepositoryError: Error, Equatable, Sendable {
 }
 
 public protocol DocumentLocatorUpdating: Sendable {
+    func preflightDocumentLocatorRelocation(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) async throws
     func relocateDocumentLocators(
         in environmentID: EnvironmentID,
         from source: RelativePath,
         to destination: RelativePath
     ) async throws
+}
+
+public extension DocumentLocatorUpdating {
+    func preflightDocumentLocatorRelocation(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) async throws {}
 }
 
 public protocol WorkspaceRepository: DocumentLocatorUpdating, Sendable {

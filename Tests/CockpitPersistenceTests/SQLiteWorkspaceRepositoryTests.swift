@@ -448,6 +448,39 @@ import CockpitTypes
     }
 }
 
+@Test func documentLocatorPreflightRejectsDestinationCollisionWithoutMutation() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let sourceID = DocumentID()
+        let destinationID = DocumentID()
+        let inspection = try SQLiteConnection(databaseURL: databaseURL)
+        try await inspection.withImmediateTransaction { connection in
+            try insertDocument(
+                connection: connection, id: sourceID, environmentID: project.baseEnvironmentID,
+                path: "old/child.txt", documentVersion: 1, persistedVersion: 1,
+                dirtyState: "clean", editLeaseID: nil
+            )
+            try insertDocument(
+                connection: connection, id: destinationID, environmentID: project.baseEnvironmentID,
+                path: "new/child.txt", documentVersion: 2, persistedVersion: 2,
+                dirtyState: "clean", editLeaseID: nil
+            )
+        }
+
+        await #expect(throws: (any Error).self) {
+            try await repository.preflightDocumentLocatorRelocation(
+                in: project.baseEnvironmentID,
+                from: RelativePath("old"),
+                to: RelativePath("new")
+            )
+        }
+
+        #expect(try await storedDocumentPath(connection: inspection, id: sourceID) == "old/child.txt")
+        #expect(try await storedDocumentPath(connection: inspection, id: destinationID) == "new/child.txt")
+    }
+}
+
 private func makeProjectInput() -> NewProject {
     NewProject(
         displayName: "Cockpit",

@@ -181,6 +181,16 @@ actor FileTreeProvider: FileTreeProviding {
     struct ExternalMutationLease: Hashable, Sendable {
         let id: UUID
     }
+    struct ExternalMutationStage: Sendable {
+        struct Reconciliation: Sendable {
+            let directory: WorkspaceDirectory
+            let current: [FileTreeEntry]
+            let delta: FileTreeDelta?
+        }
+        let leaseID: UUID
+        let staleDirectories: [WorkspaceDirectory]
+        let reconciliations: [Reconciliation]
+    }
     private let environmentID: EnvironmentID
     private let rootURL: URL
     private let rootAccessToken: (any ProjectRootAccessToken)?
@@ -253,48 +263,83 @@ actor FileTreeProvider: FileTreeProviding {
         await gate.release()
     }
 
-    func completeExternalMutation(
+    func stageExternalMutation(
         operation: FileOperation,
         physical: PhysicalFileOperationResult,
         lease: ExternalMutationLease
-    ) async throws {
+    ) async throws -> ExternalMutationStage {
         guard activeExternalMutation == lease.id else {
             throw FileOperationError.invalidPath
         }
-        do {
-            if physical.affectedKind == .directory {
-                let staleRoot: RelativePath?
-                switch physical.result {
-                case let .relocated(source, _): staleRoot = source
-                case let .trashed(path): staleRoot = path
-                case .created: staleRoot = nil
-                }
-                if let staleRoot {
-                    let staleDirectories = expanded.keys.filter {
-                        guard case let .relative(path) = $0 else { return false }
-                        return path.string == staleRoot.string || path.string.hasPrefix(staleRoot.string + "/")
-                    }
-                    staleDirectories.forEach {
-                        expanded.removeValue(forKey: $0)
-                        pendingInvalidations.remove($0)
-                    }
-                }
+        let staleDirectories: [WorkspaceDirectory]
+        if physical.affectedKind == .directory {
+            let staleRoot: RelativePath?
+            switch physical.result {
+            case let .relocated(source, _): staleRoot = source
+            case let .trashed(path): staleRoot = path
+            case .created: staleRoot = nil
             }
-
-            let parents = Set(affectedParents(for: operation, result: physical.result))
+            if let staleRoot {
+                staleDirectories = expanded.keys.filter {
+                    guard case let .relative(path) = $0 else { return false }
+                    return path.string == staleRoot.string || path.string.hasPrefix(staleRoot.string + "/")
+                }
                 .sorted(by: Self.directoryPrecedes)
-            for directory in parents where expanded[directory] != nil {
-                let previous = expanded[directory]!
-                let current = try await enumerate(directory)
-                try commit(previous: previous, current: current, directory: directory)
+            } else {
+                staleDirectories = []
             }
-            activeExternalMutation = nil
-            await gate.release()
-        } catch {
-            activeExternalMutation = nil
-            await gate.release()
-            throw error
+        } else {
+            staleDirectories = []
         }
+
+        let parents = Set(affectedParents(for: operation, result: physical.result))
+            .sorted(by: Self.directoryPrecedes)
+        var nextRevision = revision
+        var reconciliations: [ExternalMutationStage.Reconciliation] = []
+        for directory in parents where expanded[directory] != nil {
+            let previous = expanded[directory]!
+            let current = try await enumerate(directory)
+            let mutations = Self.mutations(from: previous, to: current)
+            let delta: FileTreeDelta?
+            if mutations.isEmpty {
+                delta = nil
+            } else {
+                precondition(nextRevision < .max)
+                nextRevision += 1
+                delta = try FileTreeDelta(
+                    validating: environmentID,
+                    directory: directory,
+                    revision: nextRevision,
+                    mutations: mutations
+                )
+            }
+            reconciliations.append(.init(directory: directory, current: current, delta: delta))
+        }
+        return ExternalMutationStage(
+            leaseID: lease.id,
+            staleDirectories: staleDirectories,
+            reconciliations: reconciliations
+        )
+    }
+
+    func commitExternalMutation(
+        _ stage: ExternalMutationStage,
+        lease: ExternalMutationLease
+    ) async {
+        precondition(activeExternalMutation == lease.id && stage.leaseID == lease.id)
+        for directory in stage.staleDirectories {
+            expanded.removeValue(forKey: directory)
+            pendingInvalidations.remove(directory)
+        }
+        for reconciliation in stage.reconciliations {
+            expanded[reconciliation.directory] = reconciliation.current
+            if let delta = reconciliation.delta {
+                revision = delta.revision
+                hub.publish(delta)
+            }
+        }
+        activeExternalMutation = nil
+        await gate.release()
     }
 
     func waitUntilOperationIsQueued() async {

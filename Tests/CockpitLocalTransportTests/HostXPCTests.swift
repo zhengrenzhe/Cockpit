@@ -117,6 +117,49 @@ import CockpitHostCore
         context["unknown"] = true
         object["context"] = context
     }
+    var unknownNestedIDs: [Data] = []
+    for key in ["clientInstanceID", "windowID", "environmentID", "requestID"] {
+        unknownNestedIDs.append(try mutatingJSONObject(encoded) { object in
+            var context = object["context"] as! [String: Any]
+            var identifier = context[key] as! [String: Any]
+            identifier["unknown"] = true
+            context[key] = identifier
+            object["context"] = context
+        })
+    }
+    let unknownProjectID = try mutatingJSONObject(encoded) { object in
+        var context = object["context"] as! [String: Any]
+        var contextID = context["workspaceContextID"] as! [String: Any]
+        var projectID = contextID["project"] as! [String: Any]
+        projectID["unknown"] = true
+        contextID["project"] = projectID
+        context["workspaceContextID"] = contextID
+        object["context"] = context
+    }
+    let conversationContext = try RequestContext(
+        validating: context.protocolVersion,
+        clientInstanceID: context.clientInstanceID,
+        windowID: context.windowID,
+        workspaceContextID: .conversation(fixture.conversation.id),
+        environmentID: context.environmentID,
+        activeContextGeneration: context.activeContextGeneration,
+        requestID: context.requestID
+    )
+    let conversationRequest = try JSONEncoder().encode(
+        WorkspaceCommandRequest.performFileOperation(
+            context: conversationContext,
+            operation: .createFile(parent: .root, name: "file.txt")
+        )
+    )
+    let unknownConversationID = try mutatingJSONObject(conversationRequest) { object in
+        var context = object["context"] as! [String: Any]
+        var contextID = context["workspaceContextID"] as! [String: Any]
+        var conversationID = contextID["conversation"] as! [String: Any]
+        conversationID["unknown"] = true
+        contextID["conversation"] = conversationID
+        context["workspaceContextID"] = contextID
+        object["context"] = context
+    }
     let traversal = try JSONEncoder().encode(
         WorkspaceCommandRequest.performFileOperation(
             context: context,
@@ -128,7 +171,10 @@ import CockpitHostCore
         operation["source"] = "../escape"
         object["fileOperation"] = operation
     }
-    for invalid in [unknownOperation, forbiddenOperation, unknownDirectory, unknownContext, invalidTraversal] {
+    for invalid in [
+        unknownOperation, forbiddenOperation, unknownDirectory, unknownContext,
+        unknownProjectID, unknownConversationID, invalidTraversal,
+    ] + unknownNestedIDs {
         #expect(throws: (any Error).self) {
             _ = try JSONDecoder().decode(WorkspaceCommandRequest.self, from: invalid)
         }

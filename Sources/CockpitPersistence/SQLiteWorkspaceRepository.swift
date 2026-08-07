@@ -339,6 +339,57 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository {
         }
     }
 
+    public func preflightDocumentLocatorRelocation(
+        in environmentID: EnvironmentID,
+        from source: RelativePath,
+        to destination: RelativePath
+    ) async throws {
+        let validSource = try validatedLocatorPath(source)
+        let validDestination = try validatedLocatorPath(destination)
+        let rows = try await connection.query(
+            "SELECT id, relative_path FROM documents WHERE environment_id = ? ORDER BY id",
+            bindings: [.text(environmentID.description)]
+        )
+        var stored: [(id: String, path: RelativePath)] = []
+        for row in rows {
+            guard let id = row[safe: 0]?.text,
+                  let text = row[safe: 1]?.text,
+                  let path = try? RelativePath(text)
+            else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            stored.append((id, path))
+        }
+        let movingIDs = Set(stored.compactMap { row -> String? in
+            row.path.string == validSource.string || row.path.string.hasPrefix(validSource.string + "/")
+                ? row.id
+                : nil
+        })
+        let stationaryPaths = Set(stored.compactMap { movingIDs.contains($0.id) ? nil : $0.path.string })
+        for row in stored where movingIDs.contains(row.id) {
+            let destinationText = row.path.string == validSource.string
+                ? validDestination.string
+                : validDestination.string + row.path.string.dropFirst(validSource.string.count)
+            guard (try? RelativePath(destinationText)) != nil else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            if stationaryPaths.contains(destinationText) {
+                throw FileOperationError.documentLocatorCollision
+            }
+        }
+    }
+
+    private func validatedLocatorPath(_ path: RelativePath) throws -> RelativePath {
+        do {
+            guard !path.string.contains("\0") else { throw FileOperationError.invalidPath }
+            return try RelativePath(path.string)
+        } catch let error as FileOperationError {
+            throw error
+        } catch {
+            throw FileOperationError.invalidPath
+        }
+    }
+
     private static func project(from row: [SQLiteColumn]) throws -> Project {
         guard let id = projectID(row[safe: 0]),
               let displayName = row[safe: 1]?.text,

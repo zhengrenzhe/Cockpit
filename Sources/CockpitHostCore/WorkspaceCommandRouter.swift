@@ -290,12 +290,12 @@ private struct WireRequestContext: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         value = try RequestContext(
             validating: container.decode(WireProtocolVersion.self, forKey: .protocolVersion).value,
-            clientInstanceID: container.decode(ClientInstanceID.self, forKey: .clientInstanceID),
-            windowID: container.decode(WindowID.self, forKey: .windowID),
+            clientInstanceID: container.decode(WireCockpitID<ClientInstanceScope>.self, forKey: .clientInstanceID).value,
+            windowID: container.decode(WireCockpitID<WindowScope>.self, forKey: .windowID).value,
             workspaceContextID: container.decode(WireWorkspaceContextID.self, forKey: .workspaceContextID).value,
-            environmentID: container.decode(EnvironmentID.self, forKey: .environmentID),
+            environmentID: container.decode(WireCockpitID<EnvironmentScope>.self, forKey: .environmentID).value,
             activeContextGeneration: container.decode(UInt64.self, forKey: .activeContextGeneration),
-            requestID: container.decode(RequestID.self, forKey: .requestID)
+            requestID: container.decode(WireCockpitID<RequestScope>.self, forKey: .requestID).value
         )
     }
 
@@ -311,12 +311,12 @@ private struct WireRequestContext: Codable {
         )
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(WireProtocolVersion(valid.protocolVersion), forKey: .protocolVersion)
-        try container.encode(valid.clientInstanceID, forKey: .clientInstanceID)
-        try container.encode(valid.windowID, forKey: .windowID)
+        try container.encode(WireCockpitID(valid.clientInstanceID), forKey: .clientInstanceID)
+        try container.encode(WireCockpitID(valid.windowID), forKey: .windowID)
         try container.encode(WireWorkspaceContextID(valid.workspaceContextID), forKey: .workspaceContextID)
-        try container.encode(valid.environmentID, forKey: .environmentID)
+        try container.encode(WireCockpitID(valid.environmentID), forKey: .environmentID)
         try container.encode(valid.activeContextGeneration, forKey: .activeContextGeneration)
-        try container.encode(valid.requestID, forKey: .requestID)
+        try container.encode(WireCockpitID(valid.requestID), forKey: .requestID)
     }
 }
 
@@ -339,6 +339,24 @@ private struct WireProtocolVersion: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(value.major, forKey: .major)
         try container.encode(value.minor, forKey: .minor)
+    }
+}
+
+private struct WireCockpitID<Scope>: Codable {
+    let value: CockpitID<Scope>
+    private enum CodingKeys: String, CodingKey { case rawValue }
+
+    init(_ value: CockpitID<Scope>) { self.value = value }
+
+    init(from decoder: Decoder) throws {
+        try requireExactKeys(decoder, required: ["rawValue"])
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        value = CockpitID(try container.decode(UUID.self, forKey: .rawValue))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(value.rawValue, forKey: .rawValue)
     }
 }
 
@@ -716,10 +734,12 @@ private struct WireWorkspaceContextID: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch keys {
         case ["project"]:
-            value = .project(try container.decode(ProjectID.self, forKey: .project))
+            value = .project(
+                try container.decode(WireCockpitID<ProjectScope>.self, forKey: .project).value
+            )
         case ["conversation"]:
             value = .conversation(
-                try container.decode(ConversationID.self, forKey: .conversation)
+                try container.decode(WireCockpitID<ConversationScope>.self, forKey: .conversation).value
             )
         default:
             throw DecodingError.dataCorrupted(
@@ -735,9 +755,9 @@ private struct WireWorkspaceContextID: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch value {
         case let .project(projectID):
-            try container.encode(projectID, forKey: .project)
+            try container.encode(WireCockpitID(projectID), forKey: .project)
         case let .conversation(conversationID):
-            try container.encode(conversationID, forKey: .conversation)
+            try container.encode(WireCockpitID(conversationID), forKey: .conversation)
         }
     }
 }

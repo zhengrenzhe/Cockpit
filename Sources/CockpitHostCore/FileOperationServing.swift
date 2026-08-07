@@ -8,6 +8,24 @@ public enum FileOperationError: Error, Equatable, Sendable {
     case identityChanged
     case contextEnvironmentMismatch
     case environmentNotRegistered
+    case documentLocatorCollision
+    case compensationUnavailable
+}
+
+public struct FileOperationRecoveryRequiredError: Error, @unchecked Sendable {
+    public let committedResult: FileOperationResult
+    public let originalError: any Error
+    public let compensationError: any Error
+
+    public init(
+        committedResult: FileOperationResult,
+        originalError: any Error,
+        compensationError: any Error
+    ) {
+        self.committedResult = committedResult
+        self.originalError = originalError
+        self.compensationError = compensationError
+    }
 }
 
 public enum FileOperation: Hashable, Sendable {

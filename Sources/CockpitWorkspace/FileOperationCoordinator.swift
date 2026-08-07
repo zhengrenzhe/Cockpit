@@ -7,6 +7,7 @@ actor FileOperationCoordinator {
     private let documentLocatorUpdater: any DocumentLocatorUpdating
     private let fileTreeProvider: FileTreeProvider
     private let operationGate = FileTreeOperationGate()
+    private var recoveryRequired: FileOperationRecoveryRequiredError?
 
     init(
         environmentID: EnvironmentID,
@@ -21,26 +22,67 @@ actor FileOperationCoordinator {
     }
 
     func perform(_ operation: FileOperation) async throws -> FileOperationResult {
+        if let recoveryRequired { throw recoveryRequired }
         try await operationGate.acquire()
         do {
+            if let recoveryRequired { throw recoveryRequired }
             try Task.checkCancellation()
+            let relocation = try operation.validatedRelocation
+            if let relocation {
+                try await documentLocatorUpdater.preflightDocumentLocatorRelocation(
+                    in: environmentID,
+                    from: relocation.source,
+                    to: relocation.destination
+                )
+                try Task.checkCancellation()
+            }
             let lease = try await fileTreeProvider.acquireExternalMutationLease()
             do {
+                try Task.checkCancellation()
                 let physical = try await rootHandle.perform(operation)
-                if case let .relocated(source, destination) = physical.result {
-                    try await documentLocatorUpdater.relocateDocumentLocators(
-                        in: environmentID,
-                        from: source,
-                        to: destination
-                    )
+                let completion = Task { [documentLocatorUpdater, environmentID, fileTreeProvider, rootHandle] in
+                    do {
+                        let staged = try await fileTreeProvider.stageExternalMutation(
+                            operation: operation,
+                            physical: physical,
+                            lease: lease
+                        )
+                        if case let .relocated(source, destination) = physical.result {
+                            try await documentLocatorUpdater.relocateDocumentLocators(
+                                in: environmentID,
+                                from: source,
+                                to: destination
+                            )
+                        }
+                        await fileTreeProvider.commitExternalMutation(staged, lease: lease)
+                        return PostPhysicalCompletion.success
+                    } catch {
+                        let originalError = error
+                        do {
+                            try await rootHandle.compensate(physical)
+                            await fileTreeProvider.cancelExternalMutation(lease)
+                            return .failed(originalError)
+                        } catch {
+                            await fileTreeProvider.cancelExternalMutation(lease)
+                            return .recoveryRequired(originalError: originalError, compensationError: error)
+                        }
+                    }
                 }
-                try await fileTreeProvider.completeExternalMutation(
-                    operation: operation,
-                    physical: physical,
-                    lease: lease
-                )
-                await operationGate.release()
-                return physical.result
+                switch await completion.value {
+                case .success:
+                    await operationGate.release()
+                    return physical.result
+                case let .failed(error):
+                    throw error
+                case let .recoveryRequired(originalError, compensationError):
+                    let fatal = FileOperationRecoveryRequiredError(
+                        committedResult: physical.result,
+                        originalError: originalError,
+                        compensationError: compensationError
+                    )
+                    recoveryRequired = fatal
+                    throw fatal
+                }
             } catch {
                 await fileTreeProvider.cancelExternalMutation(lease)
                 throw error
@@ -56,4 +98,10 @@ actor FileOperationCoordinator {
             await Task.yield()
         }
     }
+}
+
+private enum PostPhysicalCompletion: @unchecked Sendable {
+    case success
+    case failed(any Error)
+    case recoveryRequired(originalError: any Error, compensationError: any Error)
 }

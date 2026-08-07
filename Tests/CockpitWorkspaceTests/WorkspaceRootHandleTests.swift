@@ -72,6 +72,16 @@ import CockpitTypes
     }
     #expect(try Data(contentsOf: fixture.root.appendingPathComponent("existing.txt")) == Data("destination".utf8))
 
+    try manager.createDirectory(at: fixture.root.appendingPathComponent("existing-directory"), withIntermediateDirectories: false)
+    await #expect(throws: (any Error).self) {
+        _ = try await handle.perform(.createDirectory(parent: .root, name: "existing-directory"))
+    }
+    #expect(
+        try manager.contentsOfDirectory(atPath: fixture.root.path)
+            .filter { $0.hasPrefix(".cockpit-mkdir-") }
+            .isEmpty
+    )
+
     try Data("source".utf8).write(to: fixture.root.appendingPathComponent("source.txt"))
     await #expect(throws: (any Error).self) {
         _ = try await handle.perform(.rename(source: RelativePath("source.txt"), newName: "existing.txt"))
@@ -159,6 +169,88 @@ import CockpitTypes
     #expect(!FileManager.default.fileExists(atPath: outside.appendingPathComponent("source.txt").path))
 }
 
+@Test func movingAnOpenedAncestorOutsideRootNeverMutatesTheEscapedDirectory() async throws {
+    for operation in PostOpenEscapeOperation.allCases {
+        let fixture = try FileOperationFixture()
+        defer { fixture.remove() }
+        let manager = FileManager.default
+        let inside = fixture.root.appendingPathComponent("inside", isDirectory: true)
+        let escaped = fixture.base.appendingPathComponent("escaped-inside", isDirectory: true)
+        try manager.createDirectory(at: inside.appendingPathComponent("nested"), withIntermediateDirectories: true)
+        try Data("escaped-source".utf8).write(to: inside.appendingPathComponent("nested/source.txt"))
+        try Data("moving".utf8).write(to: fixture.root.appendingPathComponent("moving.txt"))
+        let swap = PostOpenAncestorMoveAction(directory: inside, escaped: escaped)
+        let handle = WorkspaceRootHandle(rootURL: fixture.root) { component in
+            if component == "nested" { swap.run() }
+        }
+
+        let result = try? await handle.perform(operation.value)
+        if let trashURL = result?.trashURL { try? manager.removeItem(at: trashURL) }
+
+        #expect(!manager.fileExists(atPath: escaped.appendingPathComponent("nested/created.txt").path))
+        #expect(!manager.fileExists(atPath: escaped.appendingPathComponent("nested/created-directory").path))
+        #expect(try Data(contentsOf: escaped.appendingPathComponent("nested/source.txt")) == Data("escaped-source".utf8))
+        #expect(!manager.fileExists(atPath: escaped.appendingPathComponent("nested/renamed.txt").path))
+        #expect(!manager.fileExists(atPath: escaped.appendingPathComponent("nested/moving.txt").path))
+    }
+}
+
+@Test func sameParentRenameNeverUsesAParentMovedOutsideBetweenItsTwoResolutions() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let manager = FileManager.default
+    let inside = fixture.root.appendingPathComponent("inside", isDirectory: true)
+    let escaped = fixture.base.appendingPathComponent("escaped-inside", isDirectory: true)
+    try manager.createDirectory(at: inside, withIntermediateDirectories: false)
+    try Data("escaped-source".utf8).write(to: inside.appendingPathComponent("source.txt"))
+    let swap = PostOpenAncestorMoveAction(directory: inside, escaped: escaped)
+    let callbackCount = LockedCounter()
+    let handle = WorkspaceRootHandle(rootURL: fixture.root) { component in
+        if component == "inside", callbackCount.increment() == 2 { swap.run() }
+    }
+
+    _ = try? await handle.perform(.rename(source: RelativePath("inside/source.txt"), newName: "renamed.txt"))
+
+    #expect(try Data(contentsOf: escaped.appendingPathComponent("source.txt")) == Data("escaped-source".utf8))
+    #expect(!manager.fileExists(atPath: escaped.appendingPathComponent("renamed.txt").path))
+}
+
+@Test func finalSymlinkRenameMoveAndTrashOperateOnTheLinkWithoutTouchingItsTarget() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let manager = FileManager.default
+    let target = fixture.root.appendingPathComponent("target.txt")
+    let destination = fixture.root.appendingPathComponent("destination", isDirectory: true)
+    try Data("target-bytes".utf8).write(to: target)
+    try manager.createDirectory(at: destination, withIntermediateDirectories: false)
+    try manager.createSymbolicLink(
+        at: fixture.root.appendingPathComponent("rename-link"),
+        withDestinationURL: target
+    )
+    try manager.createSymbolicLink(
+        at: fixture.root.appendingPathComponent("move-link"),
+        withDestinationURL: target
+    )
+    try manager.createSymbolicLink(
+        at: fixture.root.appendingPathComponent("trash-link"),
+        withDestinationURL: target
+    )
+    let handle = WorkspaceRootHandle(rootURL: fixture.root)
+
+    _ = try await handle.perform(.rename(source: RelativePath("rename-link"), newName: "renamed-link"))
+    _ = try await handle.perform(
+        .move(source: RelativePath("move-link"), destinationDirectory: .relative(RelativePath("destination")))
+    )
+    let trashed = try await handle.perform(.trash(path: RelativePath("trash-link")))
+    let trashURL = try #require(trashed.trashURL)
+    defer { try? manager.removeItem(at: trashURL) }
+
+    #expect(try manager.destinationOfSymbolicLink(atPath: fixture.root.appendingPathComponent("renamed-link").path) == target.path)
+    #expect(try manager.destinationOfSymbolicLink(atPath: destination.appendingPathComponent("move-link").path) == target.path)
+    #expect(try manager.destinationOfSymbolicLink(atPath: trashURL.path) == target.path)
+    #expect(try Data(contentsOf: target) == Data("target-bytes".utf8))
+}
+
 @Test func trashMovesRealItemAndRejectsIdentityReplacement() async throws {
     let fixture = try FileOperationFixture()
     defer { fixture.remove() }
@@ -201,6 +293,65 @@ private enum AncestorSwapOperation: CaseIterable {
             .move(source: try! RelativePath("inside/source.txt"), destinationDirectory: .relative(try! RelativePath("destination")))
         }
     }
+}
+
+private enum PostOpenEscapeOperation: CaseIterable {
+    case createFile
+    case createDirectory
+    case rename
+    case move
+    case trash
+
+    var value: FileOperation {
+        switch self {
+        case .createFile:
+            .createFile(parent: .relative(try! RelativePath("inside/nested")), name: "created.txt")
+        case .createDirectory:
+            .createDirectory(parent: .relative(try! RelativePath("inside/nested")), name: "created-directory")
+        case .rename:
+            .rename(source: try! RelativePath("inside/nested/source.txt"), newName: "renamed.txt")
+        case .move:
+            .move(source: try! RelativePath("moving.txt"), destinationDirectory: .relative(try! RelativePath("inside/nested")))
+        case .trash:
+            .trash(path: try! RelativePath("inside/nested/source.txt"))
+        }
+    }
+}
+
+private final class PostOpenAncestorMoveAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let directory: URL
+    private let escaped: URL
+    private var completed = false
+
+    init(directory: URL, escaped: URL) {
+        self.directory = directory
+        self.escaped = escaped
+    }
+
+    func run() {
+        lock.withLock {
+            guard !completed else { return }
+            completed = true
+            try! FileManager.default.moveItem(at: directory, to: escaped)
+            try! FileManager.default.createDirectory(
+                at: directory.appendingPathComponent("nested"),
+                withIntermediateDirectories: true
+            )
+            try! Data("replacement-source".utf8).write(
+                to: directory.appendingPathComponent("nested/source.txt")
+            )
+            try! Data("replacement-source".utf8).write(
+                to: directory.appendingPathComponent("source.txt")
+            )
+        }
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func increment() -> Int { lock.withLock { value += 1; return value } }
 }
 
 private final class DirectorySwapAction: @unchecked Sendable {

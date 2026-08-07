@@ -133,6 +133,199 @@ import CockpitTypes
     #expect(await updater.hasCompleted)
 }
 
+@Test func locatorDestinationPreflightFailurePreventsPhysicalMutation() async throws {
+    let environmentID = EnvironmentID()
+    let physical = CountingRelocationPhysicalOperations()
+    let expected = NSError(domain: "Task7.Preflight", code: 71)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: physical,
+        documentLocatorUpdater: PreflightFailingUpdater(error: expected),
+        fileTreeProvider: coordinatorProvider(environmentID: environmentID)
+    )
+
+    do {
+        _ = try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
+        Issue.record("Expected locator preflight failure")
+    } catch {
+        #expect((error as NSError).domain == expected.domain)
+        #expect((error as NSError).code == expected.code)
+    }
+    #expect(await physical.performCount == 0)
+}
+
+@Test func locatorFailureAfterPhysicalRenameCompensatesTheExactIdentityAndPreservesTreeState() async throws {
+    let fixture = try CoordinatorTemporaryDirectory()
+    defer { fixture.remove() }
+    try Data("original".utf8).write(to: fixture.url.appendingPathComponent("old.txt"))
+    let environmentID = EnvironmentID()
+    let provider = FileTreeProvider(environmentID: environmentID, rootURL: fixture.url)
+    let baseline = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
+    let expected = NSError(domain: "Task7.Metadata", code: 72)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: WorkspaceRootHandle(rootURL: fixture.url),
+        documentLocatorUpdater: RelocationFailingUpdater(error: expected),
+        fileTreeProvider: provider
+    )
+
+    do {
+        _ = try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
+        Issue.record("Expected locator update failure")
+    } catch {
+        #expect((error as NSError).domain == expected.domain)
+        #expect((error as NSError).code == expected.code)
+    }
+
+    #expect(try Data(contentsOf: fixture.url.appendingPathComponent("old.txt")) == Data("original".utf8))
+    #expect(!FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent("new.txt").path))
+    let after = try await provider.children(environmentID: environmentID, at: .root, generation: 2)
+    #expect(after.revision == 0)
+    #expect(after.children == baseline.children)
+}
+
+@Test func cancellationWhileWaitingForTreeLeaseNeverStartsThePhysicalMutation() async throws {
+    let environmentID = EnvironmentID()
+    let provider = coordinatorProvider(environmentID: environmentID)
+    let heldLease = try await provider.acquireExternalMutationLease()
+    let physical = CountingRelocationPhysicalOperations()
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: physical,
+        documentLocatorUpdater: RecordingDocumentLocatorUpdater(),
+        fileTreeProvider: provider
+    )
+    let operation = Task {
+        try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
+    }
+    await provider.waitUntilOperationIsQueued()
+
+    operation.cancel()
+    await provider.cancelExternalMutation(heldLease)
+
+    await #expect(throws: CancellationError.self) { _ = try await operation.value }
+    #expect(await physical.performCount == 0)
+}
+
+@Test func cancellationAfterPhysicalSuccessCannotInterruptMetadataAndTreeCompletion() async throws {
+    let environmentID = EnvironmentID()
+    let fileSystem = MutableCoordinatorFileSystem(entries: [.root: [try coordinatorEntry("old.txt", .file)]])
+    let provider = FileTreeProvider(
+        environmentID: environmentID,
+        rootURL: URL(fileURLWithPath: "/recording"),
+        fileSystem: fileSystem
+    )
+    _ = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
+    let updater = CancellationCheckingMetadataUpdater()
+    let physical = MutatingPhysicalOperations(fileSystem: fileSystem)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: physical,
+        documentLocatorUpdater: updater,
+        fileTreeProvider: provider
+    )
+    let operation = Task {
+        try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
+    }
+    await updater.waitUntilStarted()
+
+    operation.cancel()
+    await updater.release()
+
+    #expect(
+        try await operation.value
+            == .relocated(from: RelativePath("old.txt"), to: RelativePath("new.txt"))
+    )
+    let snapshot = try await provider.children(environmentID: environmentID, at: .root, generation: 2)
+    #expect(snapshot.revision == 1)
+    #expect(snapshot.children.map(\.identity.path.string) == ["new.txt"])
+}
+
+@Test func compensationFailureRequiresRecoveryAndFutureOperationsFailClosed() async throws {
+    let environmentID = EnvironmentID()
+    let original = NSError(domain: "Task7.Metadata", code: 73)
+    let compensation = NSError(domain: "Task7.Compensation", code: 74)
+    let physical = CompensationFailingPhysicalOperations(error: compensation)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: physical,
+        documentLocatorUpdater: RelocationFailingUpdater(error: original),
+        fileTreeProvider: coordinatorProvider(environmentID: environmentID)
+    )
+    let expectedResult = FileOperationResult.relocated(
+        from: try RelativePath("old.txt"),
+        to: try RelativePath("new.txt")
+    )
+
+    let first = Task {
+        try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
+    }
+    await physical.waitUntilStarted()
+    let queued = Task {
+        try await coordinator.perform(.createFile(parent: .root, name: "blocked.txt"))
+    }
+    await coordinator.waitUntilOperationIsQueued()
+    await physical.releaseFirst()
+
+    for operation in [first, queued] {
+        do {
+            _ = try await operation.value
+            Issue.record("Expected recovery-required failure")
+        } catch let error as FileOperationRecoveryRequiredError {
+            #expect(error.committedResult == expectedResult)
+            #expect((error.originalError as NSError).domain == original.domain)
+            #expect((error.originalError as NSError).code == original.code)
+            #expect((error.compensationError as NSError).domain == compensation.domain)
+            #expect((error.compensationError as NSError).code == compensation.code)
+        }
+    }
+    #expect(await physical.performCount == 1)
+}
+
+@Test func secondParentEnumerationFailureLeaksNoCacheRevisionDeltaOrMetadataUpdate() async throws {
+    let environmentID = EnvironmentID()
+    let source = WorkspaceDirectory.relative(try RelativePath("a-source"))
+    let destination = WorkspaceDirectory.relative(try RelativePath("z-destination"))
+    let movedDirectory = WorkspaceDirectory.relative(try RelativePath("a-source/sub"))
+    let fileSystem = SecondParentFailingFileSystem(entries: [
+        source: [try coordinatorEntry("a-source/sub", .directory)],
+        destination: [],
+        movedDirectory: [try coordinatorEntry("a-source/sub/child.txt", .file)],
+    ])
+    let provider = FileTreeProvider(
+        environmentID: environmentID,
+        rootURL: URL(fileURLWithPath: "/recording"),
+        fileSystem: fileSystem
+    )
+    let sourceBaseline = try await provider.children(environmentID: environmentID, at: source, generation: 1)
+    let destinationBaseline = try await provider.children(environmentID: environmentID, at: destination, generation: 1)
+    _ = try await provider.children(environmentID: environmentID, at: movedDirectory, generation: 1)
+    let updater = RecordingDocumentLocatorUpdater()
+    let physical = SecondParentMovePhysicalOperations(fileSystem: fileSystem, failingDirectory: destination)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: physical,
+        documentLocatorUpdater: updater,
+        fileTreeProvider: provider
+    )
+
+    await #expect(throws: FileTreeProviderError.filesystemEnumerationFailed) {
+        _ = try await coordinator.perform(
+            .move(source: RelativePath("a-source/sub"), destinationDirectory: destination)
+        )
+    }
+
+    await fileSystem.clearError(for: destination)
+    #expect(await provider.expandedDirectories(affectedBy: .targeted([movedDirectory])) == [movedDirectory])
+    let sourceAfter = try await provider.children(environmentID: environmentID, at: source, generation: 2)
+    let destinationAfter = try await provider.children(environmentID: environmentID, at: destination, generation: 2)
+    #expect(sourceAfter.revision == 0)
+    #expect(destinationAfter.revision == 0)
+    #expect(sourceAfter.children == sourceBaseline.children)
+    #expect(destinationAfter.children == destinationBaseline.children)
+    #expect(await updater.relocations.isEmpty)
+}
+
 @Test func successfulOperationsPublishDeterministicParentDeltasAndDiscardMovedAndTrashedSubtreeCache() async throws {
     let fixture = try CoordinatorTemporaryDirectory()
     defer { fixture.remove() }
@@ -244,6 +437,47 @@ private actor ControlledPhysicalOperations: FileOperationPhysicallyPerforming {
     func releaseNext() { releases.removeFirst().resume() }
 }
 
+private actor CountingRelocationPhysicalOperations: FileOperationPhysicallyPerforming {
+    private(set) var performCount = 0
+    func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult {
+        performCount += 1
+        return PhysicalFileOperationResult(
+            result: .relocated(from: try RelativePath("old.txt"), to: try RelativePath("new.txt")),
+            affectedKind: .file,
+            trashURL: nil
+        )
+    }
+}
+
+private actor CompensationFailingPhysicalOperations: FileOperationPhysicallyPerforming {
+    let error: NSError
+    private(set) var performCount = 0
+    private var firstStarted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstRelease: CheckedContinuation<Void, Never>?
+    init(error: NSError) { self.error = error }
+    func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult {
+        performCount += 1
+        if performCount == 1 {
+            firstStarted = true
+            startWaiters.forEach { $0.resume() }
+            startWaiters.removeAll()
+            await withCheckedContinuation { firstRelease = $0 }
+        }
+        return PhysicalFileOperationResult(
+            result: .relocated(from: try RelativePath("old.txt"), to: try RelativePath("new.txt")),
+            affectedKind: .file,
+            trashURL: nil
+        )
+    }
+    func compensate(_ result: PhysicalFileOperationResult) async throws { throw error }
+    func waitUntilStarted() async {
+        if firstStarted { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+    func releaseFirst() { firstRelease?.resume(); firstRelease = nil }
+}
+
 private struct FailingPhysicalOperations: FileOperationPhysicallyPerforming {
     let error: NSError
     func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult { throw error }
@@ -286,6 +520,44 @@ private actor RecordingDocumentLocatorUpdater: DocumentLocatorUpdating {
     }
 }
 
+private struct PreflightFailingUpdater: DocumentLocatorUpdating {
+    let error: NSError
+    func preflightDocumentLocatorRelocation(in environmentID: EnvironmentID, from source: RelativePath, to destination: RelativePath) throws {
+        throw error
+    }
+    func relocateDocumentLocators(in environmentID: EnvironmentID, from source: RelativePath, to destination: RelativePath) {}
+}
+
+private struct RelocationFailingUpdater: DocumentLocatorUpdating {
+    let error: NSError
+    func preflightDocumentLocatorRelocation(in environmentID: EnvironmentID, from source: RelativePath, to destination: RelativePath) {}
+    func relocateDocumentLocators(in environmentID: EnvironmentID, from source: RelativePath, to destination: RelativePath) throws {
+        throw error
+    }
+}
+
+private actor CancellationCheckingMetadataUpdater: DocumentLocatorUpdating {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    func preflightDocumentLocatorRelocation(in environmentID: EnvironmentID, from source: RelativePath, to destination: RelativePath) {}
+    func relocateDocumentLocators(in environmentID: EnvironmentID, from source: RelativePath, to destination: RelativePath) async throws {
+        started = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        await withCheckedContinuation { releaseWaiters.append($0) }
+        try Task.checkCancellation()
+    }
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+    func release() {
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
+    }
+}
+
 private actor MetadataBarrierUpdater: DocumentLocatorUpdating {
     private var started = false
     private var completed = false
@@ -314,6 +586,53 @@ private actor MutableCoordinatorFileSystem: FileTreeFileSystem {
     init(entries: [WorkspaceDirectory: [FileSystemEntryRecord]]) { self.entries = entries }
     func directChildren(rootURL: URL, directory: WorkspaceDirectory) -> [FileSystemEntryRecord] { entries[directory] ?? [] }
     func set(entries: [WorkspaceDirectory: [FileSystemEntryRecord]]) { self.entries = entries }
+}
+
+private actor SecondParentFailingFileSystem: FileTreeFileSystem {
+    private var entries: [WorkspaceDirectory: [FileSystemEntryRecord]]
+    private var errors: [WorkspaceDirectory: FileTreeProviderError] = [:]
+    init(entries: [WorkspaceDirectory: [FileSystemEntryRecord]]) { self.entries = entries }
+    func directChildren(rootURL: URL, directory: WorkspaceDirectory) throws -> [FileSystemEntryRecord] {
+        if let error = errors[directory] { throw error }
+        return entries[directory] ?? []
+    }
+    func applyMove(source: WorkspaceDirectory, destination: WorkspaceDirectory, moved: FileSystemEntryRecord) {
+        entries[source] = []
+        entries[destination] = [moved]
+    }
+    func restore(source: WorkspaceDirectory, destination: WorkspaceDirectory, original: FileSystemEntryRecord) {
+        entries[source] = [original]
+        entries[destination] = []
+    }
+    func setError(_ error: FileTreeProviderError, for directory: WorkspaceDirectory) { errors[directory] = error }
+    func clearError(for directory: WorkspaceDirectory) { errors.removeValue(forKey: directory) }
+}
+
+private struct SecondParentMovePhysicalOperations: FileOperationPhysicallyPerforming {
+    let fileSystem: SecondParentFailingFileSystem
+    let failingDirectory: WorkspaceDirectory
+    func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult {
+        let source = WorkspaceDirectory.relative(try RelativePath("a-source"))
+        let destination = WorkspaceDirectory.relative(try RelativePath("z-destination"))
+        await fileSystem.applyMove(
+            source: source,
+            destination: destination,
+            moved: FileSystemEntryRecord(relativePath: try RelativePath("z-destination/sub"), kind: .directory)
+        )
+        await fileSystem.setError(.filesystemEnumerationFailed, for: failingDirectory)
+        return PhysicalFileOperationResult(
+            result: .relocated(from: try RelativePath("a-source/sub"), to: try RelativePath("z-destination/sub")),
+            affectedKind: .directory,
+            trashURL: nil
+        )
+    }
+    func compensate(_ result: PhysicalFileOperationResult) async throws {
+        await fileSystem.restore(
+            source: .relative(try RelativePath("a-source")),
+            destination: .relative(try RelativePath("z-destination")),
+            original: FileSystemEntryRecord(relativePath: try RelativePath("a-source/sub"), kind: .directory)
+        )
+    }
 }
 
 private func coordinatorProvider(environmentID: EnvironmentID) -> FileTreeProvider {
