@@ -971,14 +971,296 @@ git commit -m "feat: coordinate authoritative documents"
 
 ### Task 10: 接入每窗口一个 Monaco WKWebView
 
-**Depends on:** Task 9。
+**Depends on:** Task 9。Task 10 仍是一个 Phase 任务；按 10A/10B/10C 串行实现并各自提交，Task 总数不变。
+
+**Pinned build inputs:** Node `26.7.0` Current、pnpm `11.20.0`、Monaco `0.56.0`、esbuild `0.28.1`、SwiftProtobuf `1.38.1`。Node/pnpm 只参与构建；不得修改 Monaco 声明的 transitive pins，不新增 npm 或 Swift 第三方依赖。App bundle gate 必须证明 App 中没有 `node`、`pnpm`、`node_modules`、`EditorRuntime/src` 或 Monaco 源码。
+
+#### Task 10A: 冻结 SwiftProtobuf 数据面 ABI 与 Host port
 
 **Files:**
 
-- Modify: `EditorRuntime/src/protocol.mjs`
-- Modify: `EditorRuntime/src/bootstrap.ts`
-- Create: `EditorRuntime/test/protocol.test.mjs`
+- Modify: `Sources/CockpitTypes/ProtocolVersion.swift`
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Create: `Sources/CockpitProtocol/HostDataPlaneMessages.swift`
 - Create: `Sources/CockpitClientCore/FileTreeDataTransport.swift`
+- Create: `Sources/CockpitHostCore/HostDataPlaneServing.swift`
+- Modify: `Sources/CockpitWorkspace/DocumentActor.swift`
+- Modify: `Sources/CockpitWorkspace/DocumentRegistry.swift`
+- Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
+- Create: `Sources/CockpitWorkspace/WorkspaceHostDataPlaneService.swift`
+- Create: `Tests/CockpitProtocolTests/HostDataPlaneProtocolTests.swift`
+- Modify: `Tests/CockpitWorkspaceTests/DocumentActorTests.swift`
+- Create: `Tests/CockpitWorkspaceTests/WorkspaceKernelDataPlaneTests.swift`
+
+**Dependency boundary:** `CockpitProtocol` 继续只依赖 `CockpitTypes` 与 SwiftProtobuf；SwiftProtobuf plugin 生成的 `cockpit.pb.swift` 仍在 `.build`，不得手改或提交。`HostDataPlaneMessages.swift` 同时定义 shared `HostDataPlaneBinding`、protobuf/domain 双向 mapper 与 validated remote error value；不得引用 HostCore。`CockpitHostCore` 定义 port，`CockpitWorkspace` 实现 port；`CockpitLocalTransport -> CockpitHostCore`，禁止给 `CockpitLocalTransport` 增加 `CockpitWorkspace` 依赖。10A 不修改 `Package.swift`。
+
+**Shared port:**
+
+```swift
+public struct HostDataPlaneBinding: Hashable, Sendable {
+    public let clientInstanceID: ClientInstanceID
+    public let windowID: WindowID
+    public let workspaceContextID: WorkspaceContextID
+    public let environmentID: EnvironmentID
+    public let activeContextGeneration: UInt64
+
+    public init(
+        validatingClientInstanceID clientInstanceID: ClientInstanceID,
+        windowID: WindowID,
+        workspaceContextID: WorkspaceContextID,
+        environmentID: EnvironmentID,
+        activeContextGeneration: UInt64
+    ) throws {
+        guard activeContextGeneration > 0,
+              activeContextGeneration <= documentJavaScriptMaximum
+        else { throw ProtocolMappingError.invalidValue("host_data_plane_binding") }
+        self.clientInstanceID = clientInstanceID
+        self.windowID = windowID
+        self.workspaceContextID = workspaceContextID
+        self.environmentID = environmentID
+        self.activeContextGeneration = activeContextGeneration
+    }
+}
+
+public enum HostDataPlaneServiceError: Error, Hashable, Sendable {
+    case contextMismatch
+    case environmentMismatch
+    case documentNotOpen
+}
+
+public enum HostDataPlaneDocumentError: Error, Hashable, Sendable {
+    case committedRecoveryRequired(EditAcknowledgement)
+}
+
+public struct DataPlaneRemoteError: Error, Hashable, Sendable {
+    public let code: CPDataPlaneErrorCode
+    public let expected: UInt64?
+    public let actual: UInt64?
+    public init(validatingCode code: CPDataPlaneErrorCode,
+                expected: UInt64?, actual: UInt64?) throws
+}
+
+public protocol FileTreeDataTransport: Sendable {
+    func children(at directory: WorkspaceDirectory) async throws -> FileTreeSnapshot
+    func changes(
+        after revision: UInt64,
+        expandedDirectories: Set<WorkspaceDirectory>
+    ) -> AsyncThrowingStream<FileTreeDelta, Error>
+}
+
+public protocol HostDataPlaneServing: Sendable {
+    func openDocument(binding: HostDataPlaneBinding, at path: RelativePath) async throws -> DocumentSnapshot
+    func snapshot(binding: HostDataPlaneBinding, documentID: DocumentID) async throws -> DocumentSnapshot
+    func acquireEditLease(binding: HostDataPlaneBinding, documentID: DocumentID) async throws -> EditLease
+    func transferEditLease(binding: HostDataPlaneBinding, documentID: DocumentID, from leaseID: EditLeaseID, to client: ClientInstanceID) async throws -> EditLease
+    func apply(binding: HostDataPlaneBinding, transaction: EditTransaction) async throws -> EditAcknowledgement
+    func flush(binding: HostDataPlaneBinding, documentID: DocumentID, through clientSequence: UInt64) async throws -> UInt64
+    func save(binding: HostDataPlaneBinding, documentID: DocumentID, expectedFingerprint: DiskFingerprint) async throws -> DocumentSnapshot
+    func discard(binding: HostDataPlaneBinding, documentID: DocumentID) async throws -> DocumentSnapshot
+    func fileTreeChildren(binding: HostDataPlaneBinding, at directory: WorkspaceDirectory) async throws -> FileTreeSnapshot
+    func fileTreeChanges(binding: HostDataPlaneBinding, after revision: UInt64) -> AsyncThrowingStream<FileTreeDelta, Error>
+}
+```
+
+`HostDataPlaneDocumentError` 定义在 `CockpitHostCore/HostDataPlaneServing.swift`，其 public cases 与 associated values 是 LocalTransport 可见的 shared document data-plane boundary；它不得引用 `CockpitWorkspace`。`WorkspaceHostDataPlaneService.apply` 必须 catch concrete Workspace-only `DocumentCommitRecoveryRequiredError` 并 throw `.committedRecoveryRequired(error.committedAcknowledgement)`；其它 Task 9 `DocumentProtocolError`/`DocumentStorageError` 原样穿过 shared port。10B LocalTransport server 只识别这个 shared recovery error，不得 import/catch Workspace concrete error。
+
+`HostDataPlaneBinding` 的唯一构造入口是上述 public validating initializer。XPC export 从已通过现有 negotiated-version/exact-key validation 的 `RequestContext` 派生 client/window/context/environment/generation；request ID 只用于 XPC correlation，不进入 ticket binding，client 不得另传或覆盖 binding 字段。`WorkspaceHostDataPlaneService` 实现 HostCore port，构造参数固定为 `any WorkspaceServing` 与 `WorkspaceKernelRegistry`：先调用 `WorkspaceServing.resolveContext(binding.workspaceContextID)` 并 exact compare EnvironmentID，再从 registry 解析该 Environment 的唯一 kernel，不复制 repository 解析逻辑。调用链固定为 service resolve/register 返回后再取 kernel，不在持有 registry actor isolation 时回调 `WorkspaceService`，因此无 actor 依赖循环。document lookup 使用 `DocumentRegistry` 新增的 public actor method `document(id:) -> DocumentActor?`，不得暴露 `byID`。每个 document 请求先验证 binding，再验证 document 已在该 Environment registry 打开，最后调用 Task 9 actor；open 只通过 `DocumentRegistry.open(at:)`。文件树只通过该 kernel 的 `FileTreeProvider`，children 传 binding generation，changes 传 binding environment/revision。
+
+Document authorization 不信任 payload client identity：acquire wire 不含 client，service 固定调用 actor `acquireEditLease(client: binding.clientInstanceID)`；`HostDataPlaneClient.acquireEditLease(documentID:client:)` 在发包前要求参数 client exact equal immutable binding client。wire binding/payload client 字段不一致在 mapper 层拒绝，Host port/Actor 调用数为 0。通过 mapper 后，Workspace service 不做 `snapshot()` 后再 mutate 的 TOCTOU 检查，而只调用以下 Task 9 Actor authorized overload；每个 overload 在同一次 `enterOperation()`/`leaveOperation()` gate 内先 exact compare current lease owner 与 `authorizedClient`，再执行原 operation 的 locked body：
+
+```swift
+public func transferEditLease(
+    from leaseID: EditLeaseID,
+    to client: ClientInstanceID,
+    authorizedClient: ClientInstanceID
+) async throws -> EditLease
+public func apply(
+    _ transaction: EditTransaction,
+    authorizedClient: ClientInstanceID
+) async throws -> EditAcknowledgement
+public func flush(
+    through clientSequence: UInt64,
+    authorizedClient: ClientInstanceID
+) async throws -> UInt64
+public func save(
+    expectedFingerprint: DiskFingerprint,
+    authorizedClient: ClientInstanceID
+) async throws -> DocumentSnapshot
+public func discard(
+    authorizedClient: ClientInstanceID
+) async throws -> DocumentSnapshot
+```
+
+`DocumentActor` 将现有 operation bodies 提取为仅在 gate 内调用的 private locked helpers；authorized overload 与 Task 9 已有 public overload各自只进入一次 gate，禁止 public method 互调造成二次 gate。authorized owner mismatch 抛既有 `DocumentProtocolError.invalidLease`；这次请求允许 exactly one Workspace Host port call 和 exactly one authorized Actor method call，但 storage write、recovery-log append/truncate、metadata CAS、document mutation 全为 0。transfer 与 apply/flush/save/discard 的并发交错由 actor operation gate 串行：mutation 先入 gate 则在 transfer 前完成，transfer 先入 gate 则旧 owner mutation 在 owner compare 处失败；不存在 transfer 后旧 owner mutation成功。
+
+**Protocol feature and framing:** `ProtocolFeature` 新增 raw value `host-data-plane`。连接只协商 Protocol `1.1` 和该 feature，service kind 必须精确为 `host-data-plane`。只复用现有 32-byte big-endian `FrameHeader`，禁止定义第二套 header；布局精确为 magic `4` + frame version `2` + flags `2` + channel `4` + sequence `8` + acknowledgement `8` + payloadLength `4`。fixture 精确为 `43 4B 50 54 00 01 00 00 00 00 00 03 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00 05`（flags 0、Channel 3、seq 1、ack 0、payload 5），encode/decode 必须 exact round-trip。Channel `0` 是 handshake/authentication，Channel `3` 是 document，Channel `4` 是 file tree。所有 frame `flags == 0`，不支持 ack-only/compression；`payloadLength` 必须等于实际 protobuf bytes并沿用 `FrameHeader.maximumPayloadLength == 16_777_216`。
+
+每个方向、每个 channel 独立 sequence：首帧 `seq=1`，随后严格 `+1`，溢出前关闭；`ack` 是该方向已完整验证的对端同 channel 最大连续 seq，初始 `0`，只单调递增且不得大于对端已发送 seq。Channel 0 只传 `CPHostDataPlaneControlEnvelope`：client `seq=1,ack=0` 发送其 `handshake_request`（唯一 requested feature 为 `host-data-plane`），server `seq=1,ack=1` 返回 `handshake_response`；client `seq=2,ack=1` 发送 `authenticate`，server `seq=2,ack=2` 返回 `authenticated`。任一 control failure 返回同 envelope 的 `error`，error bytes 不得被 handshake/auth response mapper 接受。握手成功后 Channel 3/4 各从 `seq=1,ack=0` 开始。错误响应使用收到请求的 channel、server 下一 seq 与已验证 ack；wrong channel/flags/length/seq/ack/malformed protobuf 发送类型化 error 后关闭连接。
+
+每个 Channel 3/4 envelope 都带 canonical lowercase UUID `request_id` 与完整 `DataPlaneBinding`。同连接的 request ID 不得重用。响应重复 unary request ID。验证顺序固定为：读取精确 32-byte header并验证 magic/frame-version/payload length bound；验证 allowed channel/flags/seq/ack；按 channel 选择 control/document/file-tree envelope并验证 deserialize/unknown fields/oneof/enum；再验证 protocol handshake version/feature/service kind、canonical request ID/binding IDs、ticket binding/context/environment/generation，最后验证 payload-specific document/version/sequence 或 tree revision。unknown channel 在解析 payload 前拒绝。任一步失败不得调用 Host port。
+
+**Exact protobuf declarations:** 在现有 `cockpit.protocol.v1` package 中追加以下 field numbers；不得复用、改号或把 JSON/Codable 塞入 `bytes`：
+
+```protobuf
+message DataPlaneBinding { string client_instance_id = 1; string window_id = 2; WorkspaceContextID workspace_context_id = 3; string environment_id = 4; uint64 active_context_generation = 5; }
+message HostDataPlaneTicketRequest { RequestContext context = 1; }
+message HostDataPlaneTicketResponse { string socket_path = 1; string ticket = 2; uint32 valid_for_milliseconds = 3; }
+message HostDataPlaneAuthenticate { string ticket = 1; DataPlaneBinding binding = 2; }
+message HostDataPlaneAuthenticated { DataPlaneBinding binding = 1; }
+
+enum DataPlaneErrorCode {
+  DATA_PLANE_ERROR_CODE_UNSPECIFIED = 0;
+  DATA_PLANE_ERROR_CODE_MALFORMED_MESSAGE = 1;
+  DATA_PLANE_ERROR_CODE_WRONG_CHANNEL = 2;
+  DATA_PLANE_ERROR_CODE_SEQUENCE_VIOLATION = 3;
+  DATA_PLANE_ERROR_CODE_ACK_VIOLATION = 4;
+  DATA_PLANE_ERROR_CODE_UNAUTHORIZED_PEER = 5;
+  DATA_PLANE_ERROR_CODE_INVALID_TICKET = 6;
+  DATA_PLANE_ERROR_CODE_TICKET_EXPIRED = 7;
+  DATA_PLANE_ERROR_CODE_TICKET_REPLAY = 8;
+  DATA_PLANE_ERROR_CODE_CONTEXT_MISMATCH = 9;
+  DATA_PLANE_ERROR_CODE_ENVIRONMENT_MISMATCH = 10;
+  DATA_PLANE_ERROR_CODE_GENERATION_MISMATCH = 11;
+  DATA_PLANE_ERROR_CODE_REQUEST_ID_REUSE = 12;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_NOT_OPEN = 20;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_INVALID_VALUE = 21;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_INVALID_LEASE = 22;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_LEASE_HELD = 23;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_BASE_VERSION_MISMATCH = 24;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_SEQUENCE_GAP = 25;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_DUPLICATE_MISMATCH = 26;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_STALE_SEQUENCE = 27;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_RECOVERY_REQUIRED = 28;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_RESYNCHRONIZING = 29;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_READ_ONLY = 30;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_FILE_MISSING = 31;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_FINGERPRINT_MISMATCH = 32;
+  DATA_PLANE_ERROR_CODE_TREE_ZERO_GENERATION = 40;
+  DATA_PLANE_ERROR_CODE_TREE_SYMBOLIC_LINK = 41;
+  DATA_PLANE_ERROR_CODE_TREE_REVISION_UNAVAILABLE = 42;
+  DATA_PLANE_ERROR_CODE_TREE_EVENT_SOURCE_UNAVAILABLE = 43;
+  DATA_PLANE_ERROR_CODE_TREE_ENUMERATION_FAILED = 44;
+  DATA_PLANE_ERROR_CODE_TREE_BACKPRESSURE = 45;
+  DATA_PLANE_ERROR_CODE_REQUEST_CANCELLED = 50;
+  DATA_PLANE_ERROR_CODE_INTERNAL = 60;
+}
+message DataPlaneError { DataPlaneErrorCode code = 1; optional uint64 expected = 2; optional uint64 actual = 3; DocumentAcknowledgement committed_acknowledgement = 4; }
+message EmptyResult {}
+message HostDataPlaneControlEnvelope {
+  oneof payload {
+    HandshakeRequest handshake_request = 1;
+    HandshakeResponse handshake_response = 2;
+    HostDataPlaneAuthenticate authenticate = 3;
+    HostDataPlaneAuthenticated authenticated = 4;
+    DataPlaneError error = 5;
+  }
+}
+
+message UTF16TextChange { uint64 offset = 1; uint64 length = 2; string replacement = 3; }
+message DiskFingerprintValue { uint64 device_id = 1; uint64 inode = 2; uint64 byte_count = 3; sint64 modification_time_seconds = 4; uint32 modification_time_nanoseconds = 5; bytes content_sha256 = 6; }
+message EditLeaseValue { string edit_lease_id = 1; string document_id = 2; string client_instance_id = 3; }
+enum DocumentDirtyStateValue { DOCUMENT_DIRTY_STATE_VALUE_UNSPECIFIED = 0; DOCUMENT_DIRTY_STATE_VALUE_CLEAN = 1; DOCUMENT_DIRTY_STATE_VALUE_DIRTY = 2; DOCUMENT_DIRTY_STATE_VALUE_CONFLICT = 3; DOCUMENT_DIRTY_STATE_VALUE_MISSING = 4; }
+enum DocumentMaintenanceStateValue { DOCUMENT_MAINTENANCE_STATE_VALUE_UNSPECIFIED = 0; DOCUMENT_MAINTENANCE_STATE_VALUE_TRUNCATED_RECOVERY_TAIL = 1; DOCUMENT_MAINTENANCE_STATE_VALUE_CORRUPT_RECOVERY_RECORD = 2; DOCUMENT_MAINTENANCE_STATE_VALUE_COMPACTION_DEFERRED = 3; }
+message DocumentSnapshotValue { string document_id = 1; string environment_id = 2; string relative_path = 3; string text = 4; uint64 document_version = 5; uint64 persisted_version = 6; uint64 last_accepted_client_sequence = 7; DocumentDirtyStateValue dirty_state = 8; DiskFingerprintValue observed_disk_fingerprint = 9; EditLeaseValue current_lease = 10; repeated DocumentMaintenanceStateValue maintenance = 11; }
+message DocumentAcknowledgement { string document_id = 1; uint64 client_sequence = 2; uint64 document_version = 3; }
+message DocumentOpenRequest { string relative_path = 1; }
+message DocumentSnapshotRequest { string document_id = 1; }
+message DocumentAcquireLeaseRequest { string document_id = 1; reserved 2; }
+message DocumentTransferLeaseRequest { string document_id = 1; string from_edit_lease_id = 2; string target_client_instance_id = 3; }
+message DocumentApplyRequest { string document_id = 1; string edit_lease_id = 2; uint64 base_version = 3; uint64 client_sequence = 4; repeated UTF16TextChange changes = 5; }
+message DocumentFlushRequest { string document_id = 1; uint64 through_client_sequence = 2; }
+message DocumentFlushResult { uint64 document_version = 1; }
+message DocumentSaveRequest { string document_id = 1; DiskFingerprintValue expected_fingerprint = 2; }
+message DocumentDiscardRequest { string document_id = 1; }
+message DocumentEnvelope {
+  string request_id = 1; DataPlaneBinding binding = 2;
+  oneof payload {
+    DocumentOpenRequest open_request = 10; DocumentSnapshotRequest snapshot_request = 11;
+    DocumentAcquireLeaseRequest acquire_lease_request = 12; DocumentTransferLeaseRequest transfer_lease_request = 13;
+    DocumentApplyRequest apply_request = 14; DocumentFlushRequest flush_request = 15;
+    DocumentSaveRequest save_request = 16; DocumentDiscardRequest discard_request = 17;
+    DocumentSnapshotValue snapshot_result = 30; EditLeaseValue lease_result = 31;
+    DocumentAcknowledgement acknowledgement_result = 32; DocumentFlushResult flush_result = 33;
+    DataPlaneError error = 40;
+  }
+}
+
+enum WorkspaceDirectoryKind { WORKSPACE_DIRECTORY_KIND_UNSPECIFIED = 0; WORKSPACE_DIRECTORY_KIND_ROOT = 1; WORKSPACE_DIRECTORY_KIND_RELATIVE = 2; }
+message WorkspaceDirectoryValue { WorkspaceDirectoryKind kind = 1; optional string relative_path = 2; }
+enum FileTreeEntryKindValue { FILE_TREE_ENTRY_KIND_VALUE_UNSPECIFIED = 0; FILE_TREE_ENTRY_KIND_VALUE_FILE = 1; FILE_TREE_ENTRY_KIND_VALUE_DIRECTORY = 2; FILE_TREE_ENTRY_KIND_VALUE_SYMBOLIC_LINK = 3; }
+message FileTreeEntryIdentityValue { string environment_id = 1; string relative_path = 2; }
+message FileTreeEntryValue { FileTreeEntryIdentityValue identity = 1; FileTreeEntryKindValue kind = 2; }
+message FileTreeMutationValue { oneof mutation { FileTreeEntryValue insert = 1; FileTreeEntryIdentityValue remove = 2; FileTreeEntryValue update = 3; } }
+message FileTreeSnapshotValue { string environment_id = 1; WorkspaceDirectoryValue directory = 2; uint64 generation = 3; uint64 revision = 4; repeated FileTreeEntryValue children = 5; }
+message FileTreeDeltaValue { string environment_id = 1; WorkspaceDirectoryValue directory = 2; uint64 revision = 3; repeated FileTreeMutationValue mutations = 4; }
+message FileTreeChildrenRequest { WorkspaceDirectoryValue directory = 1; }
+message FileTreeSubscribeRequest { uint64 after_revision = 1; }
+message FileTreeSubscriptionAccepted { string subscription_id = 1; uint64 revision = 2; }
+message FileTreeDeltaEvent { string subscription_id = 1; string event_id = 2; FileTreeDeltaValue delta = 3; }
+message FileTreeDeltaAck { string subscription_id = 1; string event_id = 2; uint64 revision = 3; }
+message FileTreeAckAccepted { string subscription_id = 1; string event_id = 2; uint64 revision = 3; }
+message FileTreeCancelRequest { string subscription_id = 1; }
+message FileTreeCancelled { string subscription_id = 1; }
+message FileTreeEnvelope {
+  string request_id = 1; DataPlaneBinding binding = 2;
+  oneof payload {
+    FileTreeChildrenRequest children_request = 10; FileTreeSubscribeRequest subscribe_request = 11;
+    FileTreeDeltaAck delta_ack = 12; FileTreeCancelRequest cancel_request = 13;
+    FileTreeSnapshotValue snapshot_result = 30; FileTreeSubscriptionAccepted subscription_accepted = 31;
+    FileTreeDeltaEvent delta_event = 32; FileTreeAckAccepted ack_accepted = 33;
+    FileTreeCancelled cancelled = 34; DataPlaneError error = 40;
+  }
+}
+```
+
+All IDs/paths/enums use strict manual mappers: canonical lowercase UUID textual form; `WorkspaceDirectoryKind.root` forbids `relative_path`, `.relative` requires it；FileTree mutation 必须恰有 insert/remove/update oneof；snapshot generation 为 `1...9_007_199_254_740_991`，revision 为 `0...9_007_199_254_740_991`，delta revision 为 `1...9_007_199_254_740_991`。protobuf `unknownFields`, absent/unknown oneof, `.UNRECOGNIZED`, `UNSPECIFIED`, SHA-256 not exactly 32 bytes, fingerprint nanoseconds `>=1_000_000_000`, UInt counter above JS-safe maximum, CR/NUL text, invalid Task 9 `UTF16TextEdit`, or inconsistent nested environment/document/lease are `MALFORMED_MESSAGE`/domain typed errors and never coerced。`DataPlaneError.expected/actual` 只在 generation/base-version/sequence-gap/tree-revision mismatch 同时出现；`committed_acknowledgement` 只在 `DOCUMENT_RECOVERY_REQUIRED` 出现；其它 code 禁止这些 presence fields。Workspace-only `DocumentCommitRecoveryRequiredError` 先在 Workspace service 映射为 shared `HostDataPlaneDocumentError.committedRecoveryRequired`；10B server 再把 shared error 映射到 `DOCUMENT_RECOVERY_REQUIRED` 并携带 exact committed acknowledgement；client treats it as Task 9 recovery-required and resynchronizes。
+
+**File-tree subscription:** subscribe request ID becomes immutable `subscription_id`; accepted repeats it. Each server delta has a fresh canonical `event_id`, also used as that event envelope request ID. Client ACK has a fresh request ID and references subscription/event/revision; server replies `ack_accepted` using ACK request ID. Exactly one unacknowledged delta is allowed per subscription; the server does not pull the next `AsyncThrowingStream` element until matching ACK. Wrong ACK/revision is `TREE_BACKPRESSURE` and cancels that subscription. Cancel has a fresh request ID, references subscription ID, replies `cancelled`, and terminates the provider iterator. Socket close cancels all iterators. Reconnect obtains a new ticket/socket and subscribes after the last applied revision; `TREE_REVISION_UNAVAILABLE` triggers children refresh for the client-owned expanded-directory set, then subscribe from the maximum returned snapshot revision. No delta is silently dropped.
+
+- [ ] **10A Step 1: 写 RED tests**
+
+新增 Swift Testing 函数只用 `hostDataPlaneProtocol` 与 `workspaceKernelDataPlane` lowerCamel prefixes；`DocumentActorTests.swift` 新增函数使用 `workspaceKernelDataPlaneActor` prefix（因此命中同一 filter）。覆盖现有 32-byte header 的 exact `4/2/2/4/8/8/4` fixture、每个 proto oneof/enum/error numeric value、control error bytes 绝不被 handshake response 接受、header-before-channel-envelope validation、unknown fields、shared binding public init/双向 mapper/no reverse dependency、exact bytes round-trip、JS-safe bounds、binding/revision/version validation order、所有 `DocumentDataTransport` 操作、file-tree children/subscription/delta/ack/cancel/backpressure/reconnect recovery，以及 Workspace registry 的 context/environment/document/client-lease routing 和无依赖循环。Workspace tests 必须覆盖 concrete recovery error → shared recovery error、authorized Actor owner mismatch 的一次 Actor/零 storage-mutation、以及 lease transfer 与 apply/flush/save/discard 的两种 gate interleaving。测试文件先于行为实现编写；为得到可执行而非仅 compile-error 的 RED，只添加本节已经完整声明的 public types/method signatures 与 deterministic fail-closed bodies（mapper 一律 throw `ProtocolMappingError.invalidValue("host_data_plane")`，Host service 一律 throw `HostDataPlaneServiceError.contextMismatch`），不得预写任何成功分支。
+
+- [ ] **10A Step 2: 证明 RED filter 非零并运行**
+
+```bash
+/usr/bin/swift build --disable-automatic-resolution --build-tests
+expected=$(/usr/bin/swift test list --skip-build 2>/dev/null | /usr/bin/grep -Ec '^(CockpitProtocolTests\.hostDataPlaneProtocol|CockpitWorkspaceTests\.workspaceKernelDataPlane)')
+test "$expected" -gt 0
+set +e
+/usr/bin/swift test --disable-automatic-resolution --filter 'hostDataPlaneProtocol|workspaceKernelDataPlane' --xunit-output .build/task10a-red.xml
+red_status=$?
+set -e
+test "$red_status" -ne 0 || { echo 'Task 10A RED unexpectedly passed' >&2; exit 1; }
+actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' .build/task10a-red-swift-testing.xml)
+test "$actual" -eq "$expected"
+```
+
+Expected: test exit 非零且 count 非零/相等；测试因 compile scaffold 的 deterministic fail-closed behavior 不满足而失败。任何全绿 RED、缺失 xUnit 或 count mismatch 都使 Step 2 失败。
+
+- [ ] **10A Step 3: 实现 ABI、mappers 与 Workspace port**
+
+严格实现本节；不得使用 LocalTransport JSON 例外。Host port 的 fake 只用于 mapper/validation 单测，Workspace tests 必须直接使用实际 `WorkspaceKernelRegistry`、`DocumentRegistry`、`DocumentActor` 与 `FileTreeProvider`。
+
+- [ ] **10A Step 4: GREEN、计数并提交**
+
+```bash
+/usr/bin/swift test --disable-automatic-resolution --filter 'hostDataPlaneProtocol|workspaceKernelDataPlane' --xunit-output .build/task10a-green.xml
+green_status=$?
+test "$green_status" -eq 0
+expected=$(/usr/bin/swift test list --skip-build 2>/dev/null | /usr/bin/grep -Ec '^(CockpitProtocolTests\.hostDataPlaneProtocol|CockpitWorkspaceTests\.workspaceKernelDataPlane)')
+actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' .build/task10a-green-swift-testing.xml)
+test "$expected" -gt 0 && test "$actual" -eq "$expected"
+/usr/bin/git diff --check
+git add Sources/CockpitTypes/ProtocolVersion.swift Sources/CockpitProtocol Sources/CockpitClientCore/FileTreeDataTransport.swift Sources/CockpitHostCore/HostDataPlaneServing.swift Sources/CockpitWorkspace/DocumentActor.swift Sources/CockpitWorkspace/DocumentRegistry.swift Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift Sources/CockpitWorkspace/WorkspaceHostDataPlaneService.swift Tests/CockpitProtocolTests/HostDataPlaneProtocolTests.swift Tests/CockpitWorkspaceTests/DocumentActorTests.swift Tests/CockpitWorkspaceTests/WorkspaceKernelDataPlaneTests.swift
+git commit -m "feat: define host data plane protocol"
+```
+
+#### Task 10B: 实现 Host XPC ticket 与 UDS 数据面
+
+**Files:**
+
+- Modify: `Package.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCProtocol.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
@@ -987,68 +1269,383 @@ git commit -m "feat: coordinate authoritative documents"
 - Create: `Sources/CockpitLocalTransport/HostDataPlaneClient.swift`
 - Create: `Sources/CockpitLocalTransport/HostDataPlaneTicket.swift`
 - Modify: `Applications/CockpitHost/main.swift`
+- Create: `Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift`
+- Create: `Tests/CockpitLocalTransportTests/HostDataPlaneModuleBoundaryTests.swift`
+
+**Package scope:** 10B 才给 `CockpitLocalTransport` linker settings 增加 Apple SDK system frameworks `Security`、`CryptoKit`，并给 `CockpitLocalTransportTests` 增加直接 `CockpitClientCore` test dependency；Swift package dependencies/versions 不变，不新增第三方库。
+
+**XPC issuance:** `HostXPCProtocol` 新增 `issueHostDataPlaneTicket(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void)`；request/response 分别只编码 `CPHostDataPlaneTicketRequest`/`CPHostDataPlaneTicketResponse`。export 先按现有 XPC exact-key/version 机制验证 `CPRequestContext`，再等待 UDS server 完成 bind/listen、权限和 inode 检查并进入 `.ready`，最后签发；server 未 ready 时返回 typed XPC error，不返回票据。response `valid_for_milliseconds` 必须精确为 `30_000`。
+
+**Exact seams and construction:** 以下是 10B 唯一允许的 clock/random/peer/filesystem 注入面；production init 固定使用列出的 Darwin/Security/ContinuousClock 实现，tests 只注入这些 seams，不增加 privileged runner 或第二套 transport：
+
+```swift
+public protocol HostDataPlaneClock: Sendable {
+    func now() -> ContinuousClock.Instant
+}
+public struct ContinuousHostDataPlaneClock: HostDataPlaneClock {
+    public init()
+    public func now() -> ContinuousClock.Instant
+}
+public protocol HostDataPlaneRandomBytes: Sendable {
+    func bytes(count: Int) throws -> [UInt8]
+}
+public struct SecurityHostDataPlaneRandomBytes: HostDataPlaneRandomBytes {
+    public init()
+    public func bytes(count: Int) throws -> [UInt8]
+}
+public protocol PeerCredentialReading: Sendable {
+    func peerCredentials(for descriptor: Int32) throws -> (uid: uid_t, gid: gid_t)
+}
+public struct DarwinPeerCredentialReader: PeerCredentialReading {
+    public init()
+    public func peerCredentials(for descriptor: Int32) throws -> (uid: uid_t, gid: gid_t)
+}
+public struct UnixSocketPathStatus: Hashable, Sendable {
+    public enum Kind: Hashable, Sendable { case directory, socket, symbolicLink, other }
+    public let kind: Kind
+    public let owner: uid_t
+    public let permissions: mode_t
+    public let device: dev_t
+    public let inode: ino_t
+}
+public struct UnixDomainSocketAddress: @unchecked Sendable {
+    public let value: sockaddr_un
+    public let length: socklen_t
+    public init(path: String) throws
+}
+public protocol UnixDomainSocketSystemCalls: Sendable {
+    func effectiveUserID() -> uid_t
+    func createStreamSocket() throws -> Int32
+    func setCloseOnExec(_ descriptor: Int32) throws
+    func setNoSigPipe(_ descriptor: Int32) throws
+    func bind(_ descriptor: Int32, to address: UnixDomainSocketAddress) throws
+    func listen(_ descriptor: Int32, backlog: Int32) throws
+    func accept(_ descriptor: Int32) throws -> Int32
+    func connect(_ descriptor: Int32, to address: UnixDomainSocketAddress) throws
+    func pathStatus(_ path: String) throws -> UnixSocketPathStatus?
+    func makeDirectory(_ path: String, permissions: mode_t) throws
+    func setPermissions(_ path: String, permissions: mode_t) throws
+    func unlink(_ path: String) throws
+    func close(_ descriptor: Int32)
+    func read(_ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer) throws -> Int
+    func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int
+}
+public struct DarwinUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls { public init() }
+
+public struct HostDataPlaneIssuedTicket: Hashable, Sendable {
+    public let wireValue: String
+    public let validForMilliseconds: UInt32
+}
+public actor HostDataPlaneTicketStore {
+    public init(clock: any HostDataPlaneClock, randomBytes: any HostDataPlaneRandomBytes)
+    public init() // ContinuousHostDataPlaneClock + SecurityHostDataPlaneRandomBytes
+    public func issue(binding: HostDataPlaneBinding, expectedPeerUID: uid_t) throws -> HostDataPlaneIssuedTicket
+    public func consume(wireValue: String, binding: HostDataPlaneBinding, peerUID: uid_t) throws -> HostDataPlaneBinding
+}
+public actor HostDataPlaneTicketIssuer {
+    public init(server: HostDataPlaneServer, store: HostDataPlaneTicketStore, effectiveUserID: uid_t)
+    public func issue(
+        for validatedContext: RequestContext,
+        deliver: @escaping @Sendable (CPHostDataPlaneTicketResponse) throws -> Void
+    ) async throws
+    public func stopIssuingTickets() async
+}
+public final class HostDataPlaneServer: @unchecked Sendable {
+    public init(namespace: String, service: any HostDataPlaneServing, ticketStore: HostDataPlaneTicketStore,
+                systemCalls: any UnixDomainSocketSystemCalls, peerCredentials: any PeerCredentialReading)
+    public convenience init(namespace: String = "default", service: any HostDataPlaneServing,
+                            ticketStore: HostDataPlaneTicketStore)
+    public func start() async throws
+    public func waitUntilReady() async throws
+    public func shutdown() async
+}
+public actor HostDataPlaneClient {
+    public init(binding: HostDataPlaneBinding, xpcClient: HostXPCClient,
+                systemCalls: any UnixDomainSocketSystemCalls)
+    public init(binding: HostDataPlaneBinding, xpcClient: HostXPCClient) // Darwin production
+    public func connect() async throws
+    public func disconnect() async
+    public nonisolated func documentDiagnostics() -> AsyncStream<DocumentDataPlaneDiagnostic>
+}
+public enum DocumentDataPlaneDiagnostic: Hashable, Sendable {
+    case committedRecoveryRequired(EditAcknowledgement)
+    case fingerprintMismatch
+}
+```
+
+**Ticket store:** raw ticket 是 `SecRandomCopyBytes(kSecRandomDefault, 32, ...)` 生成的 256-bit CSPRNG bytes，wire 是无 padding base64url，精确 43 ASCII chars 且 regex `^[A-Za-z0-9_-]{43}$`；decoder 必须 re-encode 后 exact equal。actor 只存 `CryptoKit.SHA256.hash(raw)`、完整 binding、expected peer UID、`ContinuousClock.Instant issuedAt`、`expiry = issuedAt + .seconds(30)` 与 consumed tombstone，绝不存 raw/wire ticket。验证/消费在一个 actor method 原子执行，顺序为 canonical decode/hash/lookup；`now >= expiry` 删除并报 expired；`getpeereid` UID 与完整 binding/context/environment/generation 逐项 exact compare；失败绑定不消费；成功后置 consumed；已 consumed 在 expiry 前报 replay；expired tombstone 删除。每次连接只能 auth 一张票据，票据只能成功一次。
+
+**Socket path and lifecycle:** namespace 必须匹配 `^[a-z0-9][a-z0-9._-]{0,31}$`，production 为 `default`；path 固定 `/private/tmp/cockpit.{geteuid()}/host/{namespace}/host.sock`。`UnixDomainSocketAddress` 先将 value zero-initialize并设 `sun_family = sa_family_t(AF_UNIX)`，以 `MemoryLayout.size(ofValue: address.sun_path)` 取得 tuple capacity（当前 Darwin `104`），要求 UTF-8 path bytes + NUL `<= capacity`，逐 byte 写入 tuple且禁止截断；`sun_len = UInt8(MemoryLayout.offset(of: \sockaddr_un.sun_path)! + pathBytes.count + 1)`，bind/connect `socklen_t` 精确等于该 `sun_len`。不得用整个 sockaddr size 或减 `sa_family_t` 推算 capacity。
+
+`/private/tmp/cockpit.{uid}`、`host`、namespace 各层用 `lstat/open(O_DIRECTORY|O_NOFOLLOW)/fstat` 验证真实 directory、owner=`geteuid()`、permissions exact `0700`；缺失层以 `0700` 创建。Darwin create 固定为 `socket(AF_UNIX, SOCK_STREAM, 0)`，成功后立即 `fcntl(fd, F_SETFD, FD_CLOEXEC)` 与 `fcntl(fd, F_SETNOSIGPIPE, 1)`；client socket和每个 accepted FD 同样在任何 read/write 前设置两项，任一失败立即 close。bind 后 pathname `chmod 0600`，owner/type/mode/dev/inode 只用 guarded `lstat(path)` 验证并记录；listener FD 不代表 filesystem inode，`fstat(listener)` 禁止用于 pathname identity/permissions，只允许 `getsockopt(SO_TYPE)` 等 descriptor/socket-state 检查。
+
+启动发现现有 path 时：`lstat` 若 symlink、非 socket、wrong owner 立即 fail closed；若为本 UID socket，先 connect。connect 成功报 `serverAlreadyRunning`，不得 unlink；只有 `ECONNREFUSED` 或在复核中已 `ENOENT` 才是 stale candidate。unlink 前第二次 `lstat` 必须与第一次 `st_dev/st_ino` 完全相等且仍为本 UID socket，否则 fail closed/retry startup from beginning。shutdown 顺序固定为停止 ticket issuance、停止 accept、关闭 active clients、取消 subscriptions、close listener；仅当 shutdown `lstat` 仍与 bind 后记录的 pathname `st_dev/st_ino` 相等且 owner/type 正确时 unlink。startup 任一步失败执行同一有 pathname inode guard 的清理。
+
+Host main 新增真实 SIGTERM shutdown path：启动前 `signal(SIGTERM, SIG_IGN)`，在 main run loop 上保留 `DispatchSourceSignal`；handler 只启动一次 async sequence `await ticketIssuer.stopIssuingTickets()` → `await server.shutdown()` → `listener.invalidate()` → `CFRunLoopStop(mainRunLoop)`，然后 main 返回退出。`HostDataPlaneTicketIssuer` actor 内用单一 issuance/shutdown gate 串行 `issue` 与 stop：`issue` 在 gate 内先检查 accepting，再等待 server ready、签发，并在 gate permit 释放前同步调用唯一 `deliver` closure；HostXPCExport 的该 closure 完成 protobuf serialization 和 XPC reply invocation。`stopIssuingTickets()` 原子改为 stopped、拒绝之后进入的 issue，并等待已经 admitted 的 issue 完成或抛错且释放 permit 后才返回。它返回后不得再调用 ticket `deliver`/XPC reply，且 server shutdown 只能在其返回后开始。Host main 保持 signal source/server/issuer 强引用；明确不依赖当前代码中不存在的 shutdown callback。所有 write 在 `F_SETNOSIGPIPE` 后执行，peer close 只转换 `EPIPE` 为 `HostDataPlaneClientError.disconnected` 并关闭连接，禁止触发进程 SIGPIPE 退出。
+
+**Peer credentials:** accept 后、读取任意 payload 前调用 Darwin `getpeereid(fd,&uid,&gid)`，要求 uid 等于 `geteuid()`；失败或错 UID 关闭。生产使用真实 syscall；测试通过 injectable `PeerCredentialReading` system-call seam 覆盖 wrong UID，无需 root/特权 runner，同时 fork/spawn 一个真实同 UID client process 覆盖真实 UDS/getpeereid/handshake/channel 3/4。
+
+**Client and errors:** `HostDataPlaneClient` 以 immutable authenticated binding 实现 Task 9 `DocumentDataTransport` 与 10A `FileTreeDataTransport`，每个 request 重复 binding。`changes(after:expandedDirectories:)` 固定持有调用时 validated/sorted/deduplicated directory snapshot；revision unavailable 时只刷新这组 directories。请求取消发送对应 file-tree cancel；document unary cancellation 丢弃晚到响应但不复用 request ID，Task 9 controller 继续按 ambiguous mutation 规则 resynchronize。断线将 pending unary 完成 typed transport-disconnected、终止 streams；reconnect 必须新 XPC ticket、重新 handshake/auth，禁止重放 mutation。server 将 Host/domain errors按 10A numeric enum exact map；`INTERNAL` 不带 filesystem path/message。frame/protobuf/context errors按 10A close 规则处理。
+
+Swift typed errors 固定为：`HostDataPlaneTicketError.randomGenerationFailed/invalidCanonicalTicket/expired/replay/bindingMismatch`；`UnixDomainSocketError.invalidNamespace/pathTooLong/unsafeDirectory/unsafeSocket/serverAlreadyRunning/staleSocketRace/permissionMismatch/systemCall(function: String, errno: Int32)`；`HostDataPlaneClientError.disconnected/requestCancelled/remote(DataPlaneRemoteError)`。`DataPlaneRemoteError` 只用于非 document codes，含 code、optional expected/actual；document response 必须在 `HostDataPlaneClient` mapper 中还原 Task 9 error，禁止包进 `.remote`。`documentDiagnostics()` 是保留 committed acknowledgement/fingerprint mismatch 的唯一 side channel，buffering policy `.bufferingOldest(32)`，overflow 只丢 diagnostic、不改变 controller error。XPC issuance 使用 error domain `dev.cockpit.host-data-plane-ticket` 与 code `1 serverNotReady / 2 invalidContext / 3 ticketGenerationFailed`；不得返回 raw Swift error text/path。
+
+Document error mapping 固定如下：`DOCUMENT_NOT_OPEN`/`DOCUMENT_INVALID_VALUE` → `.invalidValue`；`DOCUMENT_INVALID_LEASE` → `.invalidLease`；`DOCUMENT_LEASE_HELD` → `.leaseHeld`；`DOCUMENT_BASE_VERSION_MISMATCH(expected,actual)` → `.baseVersionMismatch`；`DOCUMENT_SEQUENCE_GAP(expected,actual)` → `.sequenceGap`；`DOCUMENT_DUPLICATE_MISMATCH` → `.duplicateMismatch`；`DOCUMENT_STALE_SEQUENCE` → `.staleSequence`；`DOCUMENT_RECOVERY_REQUIRED` → `.recoveryRequired`；`DOCUMENT_RESYNCHRONIZING` → `.resynchronizing`；`DOCUMENT_READ_ONLY` → `.readOnly`；`DOCUMENT_FILE_MISSING` → `.fileMissing`；`DOCUMENT_FINGERPRINT_MISMATCH` (`32`) → `.recoveryRequired`。server 只把 exact `DocumentStorageError.fingerprintMismatch` 映射到 code 32，不回传 expected/actual fingerprint/path；client yield `.fingerprintMismatch` diagnostic 后抛 `.recoveryRequired`，Task 9 save 立即进入 resynchronizing，Monaco 返回 `stale-document-state` 并等待 snapshot replacement。server 只 catch shared `HostDataPlaneDocumentError.committedRecoveryRequired(ack)` 并映射为 code 28 + exact committed acknowledgement；LocalTransport source 与 target dependencies 均禁止引用 `CockpitWorkspace` 或 concrete `DocumentCommitRecoveryRequiredError`。client yield `.committedRecoveryRequired(ack)` 后仍抛 `.recoveryRequired`，禁止把它作为成功 ack。authoritative apply code（invalid lease/lease held/base mismatch/sequence gap/duplicate/stale/recovery）各自只允许一次 transport apply，controller 必须立即 `.resynchronizing`；禁止 transient retry。
+
+- [ ] **10B Step 1: 写 RED process/actor tests**
+
+所有测试函数使用 `hostDataPlane` lowerCamel prefix。覆盖 raw 长度/canonical base64url/只存 hash/可推进 fake clock 的 `now == expiry`、failed binding 不消费、success/replay、RequestContext-derived binding、server-ready-before-XPC、namespace/sun_path tuple capacity/sun_len/addrlen、post-socket/post-accept CLOEXEC、F_SETNOSIGPIPE、0700/0600、pathname-lstat 与 listener-fstat identity 不混用、symlink/wrong owner/non-socket/live/stale/dev-inode race、shutdown inode guard、getpeereid/geteuid seam、真实同 UID 子进程、32-byte header fixture、Channel 0 control error 不被 response 接受、Channel 3/4 seq/ack/request correlation、所有 document operations、wire-visible binding mismatch 零 Host port call、Actor owner mismatch 一次 authorized Actor call且零 storage/mutation、file-tree backpressure/cancel/reconnect/revision、malformed/typed errors。每个 document numeric code 都断言 exact Swift error；shared committed-recovery error 断言 code 28 + acknowledgement 且 LocalTransport 不识别 Workspace concrete type；authoritative apply codes 断言只发一次并立即 resynchronizing；fingerprint mismatch 断言 code 32 → `.recoveryRequired`。`HostDataPlaneModuleBoundaryTests.swift` 以 `hostDataPlaneModuleBoundary` prefix 读取 `Package.swift` target dependency graph 并扫描 `Sources/CockpitLocalTransport/**/*.swift`，断言 CockpitLocalTransport target 不依赖 CockpitWorkspace 且没有 `import CockpitWorkspace`/`DocumentCommitRecoveryRequiredError`；同时通过 `swift build --target CockpitLocalTransport` compile proof。wrong UID/wrong owner/dev-inode race 只使用已声明 seams；不得声明特权测试未运行。issuance/shutdown test 注入暂停点，断言已 admitted issue 的 deliver/XPC reply invocation → `stopIssuingTickets` return → server shutdown → listener invalidation 的 strict order，stop 后新 issue 零 deliver/零 ticket reply。进程测试还要真实向 Host 发送 SIGTERM，断言停止 ticket、socket guarded unlink、listener invalidated、进程退出；peer-close write 断言只得到 EPIPE/disconnected且 server/client process 未被 SIGPIPE 终止。测试先写；为得到可执行 RED，只添加本节 exact public declarations，ticket store 固定返回 `.invalidCanonicalTicket`、server/client 固定返回 `.disconnected`，不得 bind/listen/connect 或添加成功分支。
+
+- [ ] **10B Step 2: 证明 RED filter 非零并运行**
+
+```bash
+/usr/bin/swift build --disable-automatic-resolution --build-tests
+/usr/bin/swift build --disable-automatic-resolution --target CockpitLocalTransport
+expected=$(/usr/bin/swift test list --skip-build 2>/dev/null | /usr/bin/grep -Ec '^CockpitLocalTransportTests\.hostDataPlane')
+test "$expected" -gt 0
+set +e
+/usr/bin/swift test --disable-automatic-resolution --filter '^CockpitLocalTransportTests\.hostDataPlane' --xunit-output .build/task10b-red.xml
+red_status=$?
+set -e
+test "$red_status" -ne 0 || { echo 'Task 10B RED unexpectedly passed' >&2; exit 1; }
+actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' .build/task10b-red-swift-testing.xml)
+test "$actual" -eq "$expected"
+```
+
+Expected: test exit 非零且 count 非零/相等；测试因 compile scaffold 的 deterministic fail-closed behavior 不满足而失败。任何全绿 RED、缺失 xUnit 或 count mismatch 都使 Step 2 失败。
+
+- [ ] **10B Step 3: 实现 ticket、UDS server/client 与 Host composition**
+
+严格按 10A ABI 和本节生命周期实现；禁止 JSON data plane、privileged helper、launchd socket activation或新 daemon。Host 仍由现有 launchd Mach service 启动，UDS 只由该 Host process 持有。
+
+- [ ] **10B Step 4: GREEN、计数并提交**
+
+```bash
+/usr/bin/swift test --disable-automatic-resolution --filter '^CockpitLocalTransportTests\.hostDataPlane' --xunit-output .build/task10b-green.xml
+green_status=$?
+test "$green_status" -eq 0
+expected=$(/usr/bin/swift test list --skip-build 2>/dev/null | /usr/bin/grep -Ec '^CockpitLocalTransportTests\.hostDataPlane')
+actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' .build/task10b-green-swift-testing.xml)
+test "$expected" -gt 0 && test "$actual" -eq "$expected"
+/usr/bin/git diff --check
+git add Package.swift Sources/CockpitLocalTransport Applications/CockpitHost/main.swift Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift Tests/CockpitLocalTransportTests/HostDataPlaneModuleBoundaryTests.swift
+git commit -m "feat: serve host data plane over uds"
+```
+
+#### Task 10C: 实现 bundle-only Monaco bridge
+
+**Files:**
+
+- Modify: `EditorRuntime/src/protocol.mjs`
+- Modify: `EditorRuntime/src/bootstrap.ts`
+- Modify: `EditorRuntime/build.mjs`
+- Modify: `EditorRuntime/package.json`
+- Modify: `EditorRuntime/toolchain-contract.mjs`
+- Modify: `EditorRuntime/test/build.test.mjs`
+- Create: `EditorRuntime/test/protocol.test.mjs`
+- Modify: `Sources/CockpitClientCore/WorkspaceClientState.swift`
 - Create: `Applications/CockpitApp/Monaco/MonacoMessage.swift`
+- Create: `Applications/CockpitApp/Monaco/MonacoWindowSessionResolver.swift`
 - Create: `Applications/CockpitApp/Monaco/MonacoBridge.swift`
 - Create: `Applications/CockpitApp/Monaco/MonacoEditorViewController.swift`
-- Create: `Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift`
 - Create: `Tests/CockpitAppTests/MonacoBridgeTests.swift`
+- Modify: `Tests/CockpitClientCoreTests/WorkspaceClientStateTests.swift`
 - Modify: `Tests/ProcessIntegrationTests/app-bundle-layout.zsh`
 - Modify: `project.yml`
 
-**Contract:**
+**Exact JS wire schema:** object keys must be exactly the declared keys; no additional/missing keys, numeric strings, `undefined`, NaN or infinity. All UUID strings are canonical lowercase. All integer fields are `Number.isSafeInteger`; generation/client sequence/document version are within `1...9_007_199_254_740_991` except `documentVersion` and `lastAcceptedClientSequence` permit `0`; line/column/firstVisibleLine are `1...9_007_199_254_740_991`; horizontal scroll is finite and `>=0`.
 
 ```typescript
+type WorkspaceContextWire =
+  | { kind: "project"; projectID: string }
+  | { kind: "conversation"; conversationID: string };
+type TextPosition = { line: number; column: number };
+type TextRange = { anchor: TextPosition; active: TextPosition };
+type ViewState = { cursor: TextPosition; selections: TextRange[]; firstVisibleLine: number; horizontalScrollOffset: number };
+type TextChange = { offset: number; length: number; replacement: string };
+
 type NativeToMonaco =
-  | { type: "open"; uri: string; language: string; text: string; documentVersion: number; editLeaseID: string; viewState: ViewState | null }
-  | { type: "ack"; uri: string; clientSequence: number; documentVersion: number }
-  | { type: "replace"; uri: string; text: string; documentVersion: number; editLeaseID: string }
-  | { type: "setWritable"; uri: string; writable: boolean };
+  | { type: "open"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; language: string; text: string; documentVersion: number; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean; viewState: ViewState | null }
+  | { type: "ack"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; clientSequence: number; documentVersion: number; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean }
+  | { type: "replace"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; text: string; documentVersion: number; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean; viewState: ViewState | null }
+  | { type: "setWritable"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean }
+  | { type: "renameModel"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; oldURI: string; newURI: string; language: string; text: string; documentVersion: number; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean; viewState: ViewState | null }
+  | { type: "disposeModel"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean }
+  | { type: "selectModel"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean; viewState: ViewState | null };
 
 type MonacoToNative =
-  | { type: "ready" }
-  | { type: "edit"; uri: string; editLeaseID: string; baseVersion: number; clientSequence: number; changes: TextChange[] }
-  | { type: "save"; uri: string; throughClientSequence: number }
-  | { type: "viewState"; uri: string; value: ViewState };
+  | { type: "ready"; webContentGeneration: number }
+  | { type: "edit"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; editLeaseID: string | null; writable: boolean; baseVersion: number; lastAcceptedClientSequence: number; changes: TextChange[] }
+  | { type: "save"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean }
+  | { type: "viewState"; webContentGeneration: number; workspaceContextID: WorkspaceContextWire; tabID: string; documentID: string; uri: string; lastAcceptedClientSequence: number; editLeaseID: string | null; writable: boolean; value: ViewState };
+
+type NativeReply =
+  | { ok: true; message: NativeToMonaco | null }
+  | { ok: false; error: { code: "invalid-schema" | "stale-generation" | "stale-document-state" | "unknown-document" | "read-only" | "resynchronizing" | "file-missing" | "transport-failure" } };
 ```
 
-`MonacoEditorViewController` 在一个 Window 生命周期内只创建一个 WKWebView；每个 DocumentID 使用 `cockpit-file://{environmentID}/{percentEncodedRelativePath}` model URI；切换页签只调用 `editor.setModel`。Monaco `saveViewState` 的 cursor/selection/scroll 映射到 Task 5 的 Context-local `DocumentViewState`，切回同一 Context/file 时恢复。
+`ready` 是唯一 window-scoped message，因此只含 generation；其它每条 document-scoped message 均含 generation/context/canonical lowercase TabID/document/URI/lastAcceptedClientSequence/nullable lease/writable。Swift error 固定为 `MonacoBridgeError.invalidSchema/staleGeneration/staleDocumentState/unknownDocument/readOnly/resynchronizing/fileMissing/transportFailure`，逐一映射上述 kebab-case reply code，不返回任意 error string。
 
-Host 本地数据面固定为 `/private/tmp/cockpit.{uid}/host/{serviceNamespace}/host.sock`，production namespace 为 `default`；目录 `0700`、socket `0600`。Host XPC 为当前 ClientInstanceID + WindowID + WorkspaceContextID + EnvironmentID + generation 签发 30 秒、单次消费的数据面票据。`HostDataPlaneServer` 完成 `getpeereid`、protocol 1.1 handshake 和票据校验后，只在 Channel 3 路由 document transaction/snapshot/ack，在 Channel 4 路由 lazy-tree request/delta。每条消息再次校验 Context 与 Environment 绑定、generation、documentVersion/tree revision；错误返回类型化 protocol error。
+`TextChange` 使用 UTF-16 offset/length；offset/length 为 safe nonnegative integers、`offset + length` safe、replacement 不含 CR/NUL；array 非空、offset 严格递增且 ranges 不重叠。JS edit 不含/不生成 authoritative `clientSequence`，只把 change 交给对应 `DocumentClientController.submit`；edit 在 mapper 层额外要求 `writable == true` 且 lease nonnull，controller 生成 sequence，native ack 再把 accepted sequence/version 返回。每个 Monaco→native document message 的 Context/TabID/DocumentID 必须命中 exact resolver ref，last sequence/lease/writable 必须匹配 controller-owned access tuple：`await controller.state == .ready(snapshot)` 时要求 `snapshot.currentLease.clientInstanceID == resolver.clientInstanceID` 并输出该 lease/true；`.readOnly(snapshot)` 无论 snapshot 是否含远端 owner lease都固定输出 nil/false，禁止把他人 lease 暴露为本 controller writable；其它 state 返回对应 typed error。mismatch 不调用 controller。save 从 state snapshot 读取 nonnull `observedDiskFingerprint` 并只调用 `controller.save(expectedFingerprint:)`（controller 内部已 flush）；成功 reply 是含返回 snapshot 的 `replace`，nil fingerprint 返回 `file-missing`；code 32/recovery-required 返回 `stale-document-state` 并等待 resync。不得由 JS 传 through sequence。`writable === (editLeaseID !== null)`，false 必须 null，true 必须 canonical lease ID。replace/open/rename 的 programmatic model write 在 suppression scope 中，scope 在 synchronous `model.setValue` 完成后释放且不得产生 edit 回传。
 
-`HostDataPlaneClient` 实现 ClientCore 的 `DocumentDataTransport` 与 `FileTreeDataTransport` ports。`MonacoBridge` 只依赖 `DocumentClientController`，不得持有或导入 `DocumentActor`；文件树 UI 后续只依赖 `FileTreeDataTransport`。
+**URI:** exact form `cockpit-file://{canonical-lowercase-environment-uuid}/{encoded-relative-path}`。`RelativePath` 以 `/` 分 component；每个 component 转 UTF-8 bytes，只保留 RFC 3986 unreserved `ALPHA / DIGIT / - / . / _ / ~`，其余每 byte 用 uppercase `%HH`，包括 literal `%`；`/` 只作为 separator，不编码。Monaco `Uri.parse(uri).toString()` 必须 exact equal，否则拒绝。禁止 Unicode normalization、`URLComponents` 自动重编码或 lowercase percent hex。
 
-- [ ] **Step 1: 写失败测试**
+**Public batch relocation entry:** `MonacoBridge` 可以 import `CockpitHostCore` 的 value-only `FileOperation`/`FileOperationResult`，但不得持有/call Workspace service。token 按 initiating Context + exact FileOperation source batch 建立，不以 active Tab/Document 建立；生产调用面固定为：
 
-JS 测试断言 schema 拒绝未知消息、edit sequence 单调、model 复用和 replace 不产生回传 edit；Swift 测试断言一个 window factory 只创建一次 WebView、消息映射完整、Context-local view state round-trip、旧 generation 被丢弃、WebContent crash 后经 DocumentDataTransport 获取 acknowledged snapshot 重建。Host 数据面进程测试断言票据单次消费、错 UID/context/environment/generation/revision 被拒绝，document ack 与 file-tree delta 实际经过 UDS Channel 3/4。
+```swift
+public struct MonacoRelocationToken: Hashable, Sendable {
+    public let id: RequestID
+    public let workspaceContextID: WorkspaceContextID
+    public let operation: FileOperation
+    public let sourcePath: RelativePath
+    public let affectedDocumentIDs: [DocumentID]
+    // Opaque: only MonacoBridge constructs tokens; there is no public initializer.
+}
+public enum MonacoRelocationDisposition: Hashable, Sendable {
+    case complete
+    case incomplete(pendingDocumentIDs: [DocumentID])
+    case abandonedAllStale
+}
+@MainActor public func prepareRelocation(
+    workspaceContextID: WorkspaceContextID,
+    operation: FileOperation
+) async throws -> MonacoRelocationToken
+@MainActor public func commitRelocation(
+    _ token: MonacoRelocationToken,
+    result: FileOperationResult
+) async throws -> MonacoRelocationDisposition
+@MainActor public func retryRelocation(
+    _ token: MonacoRelocationToken
+) async throws -> MonacoRelocationDisposition
+@MainActor public func abandonCommittedRelocation(
+    _ token: MonacoRelocationToken
+) throws -> MonacoRelocationDisposition
+@MainActor public func cancelRelocation(_ token: MonacoRelocationToken) throws
+```
 
-- [ ] **Step 2: 运行失败测试**
+prepare 只接受 `.rename(source:newName:)`/`.move(source:destinationDirectory:)`；其它 operation 抛 `.invalidSchema` 且不创建 token。bridge 在 window resolver 中选出 relative path 等于 source 或以 `source + "/"` 为 component prefix 的全部 open sessions，因此 file 是 0...1 session、directory 是 0...n descendant sessions；source 未打开时允许 `affectedDocumentIDs=[]`。每个 affected DocumentID 只出现一次并 canonical UUID 升序，batch 包含这些 session 在所有 Context 的全部 refs，而不仅 initiating Context。live token 的 `(workspaceContextID, operation)` 不得重复，且 affected DocumentID 不得与另一个 live token 重叠。
+
+prepare 按 DocumentID 顺序先读取每个 controller 的 exact `DocumentClientControllerState` 与 access tuple：`.ready(snapshot)` 仅当 `snapshot.currentLease` nonnull 且其 `clientInstanceID == resolver.clientInstanceID` 时调用该 controller `flush()` exactly once，并记录 `priorWritable=true`；`.readOnly` 调用 `flush()` exactly zero times并记录 `priorWritable=false`。`.ready` 缺 lease或 lease owner 不匹配抛已冻结 `MonacoBridgeError.staleDocumentState`；`.closed` 抛 `.unknownDocument`；`.resynchronizing` 抛 `.resynchronizing`；这三种不可用状态均零 flush、零 token。ready/readOnly 两种可用状态都保存该 document 的全部 refs async view state。任一 state/access validation、ready flush 或任一 ref save-view-state 失败，整个 prepare 不保存 token并原样抛出该 typed error；它不调用 Host file operation。commit 使用 token 中逐 document 冻结的 `priorWritable`，分别调用 `resynchronize(requestWriteAccess: true/false)`，不得把 batch 统一升级为 writable。
+
+caller 执行 Host rename/move；首次 commit 只接受 exact `.relocated(from:to:)` 且 `from == token.sourcePath`，其它 result/mismatch 抛 `.invalidSchema` 并保留 pre-commit token 供 cancel。每个 source session destination path 固定为：path exact equal source 时取 `to`；descendant 时把 source 之后的完整 component suffix 接到 `to`。commit 对每个 pending DocumentID 按顺序调用 controller `resynchronize(requestWriteAccess: priorWritable)`，要求返回 snapshot 的 DocumentID/EnvironmentID 不变且 relativePath exact equal mapped destination，然后执行该 document 全部 refs/model migration。空 batch 直接 consume token并返回 `.complete`。
+
+Host commit 后的 token 记录 exact `.relocated(from:to:)` 与每个 DocumentID 的 `.pending`/`.migrated` progress。单个 document resync/migration 失败不回滚已成功 document：失败及尚未处理 session 立即进入 bridge `.resynchronizing`，edit/save 返回 typed `resynchronizing`；token 保留并返回 `.incomplete(pendingDocumentIDs:)`，pending list canonical UUID 升序。`retryRelocation` 只允许 committed-incomplete token，只重试 pending documents，成功的 migrated documents 不重复；全部成功时 consume token并返回 `.complete`。`cancelRelocation` 只允许 Host commit 前，释放 token且不改 model/controller；committed token 调 cancel 抛 `.staleDocumentState`。caller 放弃 retry 时必须调用 `abandonCommittedRelocation`：它 dispose 所有 affected old/destination models、保留 resolver refs/controllers但把全部 affected sessions 置为 `.resynchronizing`、consume token并返回 `.abandonedAllStale`；之后只允许既有 controller resynchronize/reopen path 重建 authoritative models，禁止继续使用任一部分迁移 model。
+
+每个 document migration 使用 authoritative destination snapshot 和 prepare 保存的每个旧 ref view state，发 `renameModel`：新 URI 建新 Monaco model、载入 destination snapshot、分别转移 `(WorkspaceContextID,TabID,DocumentID)` view state、把该 document 的所有 refs 原子切到新 model、若当前选中则切换；旧 model 只有 refcount 变为 0 才 dispose。Monaco model URI immutable，因此该操作明确重置 undo/redo stack；禁止复用旧 model 或伪造可变 URI。
+
+**Window session ownership:** `MonacoWindowSessionResolver` 是 `@MainActor`，init 固定接收本 window 的 `ClientInstanceID`；为每个 `DocumentID` 保留且只保留一个 `DocumentClientController`，每个 tab 增加 `(WorkspaceContextID,TabID,DocumentID)` ref，同 Context/同 Document 的不同 Tab 不合并。其 public surface 固定为 `retain(contextID:tabID:documentID:controller:language:)`, `session(documentID:)`, `select(contextID:tabID:documentID:)`, `release(contextID:tabID:documentID:)`, `allSessionsSortedByDocumentID()`；同 DocumentID 传入不同 controller 必须拒绝，重复 ref key 必须幂等。view state 仅通过 init 注入的
+
+```swift
+@Sendable (WorkspaceContextID, TabID, DocumentID) async -> DocumentViewState?
+@Sendable (WorkspaceContextID, TabID, DocumentID, DocumentViewState) async throws -> Void
+```
+
+load callback 只用 `await WorkspaceClientState.state(for:)` 查找 exact TabID 并验证 resource 是同一 DocumentID。store callback 的 production adapter 只能执行一次 actor-isolated 调用：
+
+```swift
+public enum WorkspaceClientStateError: Error, Hashable, Sendable {
+    case stateNotFound
+    case tabNotFound
+    case tabDocumentMismatch
+}
+
+public func updateFileViewState(
+    key: ClientWorkspaceStateKey,
+    tabID: TabID,
+    documentID: DocumentID,
+    viewState: DocumentViewState
+) throws
+```
+
+`WorkspaceClientState.updateFileViewState` 在 actor isolation 内验证 key/view state、要求 state 存在、要求 exact TabID 存在且其 resource 恰为 `.file(documentID)`，然后只替换该 `TabRecord.fileViewState`、重建并 validate `ClientWorkspaceState`、写回 dictionary；三个 lookup failure 分别抛上述 exact error。禁止 production callback 执行 `state(for:)` → 本地修改 → `store` 的跨 actor 两调用 RMW；adapter 从其 init 捕获的 DeviceID/WindowID 与 callback ContextID 构造 `ClientWorkspaceStateKey`，callback body 只有 `try await workspaceClientState.updateFileViewState(key: key, tabID: tabID, documentID: documentID, viewState: viewState)`。同 Context/同 Document/两个 Tab 的并发 callback 必须各自保留更新，不得 last-writer 覆盖另一个 Tab。resolver/bridge 不 import `CockpitWorkspace`，不持有 `Workspace`、`WorkspaceKernel` 或 `DocumentActor`。除 value-only `FileOperation`/`FileOperationResult` relocation input 外，`MonacoBridge` 只通过 resolver 找到 `DocumentClientController`。
+
+**One WebView and crash generation:** `MonacoEditorViewController` 的 designated init 由 injected factory 创建恰好一个 `WKWebView` 并在 Window 生命周期内保持同一对象；页签切换只发带 exact TabID 的 `selectModel`/调用 JS `editor.setModel`。首次 load generation=`1`；`webViewWebContentProcessDidTerminate` 对同一个 WKWebView safe-increment generation，重装 bundle URL，旧 generation 的 native/JS message 全丢弃。新 generation `ready` 后，对 resolver 的所有 open sessions 按 DocumentID 排序逐一调用各 controller `resynchronize(requestWriteAccess:)`，分别发 open 重建全部成功 snapshot model及其每个 Tab ref；每个 session 都必须尝试，失败 model 不恢复旧文本并通过 owner error callback 报错；原 selected `(ContextID,TabID,DocumentID)` 成功重建后最后恢复 selected model 和该 exact ref callback 返回的 view state。不得替换 WKWebView、只重建当前 model或恢复未 acknowledged JS buffer。
+
+**Bundle-only WebKit:** 只用 `loadFileURL(indexHTML, allowingReadAccessTo: MonacoRuntime.bundle)`，index 必须位于签名 App Bundle `Contents/Resources/MonacoRuntime.bundle/index.html`。`build.mjs` 生成的 index `<head>` 第一项固定为 `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self'; font-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'">`；build test 解析 DOM/text 并 exact compare，禁止后续 meta 覆盖。该 CSP 对 fetch/XHR/http/https/ws/wss/data/blob/javascript image/font/media/frame/worker subresource fail closed，实际 WKWebView test 从页面发起 fetch/image/WebSocket 并断言无 request 成功。navigation policy 只允许该 bundle directory 内 `file:` URL；拒绝 `http/https/ws/wss/data/blob/javascript`、外部 file URL、redirect、form submit、target frame nil/new window、`window.open` 和 download。`WKUIDelegate.createWebViewWith` 总返回 nil；无自定义 URL scheme、local HTTP server 或浏览器路由。
+
+script handler name 固定 `cockpitMonaco`、content world 固定 `.page`。`WKUserContentController` 只强持有 `WeakMonacoScriptMessageHandler` forwarder，forwarder 对 `MonacoBridge` 是 `weak`；`MonacoEditorViewController.tearDown()` 幂等调用 `removeScriptMessageHandler(forName: "cockpitMonaco", contentWorld: .page)` 并清空 navigation/UI delegates，window close 必须调用，`deinit` 再执行同一幂等清理。测试持有 weak owner/bridge/forwarder/webView 引用，tearDown 并释放 window owner 后全部为 nil；禁止 content controller → bridge/view controller retain cycle。
+
+`EditorRuntime/package.json` 的 `packageManager` 固定 `pnpm@11.20.0`，`engines.node` 固定 `26.7.0`，`engines.pnpm` 固定 `11.20.0`；不得保留 Node 25/pnpm 9 fallback。`toolchain-contract.mjs.evaluateToolchain` 只接受 node `26.7.0` + user agent `pnpm/11.20.0 ...` exact pair，`profileName` 对该 pair 返回 `current`，其它值均返回拒绝/null；删除 Profile A/B 与 range helper。`build.test.mjs` 的 manifest/accepted fixtures 只保留该 pair，并把 Node `25.9.0` + pnpm `9.15.9` 加入 rejected fixtures。`project.yml` 给 Cockpit app 增加直接 package product `CockpitHostCore`（只为 `FileOperation`/`FileOperationResult` relocation values），要求 XcodeGen 前 `EditorRuntime/build.mjs` 已原子生成 `EditorRuntime/dist/MonacoRuntime.bundle`，以 folder resource 复制，并给 Cockpit app 与 hosted `CockpitAppTests` 显式链接 Apple SDK `WebKit.framework`。唯一 runtime resources 为 `index.html`、`editor.js`、`editor.js.map`、`editor.css`，均 regular file、非 symlink、非空；缺一即失败。`build.mjs` 保持 external source map 但固定 esbuild `sourcesContent: false`；bundle gate 解析 map 并拒绝 `sourcesContent` key。不得把 `package.json`、lockfile、Node runtime、pnpm、node_modules 或 EditorRuntime source 放入 App。
+
+- [ ] **10C Step 1: 写 JS/ClientCore/App RED tests**
+
+JS tests 每个 top-level declaration 必须单行以 `test('monaco` 开头，覆盖 exact-key schema、全部 message variants、bounds/UTF-16/change ordering、JS 不生成 sequence、model refcount/reuse/suppression/rename undo reset/generation。`WorkspaceClientStateTests.swift` 新增 Swift Testing functions 以 `workspaceClientStateViewState` prefix，覆盖 exact errors、单 Tab update，以及同 Context/同 Document 两个 Tab 用 `async let` 并发更新后两个 view state 均保留。`MonacoBridgeTests` 必须是 `final class MonacoBridgeTests: XCTestCase`，method 名以 `test` 开头；覆盖 one WKWebView、CSP network subresource/new-window blocking、weak handler teardown/deinit、URI byte encoding、TabID-aware message/controller routing、同 Context/同 Document/两 Tab view-state 隔离、remote-owner lease read-only `(nil,false)`、fingerprint code 32 stale state、batch relocation 的 unopened empty、directory descendants、cross-context refs、exact relocated result、partial→retry、partial→abandoned-all-stale、cancel phase restriction、undo reset、stale generation、same-WKWebView crash rebuild all/selected ref restore/failure no stale text。directory batch 必须含一个 owned `.ready` document 与一个 `.readOnly` document：prepare 只对 ready controller flush once、readOnly zero flush，两者全部 refs view state 都保存且 Host relocation 继续；commit 分别以 `requestWriteAccess=true`/`false` resynchronize，并迁移两个 documents 的全部 refs。另覆盖 `.ready` 非 owner、`.closed`、`.resynchronizing` 的 exact typed error、零 token与零 Host call。测试先写；为使 Swift/Xcode enumeration 可执行，只添加本节 exact Swift public declarations；`WorkspaceClientState.updateFileViewState` scaffold 固定抛 `.stateNotFound`，message decoder 固定返回 `.invalidSchema`、bridge handler 固定回复 invalid-schema、factory 仍创建一个 injected WKWebView；不得路由 controller、创建 model 或添加成功分支。
+
+- [ ] **10C Step 2: 先 build 再证明 RED 非零并运行**
 
 ```bash
-fnm exec --using 26.7.0 pnpm --dir EditorRuntime test
-/usr/bin/swift test --disable-automatic-resolution --filter HostDataPlaneTests
+fnm exec --using 26.7.0 pnpm --dir EditorRuntime build
+test_enum_dir=$(mktemp -d /tmp/cockpit-task10c-enumerate.XXXXXX)
+js_expected=$(/usr/bin/grep -Ec "^test\\('monaco" EditorRuntime/test/protocol.test.mjs)
+test "$js_expected" -gt 0
+set +e
+fnm exec --using 26.7.0 pnpm --dir EditorRuntime exec node --test --test-reporter=junit --test-reporter-destination="$test_enum_dir/js-red.xml" test/protocol.test.mjs
+js_red_status=$?
+set -e
+test "$js_red_status" -ne 0 || { echo 'Task 10C JS RED unexpectedly passed' >&2; exit 1; }
+js_actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' "$test_enum_dir/js-red.xml")
+test "$js_actual" -eq "$js_expected"
+/usr/bin/swift build --disable-automatic-resolution --build-tests
+client_expected=$(/usr/bin/swift test list --skip-build 2>/dev/null | /usr/bin/grep -Ec '^CockpitClientCoreTests\.workspaceClientStateViewState')
+test "$client_expected" -gt 0
+set +e
+/usr/bin/swift test --disable-automatic-resolution --filter '^CockpitClientCoreTests\.workspaceClientStateViewState' --xunit-output .build/task10c-client-red.xml
+client_red_status=$?
+set -e
+test "$client_red_status" -ne 0 || { echo 'Task 10C ClientCore RED unexpectedly passed' >&2; exit 1; }
+client_actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' .build/task10c-client-red-swift-testing.xml)
+test "$client_actual" -eq "$client_expected"
 xcodegen generate --no-env
-/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -only-testing:CockpitAppTests/MonacoBridgeTests test
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation -only-testing:CockpitAppTests/MonacoBridgeTests -enumerate-tests -test-enumeration-style flat -test-enumeration-format json -test-enumeration-output-path "$test_enum_dir/tests.json" test
+expected=$(/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for v in d["values"] for t in v["enabledTests"] if t["identifier"].startswith("CockpitAppTests/MonacoBridgeTests/")))' "$test_enum_dir/tests.json")
+test "$expected" -gt 0
+set +e
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation -only-testing:CockpitAppTests/MonacoBridgeTests -resultBundlePath "$test_enum_dir/red.xcresult" test
+xcode_red_status=$?
+set -e
+test "$xcode_red_status" -ne 0 || { echo 'Task 10C Xcode RED unexpectedly passed' >&2; exit 1; }
+actual=$(xcrun xcresulttool get test-results summary --path "$test_enum_dir/red.xcresult" --compact | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["totalTestCount"])')
+test "$actual" -eq "$expected"
 ```
 
-Expected: JS 和 App 测试失败，原因是双向 protocol 与 AppKit bridge 不存在。
+Expected: JS、ClientCore 与 Xcode test exit 都非零，各自 expected 非零且 actual 相等；因 compile scaffold 的 deterministic fail-closed behavior 不满足而失败。任何全绿 RED、缺失 JUnit/xUnit/xcresult 或 count mismatch 都使 Step 2 失败。
 
-- [ ] **Step 3: 实现 bundle-only WKWebView bridge**
+- [ ] **10C Step 3: 实现 runtime、bridge、bundle wiring**
 
-WKWebView 禁止任意导航、网络请求和新窗口；只加载签名 App Bundle 中 `Contents/Resources/MonacoRuntime.bundle/index.html`。`WKScriptMessageHandlerWithReply` 只接受已知 schema 和当前 generation。
+严格实现本节 exact schema/URI/session/crash/CSP/navigation/teardown contract与 `WorkspaceClientState.updateFileViewState` actor RMW。`WKScriptMessageHandlerWithReply` 只通过 weak forwarder 注册 `cockpitMonaco` + `.page`，所有 reply 都匹配 `NativeReply`，unknown/stale message 不触达 controller。
 
-`project.yml` 把构建前已经由 `EditorRuntime/build.mjs` 原子产出的 `EditorRuntime/dist/MonacoRuntime.bundle` 作为 folder resource 复制到 `Contents/Resources/MonacoRuntime.bundle`；资源输入固定为 `index.html`、`editor.js`、`editor.js.map`、`editor.css`，任一缺失即构建失败。Task 10 和统一 gate 都先执行 pnpm build 再执行 XcodeGen；`app-bundle-layout.zsh` 断言四个文件存在、非 symlink、非空，且 App 内没有 `node_modules`、Node、pnpm 或 Monaco 源码。
-
-- [ ] **Step 4: 运行 focused checks 并提交**
+- [ ] **10C Step 4: GREEN、计数、bundle gate 并提交**
 
 ```bash
 fnm exec --using 26.7.0 pnpm --dir EditorRuntime build
 fnm exec --using 26.7.0 pnpm --dir EditorRuntime test
-/usr/bin/swift test --disable-automatic-resolution --filter HostDataPlaneTests
+js_suite_status=$?
+test "$js_suite_status" -eq 0
+test_enum_dir=$(mktemp -d /tmp/cockpit-task10c-green.XXXXXX)
+js_expected=$(/usr/bin/grep -Ec "^test\\('monaco" EditorRuntime/test/protocol.test.mjs)
+test "$js_expected" -gt 0
+fnm exec --using 26.7.0 pnpm --dir EditorRuntime exec node --test --test-reporter=junit --test-reporter-destination="$test_enum_dir/js-green.xml" test/protocol.test.mjs
+js_green_status=$?
+test "$js_green_status" -eq 0
+js_actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' "$test_enum_dir/js-green.xml")
+test "$js_actual" -eq "$js_expected"
+/usr/bin/swift test --disable-automatic-resolution --filter '^CockpitClientCoreTests\.workspaceClientStateViewState' --xunit-output .build/task10c-client-green.xml
+client_green_status=$?
+test "$client_green_status" -eq 0
+client_expected=$(/usr/bin/swift test list --skip-build 2>/dev/null | /usr/bin/grep -Ec '^CockpitClientCoreTests\.workspaceClientStateViewState')
+client_actual=$(/usr/bin/python3 -c 'import sys,xml.etree.ElementTree as E; print(len(E.parse(sys.argv[1]).findall(".//testcase")))' .build/task10c-client-green-swift-testing.xml)
+test "$client_expected" -gt 0 && test "$client_actual" -eq "$client_expected"
 xcodegen generate --no-env
-/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -only-testing:CockpitAppTests/MonacoBridgeTests test
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation -only-testing:CockpitAppTests/MonacoBridgeTests -enumerate-tests -test-enumeration-style flat -test-enumeration-format json -test-enumeration-output-path "$test_enum_dir/tests.json" test
+expected=$(/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for v in d["values"] for t in v["enabledTests"] if t["identifier"].startswith("CockpitAppTests/MonacoBridgeTests/")))' "$test_enum_dir/tests.json")
+test "$expected" -gt 0
+/usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData SYMROOT="$PWD/build" -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation -only-testing:CockpitAppTests/MonacoBridgeTests -resultBundlePath "$test_enum_dir/green.xcresult" test
+xcode_green_status=$?
+test "$xcode_green_status" -eq 0
+actual=$(xcrun xcresulttool get test-results summary --path "$test_enum_dir/green.xcresult" --compact | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["totalTestCount"])')
+test "$actual" -eq "$expected"
 Tests/ProcessIntegrationTests/app-bundle-layout.zsh
 /usr/bin/git diff --check
-git add EditorRuntime Sources/CockpitClientCore/FileTreeDataTransport.swift Sources/CockpitLocalTransport Applications/CockpitHost/main.swift Applications/CockpitApp/Monaco Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift Tests/CockpitAppTests Tests/ProcessIntegrationTests/app-bundle-layout.zsh project.yml Cockpit.xcodeproj Cockpit.xcworkspace
+git add EditorRuntime/src/protocol.mjs EditorRuntime/src/bootstrap.ts EditorRuntime/build.mjs EditorRuntime/package.json EditorRuntime/toolchain-contract.mjs EditorRuntime/test/protocol.test.mjs EditorRuntime/test/build.test.mjs Sources/CockpitClientCore/WorkspaceClientState.swift Applications/CockpitApp/Monaco Tests/CockpitClientCoreTests/WorkspaceClientStateTests.swift Tests/CockpitAppTests/MonacoBridgeTests.swift Tests/ProcessIntegrationTests/app-bundle-layout.zsh project.yml Cockpit.xcodeproj Cockpit.xcworkspace
 git commit -m "feat: bridge monaco document editing"
 ```
 
@@ -1661,11 +2258,24 @@ NSWindow
     └── FileTreeViewController / NSOutlineView
 ```
 
+Task 17 同时固定 Task 10C relocation 的 UI consumer port；`FileTreeViewController` 在用户提交 rename/move 时只调用该 port，不直接调用 bridge/Host：
+
+```swift
+@MainActor public protocol FileRelocationCoordinating: AnyObject {
+    func performRelocation(
+        _ operation: FileOperation,
+        workspaceContextID: WorkspaceContextID
+    ) async throws
+}
+```
+
+该 protocol 定义在 `FileTreeViewController.swift`；controller init 必须注入 `any FileRelocationCoordinating`。rename/move 来自树节点的 source 和 active WorkspaceContextID，source 不要求存在 active/open file Tab；未打开 file 与含多个 open descendants 的 directory 都必须发一次 batch relocation call。
+
 左栏层级固定为 Project → zero-to-many Conversation；Project 行始终 selectable。中央 tab kinds 固定为 file、shell、codex、claude、new-tab-picker；new-tab-picker 作为 Context-local TabRecord 持久化，选择操作后原位替换为目标 file/terminal resource，取消时删除该 TabRecord。右栏 Phase 1 只显示文件树，不创建 Search/Git/Diff 占位按钮。
 
 - [ ] **Step 1: 写失败测试**
 
-断言 window root 是三栏 NSSplitViewController；Project 没有 Conversation 时仍有 selectable row；选择 Project/Conversation 产生新 generation；各 Context tab list 独立；同 Window 只有一个 Monaco controller；切换到 terminal 隐藏 Monaco 但不销毁 model；右栏 provider 始终来自 ActiveContext.environmentID。
+断言 window root 是三栏 NSSplitViewController；Project 没有 Conversation 时仍有 selectable row；选择 Project/Conversation 产生新 generation；各 Context tab list 独立；同 Window 只有一个 Monaco controller；切换到 terminal 隐藏 Monaco 但不销毁 model；右栏 provider 始终来自 ActiveContext.environmentID；file-tree rename/move 把 exact FileOperation + ContextID 交给 injected `FileRelocationCoordinating`；unopened file 和 directory source 均不要求 active TabID/DocumentID。
 
 - [ ] **Step 2: 运行失败测试**
 
@@ -1719,10 +2329,20 @@ git commit -m "feat: build native workspace shell"
 6. 关闭 terminal tab 只 detach；关闭 dirty 文件最后一个 viewer 显示 Save/Discard/Cancel。
 7. Conversation 行提供原生 inline rename；提交调用 `renameConversation`，空标题被拒绝，失败保留原标题并展示真实错误。
 8. 首 Agent 或后续 Agent 启动失败的错误页签提供 Retry 和 Switch Agent；Retry 以相同 profile 创建新的 TerminalSessionID，Switch Agent 先选择另一个内建 profile 再创建新的 TerminalSessionID，Conversation 本身不重建。
+9. `TabCommandController` 实现 Task 17 `FileRelocationCoordinating.performRelocation(_:workspaceContextID:)`：以 exact ContextID + FileOperation 调 `bridge.prepareRelocation`，再调用现有 Host `performFileOperation`；Host 抛错时 `try bridge.cancelRelocation(token)` 后原样抛错。Host 返回值只接受 exact `.relocated(from:to:)` 并传给 `bridge.commitRelocation`；pre-commit non-relocated/mismatch 执行 cancel 后抛 `.invalidSchema`。commit 返回 `.complete` 即结束；`.incomplete` 保留 token并由 controller 暴露 `retryRelocation(token)` 与 `abandonRelocation(token)`，分别调用 bridge retry 和 abandon，直到 `.complete` 或 `.abandonedAllStale` 终态。不得直接调用 JS rename helper。
+
+```swift
+@MainActor public func retryRelocation(
+    _ token: MonacoRelocationToken
+) async throws -> MonacoRelocationDisposition
+@MainActor public func abandonRelocation(
+    _ token: MonacoRelocationToken
+) throws -> MonacoRelocationDisposition
+```
 
 - [ ] **Step 1: 写失败测试**
 
-覆盖纯 Project 模式全部功能可用；同 Conversation 同时创建 Codex + Claude + Shell；两个 Conversation 的 tabs/sessions 隔离；全部 Context 共享同一 file/document state；手动 rename 成功/失败；Agent resolver 失败后的 executable picker 选择/取消；first agent 启动失败不回滚 Conversation；Retry/Switch Agent 生成新 session 且保留原失败记录；reattach 列表只显示当前 Context 的 detached sessions。进程测试把 Agent executable 固定到 Task 13 fixture 的绝对路径，不执行用户机器上的 codex/claude。
+覆盖纯 Project 模式全部功能可用；同 Conversation 同时创建 Codex + Claude + Shell；两个 Conversation 的 tabs/sessions 隔离；全部 Context 共享同一 file/document state；手动 rename 成功/失败；文件 rename/move（含 unopened source 与 directory descendants）严格执行 batch prepare→Host exact relocated→commit，Host error/non-relocated result 执行 cancel 且不调 JS helper，partial commit 保留 token并覆盖 retry-complete 与 abandon-all-stale 两终态；Agent resolver 失败后的 executable picker 选择/取消；first agent 启动失败不回滚 Conversation；Retry/Switch Agent 生成新 session 且保留原失败记录；reattach 列表只显示当前 Context 的 detached sessions。进程测试把 Agent executable 固定到 Task 13 fixture 的绝对路径，不执行用户机器上的 codex/claude。
 
 - [ ] **Step 2: 运行失败测试**
 
