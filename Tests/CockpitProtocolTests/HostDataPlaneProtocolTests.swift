@@ -109,6 +109,13 @@ import CockpitTypes
     #expect(mutationTags == [0x0A, 0x12, 0x1A])
 }
 
+@Test func hostDataPlaneProtocolFreezesEveryUnspecifiedEnumNumber() {
+    #expect(CPDocumentDirtyStateValue.unspecified.rawValue == 0)
+    #expect(CPDocumentMaintenanceStateValue.unspecified.rawValue == 0)
+    #expect(CPWorkspaceDirectoryKind.unspecified.rawValue == 0)
+    #expect(CPFileTreeEntryKindValue.unspecified.rawValue == 0)
+}
+
 @Test func hostDataPlaneProtocolFreezesEveryNonOneOfFieldNumberWithExactBytes() throws {
     var binding = CPDataPlaneBinding()
     binding.clientInstanceID = "x"; try hostDataPlaneProtocolExpectBytes(binding, [0x0A, 0x01, 0x78])
@@ -243,6 +250,33 @@ import CockpitTypes
     var treeEnvelope = CPFileTreeEnvelope()
     treeEnvelope.requestID = "x"; try hostDataPlaneProtocolExpectBytes(treeEnvelope, [0x0A, 0x01, 0x78])
     treeEnvelope = .init(); treeEnvelope.binding = .init(); try hostDataPlaneProtocolExpectBytes(treeEnvelope, [0x12, 0x00])
+}
+
+@Test func hostDataPlaneProtocolKeepsAcquireLeaseFieldTwoReserved() throws {
+    let values = hostDataPlaneProtocolFixture()
+    let requestID = RequestID(uuid("34000000-0000-4000-8000-000000000001"))
+    let fieldTwoEncodings: [[UInt8]] = [
+        [0x10, 0x01],
+        [0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        [0x12, 0x00],
+        [0x15, 0x00, 0x00, 0x00, 0x00],
+    ]
+
+    for fieldTwoEncoding in fieldTwoEncodings {
+        var request = CPDocumentAcquireLeaseRequest()
+        request.documentID = values.documentID.description
+        var bytes = try request.serializedData()
+        bytes.append(contentsOf: fieldTwoEncoding)
+        request = try CPDocumentAcquireLeaseRequest(serializedBytes: bytes)
+        hostDataPlaneProtocolExpectMappingError(
+            .unknownFields("document_acquire_lease_request"),
+            "acquire lease field 2 wire type \(fieldTwoEncoding[0] & 0x07)"
+        ) {
+            _ = try HostDataPlaneMessages.decodeDocumentEnvelope(
+                hostDataPlaneProtocolDocumentBytes(values, requestID, .acquireLeaseRequest(request))
+            )
+        }
+    }
 }
 
 @Test func hostDataPlaneProtocolRoundTripsBindingAndDocumentDomainValuesExactly() throws {
@@ -1140,6 +1174,37 @@ import CockpitTypes
     }
     #expect(throws: ProtocolMappingError.invalidValue("data_plane_error")) {
         _ = try DataPlaneRemoteError(validatingCode: .documentInvalidLease, expected: nil, actual: nil)
+    }
+}
+
+@Test func hostDataPlaneProtocolValidatesSharedRemoteErrorJavaScriptBoundaries() throws {
+    let maximum = documentJavaScriptMaximum
+    let expectedAtMaximum = try DataPlaneRemoteError(
+        validatingCode: .generationMismatch,
+        expected: maximum,
+        actual: 1
+    )
+    #expect(expectedAtMaximum.expected == maximum)
+    #expect(throws: ProtocolMappingError.invalidValue("data_plane_error")) {
+        _ = try DataPlaneRemoteError(
+            validatingCode: .generationMismatch,
+            expected: maximum + 1,
+            actual: 1
+        )
+    }
+
+    let actualAtMaximum = try DataPlaneRemoteError(
+        validatingCode: .treeRevisionUnavailable,
+        expected: 1,
+        actual: maximum
+    )
+    #expect(actualAtMaximum.actual == maximum)
+    #expect(throws: ProtocolMappingError.invalidValue("data_plane_error")) {
+        _ = try DataPlaneRemoteError(
+            validatingCode: .treeRevisionUnavailable,
+            expected: 1,
+            actual: maximum + 1
+        )
     }
 }
 
