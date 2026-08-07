@@ -7,36 +7,20 @@ struct PhysicalFileOperationResult: Sendable {
     let result: FileOperationResult
     let affectedKind: FileTreeEntryKind
     let trashURL: URL?
-    let identity: PhysicalFileIdentity?
 
     init(
         result: FileOperationResult,
         affectedKind: FileTreeEntryKind,
-        trashURL: URL?,
-        identity: PhysicalFileIdentity? = nil
+        trashURL: URL?
     ) {
         self.result = result
         self.affectedKind = affectedKind
         self.trashURL = trashURL
-        self.identity = identity
     }
-}
-
-struct PhysicalFileIdentity: Equatable, Sendable {
-    let device: dev_t
-    let inode: ino_t
-    let type: mode_t
 }
 
 protocol FileOperationPhysicallyPerforming: Sendable {
     func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult
-    func compensate(_ result: PhysicalFileOperationResult) async throws
-}
-
-extension FileOperationPhysicallyPerforming {
-    func compensate(_ result: PhysicalFileOperationResult) async throws {
-        throw FileOperationError.compensationUnavailable
-    }
 }
 
 final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked Sendable {
@@ -45,16 +29,19 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let beforeOpeningComponent: @Sendable (String) -> Void
     private let beforeTrashValidation: @Sendable (URL) -> Void
+    private let afterCreatingDirectoryStaging: @Sendable (RelativePath) -> Void
     private var rootFD: Int32 = -1
 
     init(
         rootURL: URL,
         beforeOpeningComponent: @escaping @Sendable (String) -> Void = { _ in },
-        beforeTrashValidation: @escaping @Sendable (URL) -> Void = { _ in }
+        beforeTrashValidation: @escaping @Sendable (URL) -> Void = { _ in },
+        afterCreatingDirectoryStaging: @escaping @Sendable (RelativePath) -> Void = { _ in }
     ) {
         self.rootURL = rootURL.standardizedFileURL
         self.beforeOpeningComponent = beforeOpeningComponent
         self.beforeTrashValidation = beforeTrashValidation
+        self.afterCreatingDirectoryStaging = afterCreatingDirectoryStaging
         queue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -70,14 +57,6 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
         try await withCheckedThrowingContinuation { continuation in
             queue.async { [self] in
                 continuation.resume(with: Result { try performSynchronously(operation) })
-            }
-        }
-    }
-
-    func compensate(_ result: PhysicalFileOperationResult) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async { [self] in
-                continuation.resume(with: Result { try compensateSynchronously(result) })
             }
         }
     }
@@ -106,8 +85,7 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             return PhysicalFileOperationResult(
                 result: .created(path: destination, kind: .file),
                 affectedKind: .file,
-                trashURL: nil,
-                identity: nil
+                trashURL: nil
             )
 
         case let .createDirectory(parent, name):
@@ -115,12 +93,13 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             let name = try validatedName(name)
             let destination = try childPath(parent: parent, name: name)
             announce(directory: parent)
-            try createDirectory(destination, rootFD: rootFD)
+            try validateDirectory(parent, rootFD: rootFD)
+            try validateAbsent(destination, rootFD: rootFD)
+            try createDirectory(operation: operation, destination: destination, rootFD: rootFD)
             return PhysicalFileOperationResult(
                 result: .created(path: destination, kind: .directory),
                 affectedKind: .directory,
-                trashURL: nil,
-                identity: nil
+                trashURL: nil
             )
 
         case let .rename(source, newName):
@@ -146,8 +125,7 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             return PhysicalFileOperationResult(
                 result: .relocated(from: source, to: destination),
                 affectedKind: kind(for: metadata.st_mode),
-                trashURL: nil,
-                identity: identity(for: metadata)
+                trashURL: nil
             )
 
         case let .move(source, destinationDirectory):
@@ -180,8 +158,7 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             return PhysicalFileOperationResult(
                 result: .relocated(from: source, to: destination),
                 affectedKind: kind(for: metadata.st_mode),
-                trashURL: nil,
-                identity: identity(for: metadata)
+                trashURL: nil
             )
 
         case let .trash(path):
@@ -189,51 +166,37 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             let parts = split(path)
             announce(directory: parts.parent)
             try validateDirectory(parts.parent, rootFD: rootFD)
-            let before = try entryMetadata(rootFD: rootFD, path: path)
-            let sourceURL = try currentURL(for: path)
-            beforeTrashValidation(sourceURL)
-            var after = stat()
-            guard lstat(sourceURL.path, &after) == 0 else {
-                throw posixError(code: errno, path: sourceURL.path)
-            }
-            guard before.st_dev == after.st_dev,
-                  before.st_ino == after.st_ino,
-                  before.st_mode & mode_t(S_IFMT) == after.st_mode & mode_t(S_IFMT)
-            else {
-                throw FileOperationError.identityChanged
-            }
-            var resultingURL: NSURL?
-            try FileManager.default.trashItem(at: sourceURL, resultingItemURL: &resultingURL)
-            let kind = kind(for: before.st_mode)
-            return PhysicalFileOperationResult(
-                result: .trashed(path: path),
-                affectedKind: kind,
-                trashURL: resultingURL as URL?,
-                identity: identity(for: before)
+            let stagingPath = try moveToUniqueStaging(
+                source: path,
+                prefix: ".cockpit-trash-",
+                rootFD: rootFD
             )
-        }
-    }
-
-    private func compensateSynchronously(_ physical: PhysicalFileOperationResult) throws {
-        guard case let .relocated(source, destination) = physical.result,
-              let expectedIdentity = physical.identity
-        else {
-            throw FileOperationError.compensationUnavailable
-        }
-        let rootFD = try openedRootFD()
-        let current = try entryMetadata(rootFD: rootFD, path: destination)
-        guard identity(for: current) == expectedIdentity else {
-            throw FileOperationError.identityChanged
-        }
-        guard renameatx_np(
-            rootFD,
-            destination.string,
-            rootFD,
-            source.string,
-            secureRenameFlags
-        ) == 0 else {
-            let code = errno
-            throw pathResolutionError(code: code, path: try currentURL(for: source).path)
+            do {
+                let before = try entryMetadata(rootFD: rootFD, path: stagingPath)
+                let stagingURL = try currentURL(for: stagingPath)
+                beforeTrashValidation(stagingURL)
+                let secureAfter = try entryMetadata(rootFD: rootFD, path: stagingPath)
+                var pathAfter = stat()
+                guard lstat(stagingURL.path, &pathAfter) == 0 else {
+                    throw posixError(code: errno, path: stagingURL.path)
+                }
+                guard sameIdentity(before, secureAfter), sameIdentity(before, pathAfter) else {
+                    throw FileOperationError.identityChanged
+                }
+                var resultingURL: NSURL?
+                try FileManager.default.trashItem(at: stagingURL, resultingItemURL: &resultingURL)
+                return PhysicalFileOperationResult(
+                    result: .trashed(path: path),
+                    affectedKind: kind(for: before.st_mode),
+                    trashURL: resultingURL as URL?
+                )
+            } catch {
+                throw FileOperationRecoveryRequiredError(
+                    originalOperation: operation,
+                    state: .staged(stagingPath),
+                    originalError: error
+                )
+            }
         }
     }
 
@@ -274,7 +237,11 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
         close(fd)
     }
 
-    private func createDirectory(_ destination: RelativePath, rootFD: Int32) throws {
+    private func createDirectory(
+        operation: FileOperation,
+        destination: RelativePath,
+        rootFD: Int32
+    ) throws {
         let mode = mode_t(S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)
         let stagingName: String
         while true {
@@ -289,26 +256,65 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
             }
         }
         let stagingPath = try RelativePath(stagingName)
-        let stagingIdentity = identity(for: try entryMetadata(rootFD: rootFD, path: stagingPath))
-        var moved = false
-        defer {
-            if !moved,
-               let current = try? entryMetadata(rootFD: rootFD, path: stagingPath),
-               identity(for: current) == stagingIdentity {
-                _ = unlinkat(rootFD, stagingName, AT_REMOVEDIR)
+        afterCreatingDirectoryStaging(stagingPath)
+        do {
+            _ = try entryMetadata(rootFD: rootFD, path: stagingPath)
+            guard renameatx_np(
+                rootFD,
+                stagingName,
+                rootFD,
+                destination.string,
+                secureRenameFlags
+            ) == 0 else {
+                let code = errno
+                throw pathResolutionError(code: code, path: try currentURL(for: destination).path)
+            }
+        } catch {
+            throw FileOperationRecoveryRequiredError(
+                originalOperation: operation,
+                state: .staged(stagingPath),
+                originalError: error
+            )
+        }
+    }
+
+    private func validateAbsent(_ path: RelativePath, rootFD: Int32) throws {
+        var metadata = stat()
+        if fstatat(
+            rootFD,
+            path.string,
+            &metadata,
+            AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY | AT_RESOLVE_BENEATH
+        ) == 0 {
+            throw posixError(code: EEXIST, path: try currentURL(for: path).path)
+        }
+        let code = errno
+        guard code == ENOENT else {
+            throw pathResolutionError(code: code, path: try currentURL(for: path).path)
+        }
+    }
+
+    private func moveToUniqueStaging(
+        source: RelativePath,
+        prefix: String,
+        rootFD: Int32
+    ) throws -> RelativePath {
+        while true {
+            let candidate = try RelativePath(prefix + UUID().uuidString)
+            if renameatx_np(
+                rootFD,
+                source.string,
+                rootFD,
+                candidate.string,
+                secureRenameFlags
+            ) == 0 {
+                return candidate
+            }
+            let code = errno
+            if code != EEXIST {
+                throw pathResolutionError(code: code, path: try currentURL(for: source).path)
             }
         }
-        guard renameatx_np(
-            rootFD,
-            stagingName,
-            rootFD,
-            destination.string,
-            secureRenameFlags
-        ) == 0 else {
-            let code = errno
-            throw pathResolutionError(code: code, path: try currentURL(for: destination).path)
-        }
-        moved = true
     }
 
     private func validatedDirectory(_ directory: WorkspaceDirectory) throws -> WorkspaceDirectory {
@@ -375,12 +381,10 @@ final class WorkspaceRootHandle: FileOperationPhysicallyPerforming, @unchecked S
         return metadata
     }
 
-    private func identity(for metadata: stat) -> PhysicalFileIdentity {
-        PhysicalFileIdentity(
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-            type: metadata.st_mode & mode_t(S_IFMT)
-        )
+    private func sameIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_mode & mode_t(S_IFMT) == rhs.st_mode & mode_t(S_IFMT)
     }
 
     private func kind(for mode: mode_t) -> FileTreeEntryKind {

@@ -9,22 +9,26 @@ public enum FileOperationError: Error, Equatable, Sendable {
     case contextEnvironmentMismatch
     case environmentNotRegistered
     case documentLocatorCollision
-    case compensationUnavailable
+}
+
+public enum FileOperationRecoveryState: Hashable, Sendable {
+    case committed(FileOperationResult)
+    case staged(RelativePath)
 }
 
 public struct FileOperationRecoveryRequiredError: Error, @unchecked Sendable {
-    public let committedResult: FileOperationResult
+    public let originalOperation: FileOperation
+    public let state: FileOperationRecoveryState
     public let originalError: any Error
-    public let compensationError: any Error
 
     public init(
-        committedResult: FileOperationResult,
-        originalError: any Error,
-        compensationError: any Error
+        originalOperation: FileOperation,
+        state: FileOperationRecoveryState,
+        originalError: any Error
     ) {
-        self.committedResult = committedResult
+        self.originalOperation = originalOperation
+        self.state = state
         self.originalError = originalError
-        self.compensationError = compensationError
     }
 }
 

@@ -73,9 +73,15 @@ import CockpitTypes
     #expect(try Data(contentsOf: fixture.root.appendingPathComponent("existing.txt")) == Data("destination".utf8))
 
     try manager.createDirectory(at: fixture.root.appendingPathComponent("existing-directory"), withIntermediateDirectories: false)
+    let stagingCount = LockedCounter()
+    let directoryHandle = WorkspaceRootHandle(
+        rootURL: fixture.root,
+        afterCreatingDirectoryStaging: { _ in _ = stagingCount.increment() }
+    )
     await #expect(throws: (any Error).self) {
-        _ = try await handle.perform(.createDirectory(parent: .root, name: "existing-directory"))
+        _ = try await directoryHandle.perform(.createDirectory(parent: .root, name: "existing-directory"))
     }
+    #expect(stagingCount.current == 0)
     #expect(
         try manager.contentsOfDirectory(atPath: fixture.root.path)
             .filter { $0.hasPrefix(".cockpit-mkdir-") }
@@ -267,12 +273,68 @@ import CockpitTypes
 
     let replacement = fixture.root.appendingPathComponent("replacement.txt")
     try Data("original".utf8).write(to: replacement)
-    let swap = FileIdentitySwapAction(url: replacement)
-    let guarded = WorkspaceRootHandle(rootURL: fixture.root, beforeTrashValidation: { _ in swap.run() })
-    await #expect(throws: FileOperationError.identityChanged) {
+    let swap = FileIdentitySwapAction()
+    let guarded = WorkspaceRootHandle(rootURL: fixture.root, beforeTrashValidation: { swap.run(at: $0) })
+    do {
         _ = try await guarded.perform(.trash(path: RelativePath("replacement.txt")))
+        Issue.record("Expected recovery-required failure")
+    } catch let error as FileOperationRecoveryRequiredError {
+        #expect(error.originalOperation == .trash(path: try RelativePath("replacement.txt")))
+        guard case let .staged(stagingPath) = error.state else {
+            Issue.record("Expected staged recovery state")
+            return
+        }
+        #expect(stagingPath.string.hasPrefix(".cockpit-trash-"))
+        #expect(error.originalError as? FileOperationError == .identityChanged)
+        #expect(try Data(contentsOf: fixture.root.appendingPathComponent(stagingPath.string)) == Data("replacement".utf8))
+        #expect(try Data(contentsOf: swap.movedURL) == Data("original".utf8))
     }
-    #expect(try Data(contentsOf: replacement) == Data("replacement".utf8))
+}
+
+@Test func trashDetachesTheItemBeforeAnAncestorCanMoveOutsideTheRoot() async throws {
+    let fixture = try FileOperationFixture()
+    defer { fixture.remove() }
+    let manager = FileManager.default
+    let inside = fixture.root.appendingPathComponent("inside", isDirectory: true)
+    let escaped = fixture.base.appendingPathComponent("escaped-inside", isDirectory: true)
+    try manager.createDirectory(at: inside.appendingPathComponent("nested"), withIntermediateDirectories: true)
+    try Data("source".utf8).write(to: inside.appendingPathComponent("nested/source.txt"))
+    try Data("sentinel".utf8).write(to: inside.appendingPathComponent("nested/sentinel.txt"))
+    let swap = TrashAncestorSwapAction(directory: inside, escaped: escaped)
+    let handle = WorkspaceRootHandle(rootURL: fixture.root, beforeTrashValidation: { _ in swap.run() })
+
+    let result = try await handle.perform(.trash(path: RelativePath("inside/nested/source.txt")))
+    let trashURL = try #require(result.trashURL)
+    defer { try? manager.removeItem(at: trashURL) }
+
+    #expect(result.result == .trashed(path: try RelativePath("inside/nested/source.txt")))
+    #expect(try Data(contentsOf: escaped.appendingPathComponent("nested/source.txt")) == Data("external-replacement".utf8))
+    #expect(try Data(contentsOf: escaped.appendingPathComponent("nested/sentinel.txt")) == Data("sentinel".utf8))
+}
+
+@Test func directoryStagingFailuresAreRecoveryRequiredAndNeverDeleteTheStagingItem() async throws {
+    for failure in DirectoryStagingFailure.allCases {
+        let fixture = try FileOperationFixture()
+        defer { fixture.remove() }
+        let action = DirectoryStagingFailureAction(root: fixture.root, failure: failure)
+        let handle = WorkspaceRootHandle(
+            rootURL: fixture.root,
+            afterCreatingDirectoryStaging: { action.run(stagingPath: $0) }
+        )
+
+        do {
+            _ = try await handle.perform(.createDirectory(parent: .root, name: "destination"))
+            Issue.record("Expected recovery-required failure")
+        } catch let error as FileOperationRecoveryRequiredError {
+            #expect(error.originalOperation == .createDirectory(parent: .root, name: "destination"))
+            guard case let .staged(stagingPath) = error.state else {
+                Issue.record("Expected staged recovery state")
+                continue
+            }
+            #expect(stagingPath.string.hasPrefix(".cockpit-mkdir-"))
+            #expect(FileManager.default.fileExists(atPath: action.actualStagingURL.path))
+        }
+    }
 }
 
 private enum AncestorSwapOperation: CaseIterable {
@@ -351,6 +413,7 @@ private final class PostOpenAncestorMoveAction: @unchecked Sendable {
 private final class LockedCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
+    var current: Int { lock.withLock { value } }
     func increment() -> Int { lock.withLock { value += 1; return value } }
 }
 
@@ -373,16 +436,68 @@ private final class DirectorySwapAction: @unchecked Sendable {
 
 private final class FileIdentitySwapAction: @unchecked Sendable {
     private let lock = NSLock()
-    private let url: URL
+    private var recordedMovedURL: URL?
     private var completed = false
-    init(url: URL) { self.url = url }
+    var movedURL: URL { lock.withLock { recordedMovedURL! } }
+    func run(at url: URL) {
+        lock.withLock {
+            guard !completed else { return }
+            completed = true
+            let original = url.appendingPathExtension("moved")
+            recordedMovedURL = original
+            try! FileManager.default.moveItem(at: url, to: original)
+            try! Data("replacement".utf8).write(to: url)
+        }
+    }
+}
+
+private final class TrashAncestorSwapAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let directory: URL
+    private let escaped: URL
+    private var completed = false
+    init(directory: URL, escaped: URL) { self.directory = directory; self.escaped = escaped }
     func run() {
         lock.withLock {
             guard !completed else { return }
             completed = true
-            let original = url.deletingLastPathComponent().appendingPathComponent("replacement-original.txt")
-            try! FileManager.default.moveItem(at: url, to: original)
-            try! Data("replacement".utf8).write(to: url)
+            try! FileManager.default.moveItem(at: directory, to: escaped)
+            let escapedSource = escaped.appendingPathComponent("nested/source.txt")
+            if !FileManager.default.fileExists(atPath: escapedSource.path) {
+                try! Data("external-replacement".utf8).write(to: escapedSource)
+            }
+            try! FileManager.default.createSymbolicLink(at: directory, withDestinationURL: escaped)
+        }
+    }
+}
+
+private enum DirectoryStagingFailure: CaseIterable {
+    case destinationCollision
+    case identityCapture
+}
+
+private final class DirectoryStagingFailureAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let root: URL
+    private let failure: DirectoryStagingFailure
+    private var recordedStagingURL: URL?
+    var actualStagingURL: URL { lock.withLock { recordedStagingURL! } }
+    init(root: URL, failure: DirectoryStagingFailure) { self.root = root; self.failure = failure }
+    func run(stagingPath: RelativePath) {
+        lock.withLock {
+            let stagingURL = root.appendingPathComponent(stagingPath.string, isDirectory: true)
+            switch failure {
+            case .destinationCollision:
+                recordedStagingURL = stagingURL
+                try! FileManager.default.createDirectory(
+                    at: root.appendingPathComponent("destination", isDirectory: true),
+                    withIntermediateDirectories: false
+                )
+            case .identityCapture:
+                let moved = root.appendingPathComponent(stagingPath.string + "-moved", isDirectory: true)
+                recordedStagingURL = moved
+                try! FileManager.default.moveItem(at: stagingURL, to: moved)
+            }
         }
     }
 }

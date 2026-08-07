@@ -154,13 +154,13 @@ import CockpitTypes
     #expect(await physical.performCount == 0)
 }
 
-@Test func locatorFailureAfterPhysicalRenameCompensatesTheExactIdentityAndPreservesTreeState() async throws {
+@Test func locatorFailureAfterPhysicalRenamePoisonsTheCoordinatorAndExposesCommittedState() async throws {
     let fixture = try CoordinatorTemporaryDirectory()
     defer { fixture.remove() }
     try Data("original".utf8).write(to: fixture.url.appendingPathComponent("old.txt"))
     let environmentID = EnvironmentID()
     let provider = FileTreeProvider(environmentID: environmentID, rootURL: fixture.url)
-    let baseline = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
+    _ = try await provider.children(environmentID: environmentID, at: .root, generation: 1)
     let expected = NSError(domain: "Task7.Metadata", code: 72)
     let coordinator = FileOperationCoordinator(
         environmentID: environmentID,
@@ -172,16 +172,22 @@ import CockpitTypes
     do {
         _ = try await coordinator.perform(.rename(source: RelativePath("old.txt"), newName: "new.txt"))
         Issue.record("Expected locator update failure")
-    } catch {
-        #expect((error as NSError).domain == expected.domain)
-        #expect((error as NSError).code == expected.code)
+    } catch let error as FileOperationRecoveryRequiredError {
+        #expect(error.originalOperation == .rename(source: try RelativePath("old.txt"), newName: "new.txt"))
+        #expect(error.state == .committed(.relocated(
+            from: try RelativePath("old.txt"),
+            to: try RelativePath("new.txt")
+        )))
+        #expect((error.originalError as NSError).domain == expected.domain)
+        #expect((error.originalError as NSError).code == expected.code)
     }
 
-    #expect(try Data(contentsOf: fixture.url.appendingPathComponent("old.txt")) == Data("original".utf8))
-    #expect(!FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent("new.txt").path))
-    let after = try await provider.children(environmentID: environmentID, at: .root, generation: 2)
-    #expect(after.revision == 0)
-    #expect(after.children == baseline.children)
+    #expect(!FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent("old.txt").path))
+    #expect(try Data(contentsOf: fixture.url.appendingPathComponent("new.txt")) == Data("original".utf8))
+    await #expect(throws: FileOperationRecoveryRequiredError.self) {
+        _ = try await coordinator.perform(.createFile(parent: .root, name: "blocked.txt"))
+    }
+    #expect(!FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent("blocked.txt").path))
 }
 
 @Test func cancellationWhileWaitingForTreeLeaseNeverStartsThePhysicalMutation() async throws {
@@ -241,11 +247,10 @@ import CockpitTypes
     #expect(snapshot.children.map(\.identity.path.string) == ["new.txt"])
 }
 
-@Test func compensationFailureRequiresRecoveryAndFutureOperationsFailClosed() async throws {
+@Test func postPhysicalFailureRequiresRecoveryAndQueuedOperationsFailClosed() async throws {
     let environmentID = EnvironmentID()
     let original = NSError(domain: "Task7.Metadata", code: 73)
-    let compensation = NSError(domain: "Task7.Compensation", code: 74)
-    let physical = CompensationFailingPhysicalOperations(error: compensation)
+    let physical = ControlledCommittedPhysicalOperations()
     let coordinator = FileOperationCoordinator(
         environmentID: environmentID,
         rootHandle: physical,
@@ -272,17 +277,16 @@ import CockpitTypes
             _ = try await operation.value
             Issue.record("Expected recovery-required failure")
         } catch let error as FileOperationRecoveryRequiredError {
-            #expect(error.committedResult == expectedResult)
+            #expect(error.originalOperation == .rename(source: try RelativePath("old.txt"), newName: "new.txt"))
+            #expect(error.state == .committed(expectedResult))
             #expect((error.originalError as NSError).domain == original.domain)
             #expect((error.originalError as NSError).code == original.code)
-            #expect((error.compensationError as NSError).domain == compensation.domain)
-            #expect((error.compensationError as NSError).code == compensation.code)
         }
     }
     #expect(await physical.performCount == 1)
 }
 
-@Test func secondParentEnumerationFailureLeaksNoCacheRevisionDeltaOrMetadataUpdate() async throws {
+@Test func secondParentEnumerationFailurePoisonsWithoutPublishingOrCompensating() async throws {
     let environmentID = EnvironmentID()
     let source = WorkspaceDirectory.relative(try RelativePath("a-source"))
     let destination = WorkspaceDirectory.relative(try RelativePath("z-destination"))
@@ -297,8 +301,8 @@ import CockpitTypes
         rootURL: URL(fileURLWithPath: "/recording"),
         fileSystem: fileSystem
     )
-    let sourceBaseline = try await provider.children(environmentID: environmentID, at: source, generation: 1)
-    let destinationBaseline = try await provider.children(environmentID: environmentID, at: destination, generation: 1)
+    _ = try await provider.children(environmentID: environmentID, at: source, generation: 1)
+    _ = try await provider.children(environmentID: environmentID, at: destination, generation: 1)
     _ = try await provider.children(environmentID: environmentID, at: movedDirectory, generation: 1)
     let updater = RecordingDocumentLocatorUpdater()
     let physical = SecondParentMovePhysicalOperations(fileSystem: fileSystem, failingDirectory: destination)
@@ -309,21 +313,55 @@ import CockpitTypes
         fileTreeProvider: provider
     )
 
-    await #expect(throws: FileTreeProviderError.filesystemEnumerationFailed) {
+    do {
         _ = try await coordinator.perform(
             .move(source: RelativePath("a-source/sub"), destinationDirectory: destination)
         )
+        Issue.record("Expected recovery-required failure")
+    } catch let error as FileOperationRecoveryRequiredError {
+        #expect(error.state == .committed(.relocated(
+            from: try RelativePath("a-source/sub"),
+            to: try RelativePath("z-destination/sub")
+        )))
+        #expect(error.originalError as? FileTreeProviderError == .filesystemEnumerationFailed)
     }
 
-    await fileSystem.clearError(for: destination)
     #expect(await provider.expandedDirectories(affectedBy: .targeted([movedDirectory])) == [movedDirectory])
-    let sourceAfter = try await provider.children(environmentID: environmentID, at: source, generation: 2)
-    let destinationAfter = try await provider.children(environmentID: environmentID, at: destination, generation: 2)
-    #expect(sourceAfter.revision == 0)
-    #expect(destinationAfter.revision == 0)
-    #expect(sourceAfter.children == sourceBaseline.children)
-    #expect(destinationAfter.children == destinationBaseline.children)
+    #expect(await fileSystem.records(at: source).isEmpty)
+    #expect(await fileSystem.records(at: destination).map(\.relativePath.string) == ["z-destination/sub"])
     #expect(await updater.relocations.isEmpty)
+}
+
+@Test func rootStagingFailurePoisonsCoordinatorAndLeavesTheActualStagingDirectory() async throws {
+    let fixture = try CoordinatorTemporaryDirectory()
+    defer { fixture.remove() }
+    let environmentID = EnvironmentID()
+    let action = CoordinatorDirectoryCollisionAction(root: fixture.url)
+    let coordinator = FileOperationCoordinator(
+        environmentID: environmentID,
+        rootHandle: WorkspaceRootHandle(
+            rootURL: fixture.url,
+            afterCreatingDirectoryStaging: { action.run(stagingPath: $0) }
+        ),
+        documentLocatorUpdater: RecordingDocumentLocatorUpdater(),
+        fileTreeProvider: FileTreeProvider(environmentID: environmentID, rootURL: fixture.url)
+    )
+
+    do {
+        _ = try await coordinator.perform(.createDirectory(parent: .root, name: "destination"))
+        Issue.record("Expected recovery-required failure")
+    } catch let error as FileOperationRecoveryRequiredError {
+        guard case let .staged(stagingPath) = error.state else {
+            Issue.record("Expected staged recovery state")
+            return
+        }
+        #expect(FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent(stagingPath.string).path))
+    }
+
+    await #expect(throws: FileOperationRecoveryRequiredError.self) {
+        _ = try await coordinator.perform(.createFile(parent: .root, name: "blocked.txt"))
+    }
+    #expect(!FileManager.default.fileExists(atPath: fixture.url.appendingPathComponent("blocked.txt").path))
 }
 
 @Test func successfulOperationsPublishDeterministicParentDeltasAndDiscardMovedAndTrashedSubtreeCache() async throws {
@@ -449,13 +487,11 @@ private actor CountingRelocationPhysicalOperations: FileOperationPhysicallyPerfo
     }
 }
 
-private actor CompensationFailingPhysicalOperations: FileOperationPhysicallyPerforming {
-    let error: NSError
+private actor ControlledCommittedPhysicalOperations: FileOperationPhysicallyPerforming {
     private(set) var performCount = 0
     private var firstStarted = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var firstRelease: CheckedContinuation<Void, Never>?
-    init(error: NSError) { self.error = error }
     func perform(_ operation: FileOperation) async throws -> PhysicalFileOperationResult {
         performCount += 1
         if performCount == 1 {
@@ -470,7 +506,6 @@ private actor CompensationFailingPhysicalOperations: FileOperationPhysicallyPerf
             trashURL: nil
         )
     }
-    func compensate(_ result: PhysicalFileOperationResult) async throws { throw error }
     func waitUntilStarted() async {
         if firstStarted { return }
         await withCheckedContinuation { startWaiters.append($0) }
@@ -600,12 +635,8 @@ private actor SecondParentFailingFileSystem: FileTreeFileSystem {
         entries[source] = []
         entries[destination] = [moved]
     }
-    func restore(source: WorkspaceDirectory, destination: WorkspaceDirectory, original: FileSystemEntryRecord) {
-        entries[source] = [original]
-        entries[destination] = []
-    }
     func setError(_ error: FileTreeProviderError, for directory: WorkspaceDirectory) { errors[directory] = error }
-    func clearError(for directory: WorkspaceDirectory) { errors.removeValue(forKey: directory) }
+    func records(at directory: WorkspaceDirectory) -> [FileSystemEntryRecord] { entries[directory] ?? [] }
 }
 
 private struct SecondParentMovePhysicalOperations: FileOperationPhysicallyPerforming {
@@ -626,12 +657,22 @@ private struct SecondParentMovePhysicalOperations: FileOperationPhysicallyPerfor
             trashURL: nil
         )
     }
-    func compensate(_ result: PhysicalFileOperationResult) async throws {
-        await fileSystem.restore(
-            source: .relative(try RelativePath("a-source")),
-            destination: .relative(try RelativePath("z-destination")),
-            original: FileSystemEntryRecord(relativePath: try RelativePath("a-source/sub"), kind: .directory)
-        )
+}
+
+private final class CoordinatorDirectoryCollisionAction: @unchecked Sendable {
+    private let lock = NSLock()
+    private let root: URL
+    private var completed = false
+    init(root: URL) { self.root = root }
+    func run(stagingPath: RelativePath) {
+        lock.withLock {
+            guard !completed else { return }
+            completed = true
+            try! FileManager.default.createDirectory(
+                at: root.appendingPathComponent("destination", isDirectory: true),
+                withIntermediateDirectories: false
+            )
+        }
     }
 }
 
