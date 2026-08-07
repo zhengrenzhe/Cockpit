@@ -241,224 +241,81 @@ public actor DocumentActor {
     public func transferEditLease(from leaseID: EditLeaseID, to client: ClientInstanceID) async throws -> EditLease {
         await enterOperation()
         defer { leaveOperation() }
-        try requireOperational()
-        guard currentLease?.id == leaseID else { throw DocumentProtocolError.invalidLease }
-        let lease = try EditLease(
-            validatingID: EditLeaseID(),
-            documentID: metadata.documentID,
-            clientInstanceID: client
-        )
-        let replacement = try replacingMetadata(editLeaseID: lease.id)
-        try await metadataRepository.compareAndSetDocumentMetadata(
-            replacement,
-            expectedDocumentVersion: metadata.documentVersion,
-            expectedEditLeaseID: leaseID
-        )
-        metadata = replacement
-        currentLease = lease
-        return lease
+        return try await transferEditLeaseLocked(from: leaseID, to: client)
     }
 
     public func apply(_ transaction: EditTransaction) async throws -> EditAcknowledgement {
         await enterOperation()
         defer { leaveOperation() }
-        try requireOperational()
-        if transaction.clientSequence == lastAcceptedClientSequence {
-            guard transaction == lastTransaction, let lastAcknowledgement else {
-                throw DocumentProtocolError.duplicateMismatch
-            }
-            return lastAcknowledgement
-        }
-        guard transaction.documentID == metadata.documentID,
-              transaction.editLeaseID == currentLease?.id
-        else { throw DocumentProtocolError.invalidLease }
-        let expectedSequence = lastAcceptedClientSequence + 1
-        guard transaction.clientSequence == expectedSequence else {
-            if transaction.clientSequence < expectedSequence { throw DocumentProtocolError.staleSequence }
-            throw DocumentProtocolError.sequenceGap(expected: expectedSequence, actual: transaction.clientSequence)
-        }
-        guard transaction.baseVersion == metadata.documentVersion else {
-            throw DocumentProtocolError.baseVersionMismatch(
-                expected: metadata.documentVersion,
-                actual: transaction.baseVersion
-            )
-        }
-        guard metadata.documentVersion < documentJavaScriptMaximum else {
-            throw DocumentProtocolError.invalidValue
-        }
-
-        let candidate = try Self.applying(transaction.changes, to: buffer)
-        let nextVersion = metadata.documentVersion + 1
-        let payload = try DocumentEditing.encodeRecoveryPayload(transaction)
-        do {
-            try await recoveryLog.append(
-                documentVersion: nextVersion,
-                clientSequence: transaction.clientSequence,
-                utf8EditPayload: payload
-            )
-        } catch {
-            recoveryRequired = true
-            throw error
-        }
-
-        let oldMetadata = metadata
-        let acknowledgement = try EditAcknowledgement(
-            validatingDocumentID: metadata.documentID,
-            clientSequence: transaction.clientSequence,
-            documentVersion: nextVersion
-        )
-        buffer = candidate
-        lastAcceptedClientSequence = transaction.clientSequence
-        lastTransaction = transaction
-        lastAcknowledgement = acknowledgement
-        metadata = try replacingMetadata(
-            documentVersion: nextVersion,
-            dirtyState: .dirty
-        )
-        do {
-            try await metadataRepository.compareAndSetDocumentMetadata(
-                metadata,
-                expectedDocumentVersion: oldMetadata.documentVersion,
-                expectedEditLeaseID: oldMetadata.editLeaseID
-            )
-        } catch {
-            recoveryRequired = true
-            throw DocumentCommitRecoveryRequiredError(committedAcknowledgement: acknowledgement)
-        }
-        return acknowledgement
+        return try await applyLocked(transaction)
     }
 
     public func flush(through clientSequence: UInt64) async throws -> UInt64 {
         await enterOperation()
         defer { leaveOperation() }
-        try requireOperational()
-        guard clientSequence <= lastAcceptedClientSequence else {
-            throw DocumentProtocolError.sequenceGap(
-                expected: lastAcceptedClientSequence + 1,
-                actual: clientSequence
-            )
-        }
-        return metadata.documentVersion
+        return try flushLocked(through: clientSequence)
     }
 
     public func save(expectedFingerprint: DiskFingerprint) async throws -> DocumentSnapshot {
         await enterOperation()
         defer { leaveOperation() }
-        try requireOperational()
-        guard let currentObservedFingerprint = observedFingerprint else {
-            throw DocumentProtocolError.fileMissing
-        }
-        guard currentObservedFingerprint == expectedFingerprint else {
-            throw DocumentStorageError.fingerprintMismatch(
-                expected: expectedFingerprint,
-                actual: currentObservedFingerprint
-            )
-        }
-        let bytes = try DocumentCodec.encode(
-            text: buffer.text,
-            signature: signature,
-            lineEndings: buffer.lineEndings
-        )
-        let fingerprint: DiskFingerprint
-        let diagnostic: DocumentRecoveryDiagnostic?
-        do {
-            fingerprint = try await documentServing.atomicallyWriteDocument(
-                bytes,
-                to: metadata.relativePath,
-                expectedFingerprint: expectedFingerprint
-            )
-            diagnostic = try await recoveryLog.checkpoint(
-                persistedDocumentVersion: metadata.documentVersion,
-                persistedClientSequence: lastAcceptedClientSequence,
-                diskFingerprint: fingerprint,
-                persistedDocumentBytes: bytes
-            )
-        } catch {
-            recoveryRequired = true
-            metadata = try replacingMetadata(dirtyState: .conflict)
-            try? await metadataRepository.repairDocumentMetadata(metadata)
-            throw error
-        }
-        let old = metadata
-        let replacement = try replacingMetadata(
-            persistedVersion: metadata.documentVersion,
-            dirtyState: .clean
-        )
-        do {
-            try await metadataRepository.compareAndSetDocumentMetadata(
-                replacement,
-                expectedDocumentVersion: old.documentVersion,
-                expectedEditLeaseID: old.editLeaseID
-            )
-        } catch {
-            recoveryRequired = true
-            throw DocumentProtocolError.recoveryRequired
-        }
-        metadata = replacement
-        observedFingerprint = fingerprint
-        if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
-        return snapshot()
+        return try await saveLocked(expectedFingerprint: expectedFingerprint)
     }
 
     public func discard() async throws -> DocumentSnapshot {
         await enterOperation()
         defer { leaveOperation() }
-        try requireOperational()
-        let disk: DocumentFileSnapshot
-        do {
-            disk = try await documentServing.readDocument(at: metadata.relativePath)
-        } catch {
-            guard Self.isMissingFileError(error) else { throw error }
-            throw DocumentProtocolError.fileMissing
-        }
-        let decoded = try DocumentCodec.decode(disk)
-        guard metadata.documentVersion < documentJavaScriptMaximum else {
-            throw DocumentProtocolError.invalidValue
-        }
-        let nextVersion = metadata.documentVersion + 1
-        let diagnostic: DocumentRecoveryDiagnostic?
-        do {
-            diagnostic = try await recoveryLog.checkpoint(
-                persistedDocumentVersion: nextVersion,
-                persistedClientSequence: lastAcceptedClientSequence,
-                diskFingerprint: disk.fingerprint,
-                persistedDocumentBytes: disk.data
-            )
-        } catch {
-            recoveryRequired = true
-            throw error
-        }
-        let old = metadata
-        let replacement = try replacingMetadata(
-            documentVersion: nextVersion,
-            persistedVersion: nextVersion,
-            dirtyState: .clean
-        )
-        let replacementBuffer = try DocumentTextBuffer(
-            validatingText: decoded.text,
-            lineEndings: decoded.lineEndings
-        )
-        do {
-            try await metadataRepository.compareAndSetDocumentMetadata(
-                replacement,
-                expectedDocumentVersion: old.documentVersion,
-                expectedEditLeaseID: old.editLeaseID
-            )
-        } catch {
-            buffer = replacementBuffer
-            signature = decoded.signature
-            observedFingerprint = disk.fingerprint
-            metadata = replacement
-            if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
-            recoveryRequired = true
-            throw DocumentProtocolError.recoveryRequired
-        }
-        buffer = replacementBuffer
-        signature = decoded.signature
-        observedFingerprint = disk.fingerprint
-        metadata = replacement
-        if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
-        return snapshot()
+        return try await discardLocked()
+    }
+
+    public func transferEditLease(
+        from leaseID: EditLeaseID,
+        to client: ClientInstanceID,
+        authorizedClient: ClientInstanceID
+    ) async throws -> EditLease {
+        await enterOperation()
+        defer { leaveOperation() }
+        try requireAuthorizedLeaseOwner(authorizedClient)
+        return try await transferEditLeaseLocked(from: leaseID, to: client)
+    }
+
+    public func apply(
+        _ transaction: EditTransaction,
+        authorizedClient: ClientInstanceID
+    ) async throws -> EditAcknowledgement {
+        await enterOperation()
+        defer { leaveOperation() }
+        try requireAuthorizedLeaseOwner(authorizedClient)
+        return try await applyLocked(transaction)
+    }
+
+    public func flush(
+        through clientSequence: UInt64,
+        authorizedClient: ClientInstanceID
+    ) async throws -> UInt64 {
+        await enterOperation()
+        defer { leaveOperation() }
+        try requireAuthorizedLeaseOwner(authorizedClient)
+        return try flushLocked(through: clientSequence)
+    }
+
+    public func save(
+        expectedFingerprint: DiskFingerprint,
+        authorizedClient: ClientInstanceID
+    ) async throws -> DocumentSnapshot {
+        await enterOperation()
+        defer { leaveOperation() }
+        try requireAuthorizedLeaseOwner(authorizedClient)
+        return try await saveLocked(expectedFingerprint: expectedFingerprint)
+    }
+
+    public func discard(
+        authorizedClient: ClientInstanceID
+    ) async throws -> DocumentSnapshot {
+        await enterOperation()
+        defer { leaveOperation() }
+        try requireAuthorizedLeaseOwner(authorizedClient)
+        return try await discardLocked()
     }
 
     public func handleExternalChange(_ change: ExternalDocumentChange) async throws -> DocumentSnapshot {
@@ -539,6 +396,228 @@ public actor DocumentActor {
             dirtyState: metadata.dirtyState,
             editLeaseID: metadata.editLeaseID
         )
+    }
+
+    private func requireAuthorizedLeaseOwner(_ authorizedClient: ClientInstanceID) throws {
+        guard currentLease?.clientInstanceID == authorizedClient else {
+            throw DocumentProtocolError.invalidLease
+        }
+    }
+
+    private func transferEditLeaseLocked(
+        from leaseID: EditLeaseID,
+        to client: ClientInstanceID
+    ) async throws -> EditLease {
+        try requireOperational()
+        guard currentLease?.id == leaseID else { throw DocumentProtocolError.invalidLease }
+        let lease = try EditLease(
+            validatingID: EditLeaseID(),
+            documentID: metadata.documentID,
+            clientInstanceID: client
+        )
+        let replacement = try replacingMetadata(editLeaseID: lease.id)
+        try await metadataRepository.compareAndSetDocumentMetadata(
+            replacement,
+            expectedDocumentVersion: metadata.documentVersion,
+            expectedEditLeaseID: leaseID
+        )
+        metadata = replacement
+        currentLease = lease
+        return lease
+    }
+
+    private func applyLocked(_ transaction: EditTransaction) async throws -> EditAcknowledgement {
+        try requireOperational()
+        if transaction.clientSequence == lastAcceptedClientSequence {
+            guard transaction == lastTransaction, let lastAcknowledgement else {
+                throw DocumentProtocolError.duplicateMismatch
+            }
+            return lastAcknowledgement
+        }
+        guard transaction.documentID == metadata.documentID,
+              transaction.editLeaseID == currentLease?.id
+        else { throw DocumentProtocolError.invalidLease }
+        let expectedSequence = lastAcceptedClientSequence + 1
+        guard transaction.clientSequence == expectedSequence else {
+            if transaction.clientSequence < expectedSequence { throw DocumentProtocolError.staleSequence }
+            throw DocumentProtocolError.sequenceGap(expected: expectedSequence, actual: transaction.clientSequence)
+        }
+        guard transaction.baseVersion == metadata.documentVersion else {
+            throw DocumentProtocolError.baseVersionMismatch(
+                expected: metadata.documentVersion,
+                actual: transaction.baseVersion
+            )
+        }
+        guard metadata.documentVersion < documentJavaScriptMaximum else {
+            throw DocumentProtocolError.invalidValue
+        }
+
+        let candidate = try Self.applying(transaction.changes, to: buffer)
+        let nextVersion = metadata.documentVersion + 1
+        let payload = try DocumentEditing.encodeRecoveryPayload(transaction)
+        do {
+            try await recoveryLog.append(
+                documentVersion: nextVersion,
+                clientSequence: transaction.clientSequence,
+                utf8EditPayload: payload
+            )
+        } catch {
+            recoveryRequired = true
+            throw error
+        }
+
+        let oldMetadata = metadata
+        let acknowledgement = try EditAcknowledgement(
+            validatingDocumentID: metadata.documentID,
+            clientSequence: transaction.clientSequence,
+            documentVersion: nextVersion
+        )
+        buffer = candidate
+        lastAcceptedClientSequence = transaction.clientSequence
+        lastTransaction = transaction
+        lastAcknowledgement = acknowledgement
+        metadata = try replacingMetadata(
+            documentVersion: nextVersion,
+            dirtyState: .dirty
+        )
+        do {
+            try await metadataRepository.compareAndSetDocumentMetadata(
+                metadata,
+                expectedDocumentVersion: oldMetadata.documentVersion,
+                expectedEditLeaseID: oldMetadata.editLeaseID
+            )
+        } catch {
+            recoveryRequired = true
+            throw DocumentCommitRecoveryRequiredError(committedAcknowledgement: acknowledgement)
+        }
+        return acknowledgement
+    }
+
+    private func flushLocked(through clientSequence: UInt64) throws -> UInt64 {
+        try requireOperational()
+        guard clientSequence <= lastAcceptedClientSequence else {
+            throw DocumentProtocolError.sequenceGap(
+                expected: lastAcceptedClientSequence + 1,
+                actual: clientSequence
+            )
+        }
+        return metadata.documentVersion
+    }
+
+    private func saveLocked(expectedFingerprint: DiskFingerprint) async throws -> DocumentSnapshot {
+        try requireOperational()
+        guard let currentObservedFingerprint = observedFingerprint else {
+            throw DocumentProtocolError.fileMissing
+        }
+        guard currentObservedFingerprint == expectedFingerprint else {
+            throw DocumentStorageError.fingerprintMismatch(
+                expected: expectedFingerprint,
+                actual: currentObservedFingerprint
+            )
+        }
+        let bytes = try DocumentCodec.encode(
+            text: buffer.text,
+            signature: signature,
+            lineEndings: buffer.lineEndings
+        )
+        let fingerprint: DiskFingerprint
+        let diagnostic: DocumentRecoveryDiagnostic?
+        do {
+            fingerprint = try await documentServing.atomicallyWriteDocument(
+                bytes,
+                to: metadata.relativePath,
+                expectedFingerprint: expectedFingerprint
+            )
+            diagnostic = try await recoveryLog.checkpoint(
+                persistedDocumentVersion: metadata.documentVersion,
+                persistedClientSequence: lastAcceptedClientSequence,
+                diskFingerprint: fingerprint,
+                persistedDocumentBytes: bytes
+            )
+        } catch {
+            recoveryRequired = true
+            metadata = try replacingMetadata(dirtyState: .conflict)
+            try? await metadataRepository.repairDocumentMetadata(metadata)
+            throw error
+        }
+        let old = metadata
+        let replacement = try replacingMetadata(
+            persistedVersion: metadata.documentVersion,
+            dirtyState: .clean
+        )
+        do {
+            try await metadataRepository.compareAndSetDocumentMetadata(
+                replacement,
+                expectedDocumentVersion: old.documentVersion,
+                expectedEditLeaseID: old.editLeaseID
+            )
+        } catch {
+            recoveryRequired = true
+            throw DocumentProtocolError.recoveryRequired
+        }
+        metadata = replacement
+        observedFingerprint = fingerprint
+        if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
+        return snapshot()
+    }
+
+    private func discardLocked() async throws -> DocumentSnapshot {
+        try requireOperational()
+        let disk: DocumentFileSnapshot
+        do {
+            disk = try await documentServing.readDocument(at: metadata.relativePath)
+        } catch {
+            guard Self.isMissingFileError(error) else { throw error }
+            throw DocumentProtocolError.fileMissing
+        }
+        let decoded = try DocumentCodec.decode(disk)
+        guard metadata.documentVersion < documentJavaScriptMaximum else {
+            throw DocumentProtocolError.invalidValue
+        }
+        let nextVersion = metadata.documentVersion + 1
+        let diagnostic: DocumentRecoveryDiagnostic?
+        do {
+            diagnostic = try await recoveryLog.checkpoint(
+                persistedDocumentVersion: nextVersion,
+                persistedClientSequence: lastAcceptedClientSequence,
+                diskFingerprint: disk.fingerprint,
+                persistedDocumentBytes: disk.data
+            )
+        } catch {
+            recoveryRequired = true
+            throw error
+        }
+        let old = metadata
+        let replacement = try replacingMetadata(
+            documentVersion: nextVersion,
+            persistedVersion: nextVersion,
+            dirtyState: .clean
+        )
+        let replacementBuffer = try DocumentTextBuffer(
+            validatingText: decoded.text,
+            lineEndings: decoded.lineEndings
+        )
+        do {
+            try await metadataRepository.compareAndSetDocumentMetadata(
+                replacement,
+                expectedDocumentVersion: old.documentVersion,
+                expectedEditLeaseID: old.editLeaseID
+            )
+        } catch {
+            buffer = replacementBuffer
+            signature = decoded.signature
+            observedFingerprint = disk.fingerprint
+            metadata = replacement
+            if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
+            recoveryRequired = true
+            throw DocumentProtocolError.recoveryRequired
+        }
+        buffer = replacementBuffer
+        signature = decoded.signature
+        observedFingerprint = disk.fingerprint
+        metadata = replacement
+        if let diagnostic { addMaintenance(Self.maintenanceState(diagnostic)) }
+        return snapshot()
     }
 
     private func replacingMetadata(

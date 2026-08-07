@@ -161,3 +161,257 @@ message DocumentRecoveryCheckpoint {
   bytes checkpoint_sha256 = 12;
   bytes persisted_document_bytes = 13;
 }
+
+message DataPlaneBinding {
+  string client_instance_id = 1;
+  string window_id = 2;
+  WorkspaceContextID workspace_context_id = 3;
+  string environment_id = 4;
+  uint64 active_context_generation = 5;
+}
+
+message HostDataPlaneTicketRequest { RequestContext context = 1; }
+message HostDataPlaneTicketResponse {
+  string socket_path = 1;
+  string ticket = 2;
+  uint32 valid_for_milliseconds = 3;
+}
+message HostDataPlaneAuthenticate {
+  string ticket = 1;
+  DataPlaneBinding binding = 2;
+}
+message HostDataPlaneAuthenticated { DataPlaneBinding binding = 1; }
+
+enum DataPlaneErrorCode {
+  DATA_PLANE_ERROR_CODE_UNSPECIFIED = 0;
+  DATA_PLANE_ERROR_CODE_MALFORMED_MESSAGE = 1;
+  DATA_PLANE_ERROR_CODE_WRONG_CHANNEL = 2;
+  DATA_PLANE_ERROR_CODE_SEQUENCE_VIOLATION = 3;
+  DATA_PLANE_ERROR_CODE_ACK_VIOLATION = 4;
+  DATA_PLANE_ERROR_CODE_UNAUTHORIZED_PEER = 5;
+  DATA_PLANE_ERROR_CODE_INVALID_TICKET = 6;
+  DATA_PLANE_ERROR_CODE_TICKET_EXPIRED = 7;
+  DATA_PLANE_ERROR_CODE_TICKET_REPLAY = 8;
+  DATA_PLANE_ERROR_CODE_CONTEXT_MISMATCH = 9;
+  DATA_PLANE_ERROR_CODE_ENVIRONMENT_MISMATCH = 10;
+  DATA_PLANE_ERROR_CODE_GENERATION_MISMATCH = 11;
+  DATA_PLANE_ERROR_CODE_REQUEST_ID_REUSE = 12;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_NOT_OPEN = 20;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_INVALID_VALUE = 21;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_INVALID_LEASE = 22;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_LEASE_HELD = 23;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_BASE_VERSION_MISMATCH = 24;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_SEQUENCE_GAP = 25;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_DUPLICATE_MISMATCH = 26;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_STALE_SEQUENCE = 27;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_RECOVERY_REQUIRED = 28;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_RESYNCHRONIZING = 29;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_READ_ONLY = 30;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_FILE_MISSING = 31;
+  DATA_PLANE_ERROR_CODE_DOCUMENT_FINGERPRINT_MISMATCH = 32;
+  DATA_PLANE_ERROR_CODE_TREE_ZERO_GENERATION = 40;
+  DATA_PLANE_ERROR_CODE_TREE_SYMBOLIC_LINK = 41;
+  DATA_PLANE_ERROR_CODE_TREE_REVISION_UNAVAILABLE = 42;
+  DATA_PLANE_ERROR_CODE_TREE_EVENT_SOURCE_UNAVAILABLE = 43;
+  DATA_PLANE_ERROR_CODE_TREE_ENUMERATION_FAILED = 44;
+  DATA_PLANE_ERROR_CODE_TREE_BACKPRESSURE = 45;
+  DATA_PLANE_ERROR_CODE_REQUEST_CANCELLED = 50;
+  DATA_PLANE_ERROR_CODE_INTERNAL = 60;
+}
+
+message DataPlaneError {
+  DataPlaneErrorCode code = 1;
+  optional uint64 expected = 2;
+  optional uint64 actual = 3;
+  DocumentAcknowledgement committed_acknowledgement = 4;
+}
+message EmptyResult {}
+message HostDataPlaneControlEnvelope {
+  oneof payload {
+    HandshakeRequest handshake_request = 1;
+    HandshakeResponse handshake_response = 2;
+    HostDataPlaneAuthenticate authenticate = 3;
+    HostDataPlaneAuthenticated authenticated = 4;
+    DataPlaneError error = 5;
+  }
+}
+
+message UTF16TextChange {
+  uint64 offset = 1;
+  uint64 length = 2;
+  string replacement = 3;
+}
+message DiskFingerprintValue {
+  uint64 device_id = 1;
+  uint64 inode = 2;
+  uint64 byte_count = 3;
+  sint64 modification_time_seconds = 4;
+  uint32 modification_time_nanoseconds = 5;
+  bytes content_sha256 = 6;
+}
+message EditLeaseValue {
+  string edit_lease_id = 1;
+  string document_id = 2;
+  string client_instance_id = 3;
+}
+enum DocumentDirtyStateValue {
+  DOCUMENT_DIRTY_STATE_VALUE_UNSPECIFIED = 0;
+  DOCUMENT_DIRTY_STATE_VALUE_CLEAN = 1;
+  DOCUMENT_DIRTY_STATE_VALUE_DIRTY = 2;
+  DOCUMENT_DIRTY_STATE_VALUE_CONFLICT = 3;
+  DOCUMENT_DIRTY_STATE_VALUE_MISSING = 4;
+}
+enum DocumentMaintenanceStateValue {
+  DOCUMENT_MAINTENANCE_STATE_VALUE_UNSPECIFIED = 0;
+  DOCUMENT_MAINTENANCE_STATE_VALUE_TRUNCATED_RECOVERY_TAIL = 1;
+  DOCUMENT_MAINTENANCE_STATE_VALUE_CORRUPT_RECOVERY_RECORD = 2;
+  DOCUMENT_MAINTENANCE_STATE_VALUE_COMPACTION_DEFERRED = 3;
+}
+message DocumentSnapshotValue {
+  string document_id = 1;
+  string environment_id = 2;
+  string relative_path = 3;
+  string text = 4;
+  uint64 document_version = 5;
+  uint64 persisted_version = 6;
+  uint64 last_accepted_client_sequence = 7;
+  DocumentDirtyStateValue dirty_state = 8;
+  DiskFingerprintValue observed_disk_fingerprint = 9;
+  EditLeaseValue current_lease = 10;
+  repeated DocumentMaintenanceStateValue maintenance = 11;
+}
+message DocumentAcknowledgement {
+  string document_id = 1;
+  uint64 client_sequence = 2;
+  uint64 document_version = 3;
+}
+message DocumentOpenRequest { string relative_path = 1; }
+message DocumentSnapshotRequest { string document_id = 1; }
+message DocumentAcquireLeaseRequest {
+  string document_id = 1;
+  reserved 2;
+}
+message DocumentTransferLeaseRequest {
+  string document_id = 1;
+  string from_edit_lease_id = 2;
+  string target_client_instance_id = 3;
+}
+message DocumentApplyRequest {
+  string document_id = 1;
+  string edit_lease_id = 2;
+  uint64 base_version = 3;
+  uint64 client_sequence = 4;
+  repeated UTF16TextChange changes = 5;
+}
+message DocumentFlushRequest {
+  string document_id = 1;
+  uint64 through_client_sequence = 2;
+}
+message DocumentFlushResult { uint64 document_version = 1; }
+message DocumentSaveRequest {
+  string document_id = 1;
+  DiskFingerprintValue expected_fingerprint = 2;
+}
+message DocumentDiscardRequest { string document_id = 1; }
+message DocumentEnvelope {
+  string request_id = 1;
+  DataPlaneBinding binding = 2;
+  oneof payload {
+    DocumentOpenRequest open_request = 10;
+    DocumentSnapshotRequest snapshot_request = 11;
+    DocumentAcquireLeaseRequest acquire_lease_request = 12;
+    DocumentTransferLeaseRequest transfer_lease_request = 13;
+    DocumentApplyRequest apply_request = 14;
+    DocumentFlushRequest flush_request = 15;
+    DocumentSaveRequest save_request = 16;
+    DocumentDiscardRequest discard_request = 17;
+    DocumentSnapshotValue snapshot_result = 30;
+    EditLeaseValue lease_result = 31;
+    DocumentAcknowledgement acknowledgement_result = 32;
+    DocumentFlushResult flush_result = 33;
+    DataPlaneError error = 40;
+  }
+}
+
+enum WorkspaceDirectoryKind {
+  WORKSPACE_DIRECTORY_KIND_UNSPECIFIED = 0;
+  WORKSPACE_DIRECTORY_KIND_ROOT = 1;
+  WORKSPACE_DIRECTORY_KIND_RELATIVE = 2;
+}
+message WorkspaceDirectoryValue {
+  WorkspaceDirectoryKind kind = 1;
+  optional string relative_path = 2;
+}
+enum FileTreeEntryKindValue {
+  FILE_TREE_ENTRY_KIND_VALUE_UNSPECIFIED = 0;
+  FILE_TREE_ENTRY_KIND_VALUE_FILE = 1;
+  FILE_TREE_ENTRY_KIND_VALUE_DIRECTORY = 2;
+  FILE_TREE_ENTRY_KIND_VALUE_SYMBOLIC_LINK = 3;
+}
+message FileTreeEntryIdentityValue {
+  string environment_id = 1;
+  string relative_path = 2;
+}
+message FileTreeEntryValue {
+  FileTreeEntryIdentityValue identity = 1;
+  FileTreeEntryKindValue kind = 2;
+}
+message FileTreeMutationValue {
+  oneof mutation {
+    FileTreeEntryValue insert = 1;
+    FileTreeEntryIdentityValue remove = 2;
+    FileTreeEntryValue update = 3;
+  }
+}
+message FileTreeSnapshotValue {
+  string environment_id = 1;
+  WorkspaceDirectoryValue directory = 2;
+  uint64 generation = 3;
+  uint64 revision = 4;
+  repeated FileTreeEntryValue children = 5;
+}
+message FileTreeDeltaValue {
+  string environment_id = 1;
+  WorkspaceDirectoryValue directory = 2;
+  uint64 revision = 3;
+  repeated FileTreeMutationValue mutations = 4;
+}
+message FileTreeChildrenRequest { WorkspaceDirectoryValue directory = 1; }
+message FileTreeSubscribeRequest { uint64 after_revision = 1; }
+message FileTreeSubscriptionAccepted {
+  string subscription_id = 1;
+  uint64 revision = 2;
+}
+message FileTreeDeltaEvent {
+  string subscription_id = 1;
+  string event_id = 2;
+  FileTreeDeltaValue delta = 3;
+}
+message FileTreeDeltaAck {
+  string subscription_id = 1;
+  string event_id = 2;
+  uint64 revision = 3;
+}
+message FileTreeAckAccepted {
+  string subscription_id = 1;
+  string event_id = 2;
+  uint64 revision = 3;
+}
+message FileTreeCancelRequest { string subscription_id = 1; }
+message FileTreeCancelled { string subscription_id = 1; }
+message FileTreeEnvelope {
+  string request_id = 1;
+  DataPlaneBinding binding = 2;
+  oneof payload {
+    FileTreeChildrenRequest children_request = 10;
+    FileTreeSubscribeRequest subscribe_request = 11;
+    FileTreeDeltaAck delta_ack = 12;
+    FileTreeCancelRequest cancel_request = 13;
+    FileTreeSnapshotValue snapshot_result = 30;
+    FileTreeSubscriptionAccepted subscription_accepted = 31;
+    FileTreeDeltaEvent delta_event = 32;
+    FileTreeAckAccepted ack_accepted = 33;
+    FileTreeCancelled cancelled = 34;
+    DataPlaneError error = 40;
+  }
+}

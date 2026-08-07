@@ -25,4 +25,5 @@ public struct ProtocolFeature: RawRepresentable, Hashable, Codable, Sendable {
     public static let terminalControl = Self(rawValue: "terminal-control")
     public static let terminalFrames = Self(rawValue: "terminal-frames")
     public static let remoteDirect = Self(rawValue: "remote-direct")
+    public static let hostDataPlane = Self(rawValue: "host-data-plane")
 }

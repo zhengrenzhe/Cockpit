@@ -129,6 +129,10 @@ public actor DocumentRegistry {
         }
     }
 
+    public func document(id: DocumentID) -> DocumentActor? {
+        byID[id]
+    }
+
     public func acquireInternalMutationLease() async throws -> DocumentInternalMutationLease {
         try await acquireInternalMutationLease(scope: .all)
     }

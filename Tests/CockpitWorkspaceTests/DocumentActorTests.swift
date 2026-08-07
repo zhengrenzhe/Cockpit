@@ -546,6 +546,197 @@ import CockpitTypes
     #expect(snapshot.dirtyState == .conflict)
 }
 
+@Test func workspaceKernelDataPlaneActorRejectsEveryUnauthorizedMutationBeforeStorageMutation() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    let unauthorized = ClientInstanceID()
+    let transaction = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: lease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "x")]
+    )
+    let before = await actor.snapshot()
+    let compareAndSetCount = await fixture.repository.compareAndSetCount
+    let bytes = try Data(contentsOf: fixture.documentURL)
+
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.transferEditLease(
+            from: lease.id,
+            to: ClientInstanceID(),
+            authorizedClient: unauthorized
+        )
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.apply(transaction, authorizedClient: unauthorized)
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.flush(through: 0, authorizedClient: unauthorized)
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.save(
+            expectedFingerprint: try #require(before.observedDiskFingerprint),
+            authorizedClient: unauthorized
+        )
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.discard(authorizedClient: unauthorized)
+    }
+
+    #expect(await actor.snapshot() == before)
+    #expect(await fixture.repository.compareAndSetCount == compareAndSetCount)
+    #expect((try await fixture.recoveryLog.recover()).records.isEmpty)
+    #expect(try Data(contentsOf: fixture.documentURL) == bytes)
+}
+
+@Test func workspaceKernelDataPlaneActorSerializesApplyBeforeLeaseTransfer() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    await fixture.repository.blockNextCompareAndSet()
+    let apply = Task {
+        try await actor.apply(
+            EditTransaction(
+                validatingDocumentID: fixture.metadata.documentID,
+                editLeaseID: lease.id,
+                baseVersion: 0,
+                clientSequence: 1,
+                changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "d")]
+            ),
+            authorizedClient: fixture.clientID
+        )
+    }
+    await fixture.repository.waitUntilCompareAndSetBlocks()
+    let nextClient = ClientInstanceID()
+    let transfer = Task {
+        try await actor.transferEditLease(
+            from: lease.id,
+            to: nextClient,
+            authorizedClient: fixture.clientID
+        )
+    }
+    for _ in 0..<20 { await Task.yield() }
+    #expect(await fixture.repository.compareAndSetCount == 2)
+
+    await fixture.repository.releaseCompareAndSet()
+    #expect(try await apply.value.documentVersion == 1)
+    #expect(try await transfer.value.clientInstanceID == nextClient)
+    let snapshot = await actor.snapshot()
+    #expect(snapshot.text == "abcd")
+    #expect(snapshot.currentLease?.clientInstanceID == nextClient)
+}
+
+@Test func workspaceKernelDataPlaneActorSerializesSaveAndDiscardBeforeLeaseTransfer() async throws {
+    for operation in ["save", "discard"] {
+        let fixture = try DocumentActorFixture(text: "abc")
+        defer { fixture.remove() }
+        let actor = try await fixture.openActor()
+        let lease = try await actor.acquireEditLease(client: fixture.clientID)
+        _ = try await actor.apply(
+            EditTransaction(
+                validatingDocumentID: fixture.metadata.documentID,
+                editLeaseID: lease.id,
+                baseVersion: 0,
+                clientSequence: 1,
+                changes: [try UTF16TextEdit(validatingOffset: 3, length: 0, replacement: "d")]
+            ),
+            authorizedClient: fixture.clientID
+        )
+        let dirty = await actor.snapshot()
+        if operation == "discard" {
+            try Data("replacement".utf8).write(to: fixture.documentURL)
+        }
+        await fixture.repository.blockNextCompareAndSet()
+        let mutation = Task { () throws -> DocumentSnapshot in
+            if operation == "save" {
+                return try await actor.save(
+                    expectedFingerprint: try #require(dirty.observedDiskFingerprint),
+                    authorizedClient: fixture.clientID
+                )
+            }
+            return try await actor.discard(authorizedClient: fixture.clientID)
+        }
+        await fixture.repository.waitUntilCompareAndSetBlocks()
+        let nextClient = ClientInstanceID()
+        let transfer = Task {
+            try await actor.transferEditLease(
+                from: lease.id,
+                to: nextClient,
+                authorizedClient: fixture.clientID
+            )
+        }
+        for _ in 0..<20 { await Task.yield() }
+        let countWhileMutationBlocked = await fixture.repository.compareAndSetCount
+
+        await fixture.repository.releaseCompareAndSet()
+        let mutated = try await mutation.value
+        #expect(try await transfer.value.clientInstanceID == nextClient)
+        #expect(await fixture.repository.compareAndSetCount == countWhileMutationBlocked + 1)
+        #expect(mutated.currentLease?.clientInstanceID == fixture.clientID)
+        #expect((await actor.snapshot()).currentLease?.clientInstanceID == nextClient)
+    }
+}
+
+@Test func workspaceKernelDataPlaneActorTransferFirstRejectsOldOwnerApplyFlushSaveAndDiscard() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    let nextClient = ClientInstanceID()
+    let transferred = try await actor.transferEditLease(
+        from: lease.id,
+        to: nextClient,
+        authorizedClient: fixture.clientID
+    )
+    let before = await actor.snapshot()
+    let compareAndSetCount = await fixture.repository.compareAndSetCount
+    let transaction = try EditTransaction(
+        validatingDocumentID: fixture.metadata.documentID,
+        editLeaseID: lease.id,
+        baseVersion: 0,
+        clientSequence: 1,
+        changes: [try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "x")]
+    )
+
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.apply(transaction, authorizedClient: fixture.clientID)
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.flush(through: 0, authorizedClient: fixture.clientID)
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.save(
+            expectedFingerprint: try #require(before.observedDiskFingerprint),
+            authorizedClient: fixture.clientID
+        )
+    }
+    await #expect(throws: DocumentProtocolError.invalidLease) {
+        _ = try await actor.discard(authorizedClient: fixture.clientID)
+    }
+
+    #expect(await actor.snapshot() == before)
+    #expect(await fixture.repository.compareAndSetCount == compareAndSetCount)
+    #expect((await actor.snapshot()).currentLease == transferred)
+}
+
+@Test func workspaceKernelDataPlaneActorFlushBeforeTransferCompletesInsideOneGate() async throws {
+    let fixture = try DocumentActorFixture(text: "abc")
+    defer { fixture.remove() }
+    let actor = try await fixture.openActor()
+    let lease = try await actor.acquireEditLease(client: fixture.clientID)
+    #expect(try await actor.flush(through: 0, authorizedClient: fixture.clientID) == 0)
+    let nextClient = ClientInstanceID()
+    #expect(try await actor.transferEditLease(
+        from: lease.id,
+        to: nextClient,
+        authorizedClient: fixture.clientID
+    ).clientInstanceID == nextClient)
+}
+
 private final class DocumentActorFixture: @unchecked Sendable {
     let root: URL
     let recoveryRoot: URL
@@ -708,6 +899,7 @@ actor TestDocumentMetadataRepository: DocumentMetadataRepository {
         if releaseBlock != nil { return }
         await withCheckedContinuation { blockStarted.append($0) }
     }
+    var isCompareAndSetBlocked: Bool { releaseBlock != nil }
     func releaseCompareAndSet() { releaseBlock?.resume(); releaseBlock = nil }
     func blockNextFindOrCreate() { blockNextFind = true }
     func waitUntilFindOrCreateBlocks() async {
