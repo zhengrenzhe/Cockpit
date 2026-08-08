@@ -989,6 +989,7 @@ actor HostDataPlaneTreeStream {
     private var subscriptionID: String?
     private var pendingEvent: (id: String, revision: UInt64)?
     private var startup: Task<Void, Error>?
+    private var connectionWorker: Task<Void, Error>?
     private var established = false
     private var cancelled = false
     private var cancelWaiter: CancelWaiter?
@@ -1008,25 +1009,14 @@ actor HostDataPlaneTreeStream {
     func next() async throws -> FileTreeDelta? {
         if cancelled { throw CancellationError() }
         try await ensureEstablished()
+        try checkActive()
         while true {
             do {
                 if let pendingEvent {
                     try await acknowledge(pendingEvent)
                     self.pendingEvent = nil
                 }
-                let envelope: CPFileTreeEnvelope
-                do {
-                    envelope = try await receive()
-                } catch {
-                    throw error
-                }
-
-                if cancelled {
-                    if try completeCancellationIfMatched(envelope) {
-                        throw CancellationError()
-                    }
-                    continue
-                }
+                let envelope = try await receiveWhileActive()
                 guard let payload = envelope.payload else {
                     throw HostDataPlaneResponseValidationError()
                 }
@@ -1074,6 +1064,12 @@ actor HostDataPlaneTreeStream {
         ownerPublication.cancel()
         startup?.cancel()
         guard descriptorOwner != nil, let subscriptionID else {
+            connectionWorker?.cancel()
+            descriptorOwner?.interrupt()
+            if let connectionWorker {
+                _ = await connectionWorker.result
+                self.connectionWorker = nil
+            }
             closeConnection()
             return
         }
@@ -1090,7 +1086,7 @@ actor HostDataPlaneTreeStream {
             continuation: nil
         )
         do {
-            try send(envelope)
+            try send(envelope, allowingCancellation: true)
         } catch {
             abandonCancellationWaiter()
             closeConnection()
@@ -1108,7 +1104,7 @@ actor HostDataPlaneTreeStream {
         } else {
             do {
                 while cancelWaiter != nil {
-                    let response = try await receive()
+                    let response = try await receiveWhileActive()
                     _ = try completeCancellationIfMatched(response)
                 }
             } catch {
@@ -1128,7 +1124,7 @@ actor HostDataPlaneTreeStream {
         } catch {
             throw HostDataPlaneClientError.disconnected
         }
-        try Task.checkCancellation()
+        try checkActive()
         let fd = try calls.createStreamSocket()
         let owner = HostDataPlaneDescriptorOwner(fd, calls: calls)
         guard ownerPublication.publish(owner) else {
@@ -1136,21 +1132,31 @@ actor HostDataPlaneTreeStream {
         }
         descriptorOwner = owner
         do {
-            try owner.withDescriptor { descriptor in
-                try calls.setCloseOnExec(descriptor)
-                try calls.setNoSigPipe(descriptor)
-                try calls.connect(
-                    descriptor,
-                    to: UnixDomainSocketAddress(path: ticket.socketPath)
+            let calls = calls
+            let binding = binding
+            let readQueue = readQueue
+            let worker = Task.detached {
+                try owner.withDescriptor { descriptor in
+                    try calls.setCloseOnExec(descriptor)
+                    try calls.setNoSigPipe(descriptor)
+                    try calls.connect(
+                        descriptor,
+                        to: UnixDomainSocketAddress(path: ticket.socketPath)
+                    )
+                }
+                try Task.checkCancellation()
+                try await authenticateTree(
+                    descriptorOwner: owner,
+                    ticket: ticket.ticket,
+                    binding: binding,
+                    calls: calls,
+                    readQueue: readQueue
                 )
             }
-            try await authenticateTree(
-                descriptorOwner: owner,
-                ticket: ticket.ticket,
-                binding: binding,
-                calls: calls,
-                readQueue: readQueue
-            )
+            connectionWorker = worker
+            try await worker.value
+            connectionWorker = nil
+            try checkActive()
             lastOutgoing = 0
             lastIncoming = 0
             lastAcknowledged = 0
@@ -1158,9 +1164,13 @@ actor HostDataPlaneTreeStream {
             pendingEvent = nil
             try await subscribe()
         } catch {
+            connectionWorker = nil
             if descriptorOwner === owner { descriptorOwner = nil }
             owner.interrupt()
             owner.close()
+            if cancelled || Task.isCancelled || error is CancellationError {
+                throw CancellationError()
+            }
             throw normalizeConnectionError(error)
         }
     }
@@ -1170,8 +1180,13 @@ actor HostDataPlaneTreeStream {
         if startup == nil { start() }
         do {
             try await startup?.value
+            try checkActive()
             established = true
             startup = nil
+        } catch is CancellationError {
+            startup = nil
+            closeConnection()
+            throw CancellationError()
         } catch {
             startup = nil
             closeConnection()
@@ -1183,6 +1198,7 @@ actor HostDataPlaneTreeStream {
         while !cancelled {
             do {
                 try await establishAndSubscribe()
+                try checkActive()
                 established = true
                 return
             } catch is CancellationError {
@@ -1190,6 +1206,7 @@ actor HostDataPlaneTreeStream {
             } catch {
                 closeConnection()
                 try await Task.sleep(for: .milliseconds(10))
+                try checkActive()
             }
         }
         throw CancellationError()
@@ -1200,7 +1217,7 @@ actor HostDataPlaneTreeStream {
         let id = RequestID().description
         var envelope = CPFileTreeEnvelope(); envelope.requestID = id; envelope.binding = try HostDataPlaneMessages.encode(binding); envelope.subscribeRequest = request
         try send(envelope)
-        let response = try await receive()
+        let response = try await receiveWhileActive()
         if case let .error(error)? = response.payload {
             throw mapRemote(error, diagnostics: nil)
         }
@@ -1219,7 +1236,7 @@ actor HostDataPlaneTreeStream {
         let requestID = RequestID().description
         var envelope = CPFileTreeEnvelope(); envelope.requestID = requestID; envelope.binding = try HostDataPlaneMessages.encode(binding); envelope.deltaAck = ack
         try send(envelope)
-        let response = try await receive()
+        let response = try await receiveWhileActive()
         if case let .error(error)? = response.payload {
             throw mapRemote(error, diagnostics: nil)
         }
@@ -1239,7 +1256,7 @@ actor HostDataPlaneTreeStream {
             let requestID = RequestID().description
             var envelope = CPFileTreeEnvelope(); envelope.requestID = requestID; envelope.binding = try HostDataPlaneMessages.encode(binding); envelope.childrenRequest = request
             try send(envelope)
-            let response = try await receive()
+            let response = try await receiveWhileActive()
             if case let .error(error)? = response.payload {
                 throw mapRemote(error, diagnostics: nil)
             }
@@ -1258,7 +1275,13 @@ actor HostDataPlaneTreeStream {
         after = maximum; try await subscribe()
     }
 
-    private func send(_ envelope: CPFileTreeEnvelope) throws {
+    private func send(
+        _ envelope: CPFileTreeEnvelope,
+        allowingCancellation: Bool = false
+    ) throws {
+        guard allowingCancellation || !cancelled else {
+            throw CancellationError()
+        }
         guard let descriptorOwner,
               case let .value(sequence) = hostDataPlaneAdvanceSequence(lastOutgoing) else {
             throw HostDataPlaneClientError.disconnected
@@ -1309,12 +1332,25 @@ actor HostDataPlaneTreeStream {
         return envelope
     }
 
+    private func receiveWhileActive() async throws -> CPFileTreeEnvelope {
+        while true {
+            let envelope = try await receive()
+            if cancelled {
+                if try completeCancellationIfMatched(envelope) {
+                    throw CancellationError()
+                }
+                continue
+            }
+            try Task.checkCancellation()
+            return envelope
+        }
+    }
+
     private func completeCancellationIfMatched(_ envelope: CPFileTreeEnvelope) throws -> Bool {
         guard let waiter = cancelWaiter else { return false }
-        guard envelope.requestID == waiter.requestID,
-              case let .cancelled(value)? = envelope.payload,
+        guard envelope.requestID == waiter.requestID else { return false }
+        guard case let .cancelled(value)? = envelope.payload,
               value.subscriptionID == waiter.subscriptionID else {
-            if case .deltaEvent? = envelope.payload { return false }
             throw HostDataPlaneResponseValidationError()
         }
         cancelWaiter = nil
@@ -1339,6 +1375,11 @@ actor HostDataPlaneTreeStream {
         pendingEvent = nil
         abandonCancellationWaiter()
     }
+
+    private func checkActive() throws {
+        guard !cancelled else { throw CancellationError() }
+        try Task.checkCancellation()
+    }
 }
 
 private func authenticateTree(
@@ -1348,11 +1389,13 @@ private func authenticateTree(
     calls: any UnixDomainSocketSystemCalls,
     readQueue: DispatchQueue
 ) async throws {
+    try Task.checkCancellation()
     var handshake = CPHostDataPlaneControlEnvelope(); handshake.handshakeRequest = .cockpit(deviceID: DeviceID(), features: [.hostDataPlane])
     try descriptorOwner.withDescriptor { descriptor in
         try writeFrame(calls, descriptor, channel: .control, sequence: 1, acknowledgement: 0, payload: handshake.serializedData())
     }
     let handshakeResponse = try await readFrameAsync(calls, descriptorOwner, queue: readQueue)
+    try Task.checkCancellation()
     guard handshakeResponse.header.channel == .control,
           handshakeResponse.header.sequence == 1,
           handshakeResponse.header.acknowledgement == 1
@@ -1364,6 +1407,7 @@ private func authenticateTree(
         try writeFrame(calls, descriptor, channel: .control, sequence: 2, acknowledgement: 1, payload: envelope.serializedData())
     }
     let response = try await readFrameAsync(calls, descriptorOwner, queue: readQueue)
+    try Task.checkCancellation()
     guard response.header.channel == .control,
           response.header.sequence == 2,
           response.header.acknowledgement == 2

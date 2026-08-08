@@ -36,6 +36,12 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             path: String,
             identity: UnixSocketPathStatus
         )
+        case terminal(
+            listener: HostDataPlaneDescriptorOwner,
+            acceptController: HostDataPlaneAcceptController,
+            path: String,
+            identity: UnixSocketPathStatus
+        )
         case stopped
     }
 
@@ -216,14 +222,19 @@ public final class HostDataPlaneServer: @unchecked Sendable {
 
     public func shutdown() async {
         let snapshot = lock.withLock { () -> (HostDataPlaneDescriptorOwner, HostDataPlaneAcceptController, String, UnixSocketPathStatus, [HostDataPlaneServerConnection])? in
-            guard case let .ready(listener, acceptController, path, identity) = state else {
+            let resources: (HostDataPlaneDescriptorOwner, HostDataPlaneAcceptController, String, UnixSocketPathStatus)
+            switch state {
+            case let .ready(listener, acceptController, path, identity),
+                 let .terminal(listener, acceptController, path, identity):
+                resources = (listener, acceptController, path, identity)
+            case .idle, .stopped:
                 state = .stopped
                 return nil
             }
             state = .stopped
             let clients = Array(connections.values)
             connections.removeAll()
-            return (listener, acceptController, path, identity, clients)
+            return (resources.0, resources.1, resources.2, resources.3, clients)
         }
         guard let snapshot else { return }
         snapshot.1.signal()
@@ -249,12 +260,20 @@ public final class HostDataPlaneServer: @unchecked Sendable {
                 guard try acceptController.wait(listener: descriptor) == .listenerReady else {
                     return
                 }
+            } catch let error as UnixDomainSocketError where isRecoverableAcceptWaitError(error) {
+                continue
             } catch {
+                transitionToTerminal(descriptor: descriptor, acceptController: acceptController)
                 return
             }
             let accepted: Int32
             do { accepted = try systemCalls.accept(descriptor) }
-            catch { return }
+            catch let error as UnixDomainSocketError where isRecoverableAcceptError(error) {
+                continue
+            } catch {
+                transitionToTerminal(descriptor: descriptor, acceptController: acceptController)
+                return
+            }
             guard lock.withLock({
                 if case .ready = state { return true }
                 return false
@@ -302,6 +321,39 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             }
         }
     }
+
+    private func transitionToTerminal(
+        descriptor: Int32,
+        acceptController: HostDataPlaneAcceptController
+    ) {
+        lock.withLock {
+            guard case let .ready(listener, currentController, path, identity) = state,
+                  currentController === acceptController,
+                  listener.descriptor == descriptor else {
+                return
+            }
+            state = .terminal(
+                listener: listener,
+                acceptController: currentController,
+                path: path,
+                identity: identity
+            )
+        }
+    }
+}
+
+private func isRecoverableAcceptWaitError(_ error: UnixDomainSocketError) -> Bool {
+    guard case let .systemCall(function, value) = error, function == "poll" else {
+        return false
+    }
+    return value == EAGAIN || value == EINTR
+}
+
+private func isRecoverableAcceptError(_ error: UnixDomainSocketError) -> Bool {
+    guard case let .systemCall(function, value) = error, function == "accept" else {
+        return false
+    }
+    return value == EAGAIN || value == ECONNABORTED || value == EINTR
 }
 
 private final class HostDataPlaneServerConnection: @unchecked Sendable {

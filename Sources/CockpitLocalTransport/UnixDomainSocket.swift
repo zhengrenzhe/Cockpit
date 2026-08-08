@@ -408,7 +408,7 @@ extension DarwinUnixDomainSocketSystemCalls: HostDataPlaneAcceptPolling {
         ]
         while true {
             let result = Darwin.poll(&descriptors, nfds_t(descriptors.count), -1)
-            if result < 0, errno == EINTR { continue }
+            if result < 0, errno == EINTR || errno == EAGAIN { continue }
             guard result >= 0 else {
                 throw UnixDomainSocketError.systemCall(function: "poll", errno: errno)
             }
