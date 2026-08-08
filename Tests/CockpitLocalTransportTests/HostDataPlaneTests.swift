@@ -345,6 +345,204 @@ import CockpitTypes
     #expect(fixture.service.treeAfterRevisions.isEmpty)
 }
 
+@Test func hostDataPlaneServerNaturalTeardownInterruptsBlockedTreeWriteBeforeLaterShutdown() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = RecordingDarwinUnixDomainSocketSystemCalls(
+        blockTreeDelta: true
+    ) { _ in }
+    let namespace = uniqueHostDataPlaneNamespace("natural-tree-close")
+    let server = HostDataPlaneServer(
+        namespace: namespace,
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: DarwinPeerCredentialReader()
+    )
+    try await server.start()
+    let issued = try await fixture.ticketStore.issue(
+        binding: fixture.binding,
+        expectedPeerUID: geteuid()
+    )
+    let peer = try RawHostDataPlanePeer(
+        path: hostDataPlaneSocketPath(namespace: namespace, uid: geteuid())
+    )
+    try peer.handshake()
+    #expect(
+        try peer.authenticate(
+            ticket: issued.wireValue,
+            binding: fixture.binding
+        ).code == .unspecified
+    )
+    let subscriptionID = RequestID().description
+    try peer.writeFrame(
+        channel: .fileTreeEvents,
+        sequence: 1,
+        acknowledgement: 0,
+        payload: try fileTreeSubscribeEnvelope(
+            requestID: subscriptionID,
+            binding: fixture.binding,
+            after: fixture.treeSnapshot.revision
+        ).serializedData()
+    )
+    _ = try peer.readFrame()
+    do {
+        try await eventually { fixture.service.activeTreeSubscriptions == 1 }
+    } catch {
+        Issue.record("natural teardown subscription did not become active")
+        await server.shutdown()
+        return
+    }
+    fixture.service.yieldTreeDelta(fixture.treeDelta)
+    do {
+        try await eventually { calls.treeDeltaWriteBlocked }
+    } catch {
+        Issue.record("natural teardown tree delta write did not block")
+        await server.shutdown()
+        return
+    }
+
+    try peer.halfCloseWrites()
+    do {
+        try await eventually { calls.blockedTreeDeltaTaskCancelled }
+    } catch {
+        calls.releaseTreeDeltaWriteForCleanup()
+        await server.shutdown()
+        Issue.record("natural teardown did not cancel the blocked tree task after peer EOF")
+        return
+    }
+    try await Task.sleep(for: .milliseconds(20))
+
+    let returned = LockedHostDataPlaneBox(false)
+    let shutdown = Task {
+        await server.shutdown()
+        returned.withValue { $0 = true }
+    }
+    do {
+        try await eventually(timeout: .milliseconds(250)) { returned.value }
+    } catch {}
+    let bounded = returned.value
+    calls.releaseTreeDeltaWriteForCleanup()
+    await shutdown.value
+
+    #expect(bounded)
+    #expect(calls.clientInterruptCount == 1)
+}
+
+@Test func hostDataPlaneServerShutdownDoesNotDependOnCreatingAWakeSocket() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = ScriptedUnixDomainSocketSystemCalls(uid: 501)
+    calls.seedSafeDirectories(namespace: "owned-wake")
+    calls.blockAcceptWhenEmpty = true
+    calls.failSocketCreationAfterCount = 1
+    let server = HostDataPlaneServer(
+        namespace: "owned-wake",
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: FixedPeerCredentialReader(uid: 501)
+    )
+    try await server.start()
+    try await eventually { calls.acceptEntered }
+
+    let returned = LockedHostDataPlaneBox(false)
+    let shutdown = Task {
+        await server.shutdown()
+        returned.withValue { $0 = true }
+    }
+    do {
+        try await eventually(timeout: .milliseconds(250)) { returned.value }
+    } catch {}
+    let bounded = returned.value
+    calls.releaseAcceptForCleanup()
+    await shutdown.value
+
+    #expect(bounded)
+    #expect(calls.createSocketCount == 1)
+    #expect(calls.closedDescriptors.filter { $0 == 41 }.count == 1)
+}
+
+@Test func hostDataPlaneServerJoinsNamedTreeTaskBeforeCancelledReply() async throws {
+    let cancellationEntered = LockedHostDataPlaneBox(false)
+    let cancellationRelease = DispatchSemaphore(value: 0)
+    let events = LockedHostDataPlaneBox<[String]>([])
+    let fixture = try HostDataPlaneFixture {
+        cancellationEntered.withValue { $0 = true }
+        cancellationRelease.wait()
+    }
+    let calls = RecordingDarwinUnixDomainSocketSystemCalls { event in
+        events.withValue { $0.append(event) }
+    }
+    let namespace = uniqueHostDataPlaneNamespace("cancel-join")
+    let server = HostDataPlaneServer(
+        namespace: namespace,
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: DarwinPeerCredentialReader()
+    )
+    try await server.start()
+    let issued = try await fixture.ticketStore.issue(
+        binding: fixture.binding,
+        expectedPeerUID: geteuid()
+    )
+    let peer = try RawHostDataPlanePeer(
+        path: hostDataPlaneSocketPath(namespace: namespace, uid: geteuid())
+    )
+    try peer.handshake()
+    #expect(
+        try peer.authenticate(
+            ticket: issued.wireValue,
+            binding: fixture.binding
+        ).code == .unspecified
+    )
+    let subscriptionID = RequestID().description
+    try peer.writeFrame(
+        channel: .fileTreeEvents,
+        sequence: 1,
+        acknowledgement: 0,
+        payload: try fileTreeSubscribeEnvelope(
+            requestID: subscriptionID,
+            binding: fixture.binding,
+            after: fixture.treeSnapshot.revision
+        ).serializedData()
+    )
+    _ = try peer.readFrame()
+    try await eventually { fixture.service.activeTreeSubscriptions == 1 }
+    fixture.service.yieldTreeDelta(fixture.treeDelta)
+    let delta = try peer.readFrame()
+    let deltaEnvelope = try fileTreeEnvelope(delta)
+    #expect(deltaEnvelope.deltaEvent.subscriptionID == subscriptionID)
+    let cancelRequestID = RequestID().description
+    var cancel = CPFileTreeCancelRequest()
+    cancel.subscriptionID = subscriptionID
+    var envelope = CPFileTreeEnvelope()
+    envelope.requestID = cancelRequestID
+    envelope.binding = try HostDataPlaneMessages.encode(fixture.binding)
+    envelope.cancelRequest = cancel
+    try peer.writeFrame(
+        channel: .fileTreeEvents,
+        sequence: 2,
+        acknowledgement: delta.header.sequence,
+        payload: envelope.serializedData()
+    )
+    try await eventually { cancellationEntered.value }
+
+    do {
+        try await eventually(timeout: .milliseconds(250)) {
+            events.value.contains("tree-cancelled-write")
+        }
+    } catch {}
+    let repliedBeforeJoin = events.value.contains("tree-cancelled-write")
+    cancellationRelease.signal()
+    let cancelledFrame = try peer.readFrame()
+    let cancelledEnvelope = try fileTreeEnvelope(cancelledFrame)
+
+    #expect(!repliedBeforeJoin)
+    #expect(cancelledEnvelope.requestID == cancelRequestID)
+    #expect(cancelledEnvelope.cancelled.subscriptionID == subscriptionID)
+    await server.shutdown()
+}
+
 @Test func hostDataPlaneServerFailsClosedForUnsafeLiveStaleAndRacedPaths() async throws {
     let fixture = try HostDataPlaneFixture()
     let root = "/private/tmp/cockpit.501"
@@ -935,6 +1133,91 @@ import CockpitTypes
     #expect(calls.closeCount == 1)
 }
 
+@Test func hostDataPlaneClientCancelledWaiterDetachesFromSharedColdEstablishment() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = ScriptedHostDataPlaneClientSocketCalls()
+    let proxy = BlockingHostDataPlaneTicketProxy()
+    let xpc = HostXPCClient(connectionFactory: { _ in HostDataPlaneXPCConnection(proxy: proxy) })
+    let client = HostDataPlaneClient(
+        binding: fixture.binding,
+        xpcClient: xpc,
+        systemCalls: calls
+    )
+    let firstResult = LockedHostDataPlaneBox<Result<DocumentSnapshot, any Error>?>(nil)
+    let secondResult = LockedHostDataPlaneBox<Result<FileTreeSnapshot, any Error>?>(nil)
+    let first = Task {
+        do {
+            let snapshot = try await client.snapshot(documentID: fixture.documentID)
+            firstResult.withValue { $0 = .success(snapshot) }
+        } catch {
+            firstResult.withValue { $0 = .failure(error) }
+        }
+    }
+    try await proxy.waitForIssueAttempt()
+    let second = Task {
+        do {
+            let snapshot = try await client.children(at: .root)
+            secondResult.withValue { $0 = .success(snapshot) }
+        } catch {
+            secondResult.withValue { $0 = .failure(error) }
+        }
+    }
+    try await eventually { proxy.issueCount == 1 && firstResult.value == nil && secondResult.value == nil }
+    for _ in 0..<8 { await Task.yield() }
+
+    first.cancel()
+    do {
+        try await eventually(timeout: .milliseconds(250)) { firstResult.value != nil }
+    } catch {}
+    let firstCompletedBeforeSharedAttempt = firstResult.value != nil
+
+    var handshake = CPHandshakeResponse()
+    handshake.protocolMajor = 1
+    handshake.protocolMinor = 1
+    handshake.connectionID = ConnectionID(uuid(24)).description
+    handshake.acceptedFeatures = [ProtocolFeature.hostDataPlane.rawValue]
+    handshake.serviceKind = "host-data-plane"
+    var handshakeEnvelope = CPHostDataPlaneControlEnvelope()
+    handshakeEnvelope.handshakeResponse = handshake
+    calls.enqueue(try hostDataPlaneTestFrame(
+        .control,
+        1,
+        1,
+        handshakeEnvelope.serializedData()
+    ))
+    var authenticated = CPHostDataPlaneAuthenticated()
+    authenticated.binding = try HostDataPlaneMessages.encode(fixture.binding)
+    var authenticatedEnvelope = CPHostDataPlaneControlEnvelope()
+    authenticatedEnvelope.authenticated = authenticated
+    calls.enqueue(try hostDataPlaneTestFrame(
+        .control,
+        2,
+        2,
+        authenticatedEnvelope.serializedData()
+    ))
+    proxy.releaseTicket()
+    try await calls.waitForWrittenFrames(3)
+    let request = try fileTreeEnvelope(calls.writtenFrames[2])
+    calls.enqueue(try fileTreeSnapshotFrame(
+        requestID: request.requestID,
+        binding: fixture.binding,
+        snapshot: fixture.treeSnapshot
+    ))
+    await first.value
+    await second.value
+
+    #expect(firstCompletedBeforeSharedAttempt)
+    if case let .failure(error)? = firstResult.value {
+        #expect(error as? HostDataPlaneClientError == .requestCancelled)
+    } else {
+        Issue.record("cancelled establishment waiter did not complete with requestCancelled")
+    }
+    #expect(try secondResult.value?.get() == fixture.treeSnapshot)
+    #expect(proxy.issueCount == 1)
+    #expect(calls.createSocketCount == 1)
+    await client.disconnect()
+}
+
 @Test func hostDataPlaneClientDisconnectInterruptsAndJoinsBlockedHandshakeOnce() async throws {
     let fixture = try HostDataPlaneFixture()
     let calls = ScriptedHostDataPlaneClientSocketCalls()
@@ -1009,6 +1292,105 @@ import CockpitTypes
     #expect(calls.closeCount == 1)
 }
 
+@Test func hostDataPlaneTreeCancellationBeforeTicketReplyCannotPublishSocketOwner() async throws {
+    let calls = ScriptedHostDataPlaneClientSocketCalls()
+    let owner = HostDataPlaneDescriptorOwner(71, calls: calls)
+    var state = HostDataPlaneTreeOwnerPublicationState()
+    state.cancel()
+    let published = state.publish(owner)
+    if published { owner.close() }
+
+    #expect(!published)
+    #expect(state.cancelled)
+    #expect(calls.closeCount == 1)
+}
+
+@Test func hostDataPlaneTreeCancelBetweenNextCallsKeepsIndependentSingleReader() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = ScriptedHostDataPlaneClientSocketCalls()
+    var handshake = CPHandshakeResponse()
+    handshake.protocolMajor = 1
+    handshake.protocolMinor = 1
+    handshake.connectionID = ConnectionID(uuid(24)).description
+    handshake.acceptedFeatures = [ProtocolFeature.hostDataPlane.rawValue]
+    handshake.serviceKind = "host-data-plane"
+    var handshakeEnvelope = CPHostDataPlaneControlEnvelope()
+    handshakeEnvelope.handshakeResponse = handshake
+    calls.enqueue(try hostDataPlaneTestFrame(
+        .control,
+        1,
+        1,
+        handshakeEnvelope.serializedData()
+    ))
+    var authenticated = CPHostDataPlaneAuthenticated()
+    authenticated.binding = try HostDataPlaneMessages.encode(fixture.binding)
+    var authenticatedEnvelope = CPHostDataPlaneControlEnvelope()
+    authenticatedEnvelope.authenticated = authenticated
+    calls.enqueue(try hostDataPlaneTestFrame(
+        .control,
+        2,
+        2,
+        authenticatedEnvelope.serializedData()
+    ))
+    let proxy = FixedHostDataPlaneTicketProxy()
+    let xpc = HostXPCClient(connectionFactory: { _ in
+        HostDataPlaneXPCConnection(proxy: proxy)
+    })
+    let state = HostDataPlaneTreeStream(
+        binding: fixture.binding,
+        xpcClient: xpc,
+        systemCalls: calls,
+        after: fixture.treeSnapshot.revision,
+        expandedDirectories: [.root]
+    )
+    await state.start()
+    let first = Task { try await state.next() }
+    try await calls.waitForWrittenFrames(3)
+    let subscribe = try fileTreeEnvelope(calls.writtenFrames[2])
+    calls.enqueue(try fileTreeSubscriptionAcceptedFrame(
+        requestID: subscribe.requestID,
+        binding: fixture.binding,
+        revision: fixture.treeSnapshot.revision
+    ))
+    let eventID = RequestID().description
+    calls.enqueue(try fileTreeDeltaFrame(
+        requestID: eventID,
+        subscriptionID: subscribe.requestID,
+        binding: fixture.binding,
+        delta: fixture.treeDelta,
+        sequence: 2,
+        acknowledgement: 1
+    ))
+    #expect(try await first.value == fixture.treeDelta)
+    #expect(calls.activeReaderCount == 0)
+
+    let cancelled = LockedHostDataPlaneBox(false)
+    let cancel = Task {
+        await state.cancel()
+        cancelled.withValue { $0 = true }
+    }
+    try await calls.waitForWrittenFrames(4)
+    let request = try fileTreeEnvelope(calls.writtenFrames[3])
+    calls.enqueue(try fileTreeCancelledFrame(
+        requestID: request.requestID,
+        subscriptionID: subscribe.requestID,
+        binding: fixture.binding,
+        sequence: 3,
+        acknowledgement: 2
+    ))
+    do {
+        try await eventually(timeout: .milliseconds(250)) {
+            cancelled.value && calls.closeCount == 1
+        }
+    } catch {}
+
+    #expect(cancelled.value)
+    #expect(calls.maximumConcurrentReaders == 1)
+    #expect(calls.unreadByteCount == 0)
+    #expect(calls.closeCount == 1)
+    _ = cancel
+}
+
 @Test func hostDataPlaneClientDisconnectAndInflightReadCloseDescriptorExactlyOnce() async throws {
     let fixture = try HostDataPlaneFixture()
     let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
@@ -1075,6 +1457,31 @@ import CockpitTypes
     let consumedUsedRequest = state.consumeBeforeRegistration("used-request")
     #expect(!recordedUsedRequest)
     #expect(!consumedUsedRequest)
+}
+
+@Test func hostDataPlaneUnaryAlreadyCancelledRegistrationConsumesTombstoneAndRetiresIdentity() {
+    var state = HostDataPlaneUnaryCancellationState<String>()
+    let key = "document:request"
+    let requestID = "request"
+    let recorded = state.recordBeforeRegistration(key, requestIDWasUsed: false)
+    #expect(recorded)
+
+    let disposition = state.registrationDisposition(
+        for: key,
+        requestID: requestID,
+        alreadyCancelled: true
+    )
+
+    #expect(disposition == .cancelAndRetire)
+    #expect(state.requestIDWasRetired(requestID))
+    let staleTombstoneRemains = state.consumeBeforeRegistration(key)
+    #expect(!staleTombstoneRemains)
+    let repeated = state.registrationDisposition(
+        for: "tree:\(requestID)",
+        requestID: requestID,
+        alreadyCancelled: false
+    )
+    #expect(repeated == .requestIDReuse)
 }
 
 @Test func hostDataPlaneEstablishedOverflowClosesAndCompletesEveryPendingRequest() async throws {
@@ -2502,14 +2909,17 @@ private struct FixedPeerCredentialReader: PeerCredentialReading {
     func peerCredentials(for descriptor: Int32) throws -> (uid: uid_t, gid: gid_t) { (uid, 20) }
 }
 
-private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls, HostDataPlaneDescriptorInterrupting, @unchecked Sendable {
+private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls, HostDataPlaneDescriptorInterrupting, HostDataPlaneAcceptPolling, @unchecked Sendable {
     private let lock = NSLock()
     private let readRelease = DispatchSemaphore(value: 0)
+    private let acceptRelease = DispatchSemaphore(value: 0)
     let uid: uid_t
     var statuses: [String: [UnixSocketPathStatus?]] = [:]
     var connectError: UnixDomainSocketError? = .systemCall(function: "connect", errno: ENOENT)
     var acceptedDescriptors: [Int32] = []
     var blockReads = false
+    var blockAcceptWhenEmpty = false
+    var failSocketCreationAfterCount: Int?
     var closeObserver: (@Sendable (Int32) -> Void)?
     var postBindSocketIdentity = UnixSocketPathStatus(
         kind: .socket, owner: 501, permissions: 0o600, device: 8, inode: 9
@@ -2526,8 +2936,13 @@ private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemC
     private var boundPath: String?
     private var nextDescriptor: Int32 = 41
     private var enteredRead = false
+    private var enteredAccept = false
+    private var createdSockets = 0
+    private var acceptWakeSignalled = false
 
     var readEntered: Bool { lock.withLock { enteredRead } }
+    var acceptEntered: Bool { lock.withLock { enteredAccept } }
+    var createSocketCount: Int { lock.withLock { createdSockets } }
 
     init(uid: uid_t) {
         self.uid = uid
@@ -2550,7 +2965,15 @@ private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemC
 
     func effectiveUserID() -> uid_t { uid }
     func createStreamSocket() throws -> Int32 {
-        lock.withLock { defer { nextDescriptor += 1 }; return nextDescriptor }
+        try lock.withLock {
+            if let failSocketCreationAfterCount,
+               createdSockets >= failSocketCreationAfterCount {
+                throw UnixDomainSocketError.systemCall(function: "socket", errno: EMFILE)
+            }
+            createdSockets += 1
+            defer { nextDescriptor += 1 }
+            return nextDescriptor
+        }
     }
     func setCloseOnExec(_ descriptor: Int32) throws { lock.withLock { closeOnExecDescriptors.append(descriptor) } }
     func setNoSigPipe(_ descriptor: Int32) throws { lock.withLock { noSigPipeDescriptors.append(descriptor) } }
@@ -2559,7 +2982,13 @@ private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemC
     }
     func listen(_ descriptor: Int32, backlog: Int32) throws {}
     func accept(_ descriptor: Int32) throws -> Int32 {
-        try lock.withLock {
+        let blocks = lock.withLock { () -> Bool in
+            guard acceptedDescriptors.isEmpty else { return false }
+            enteredAccept = true
+            return blockAcceptWhenEmpty
+        }
+        if blocks { acceptRelease.wait() }
+        return try lock.withLock {
             guard !acceptedDescriptors.isEmpty else {
                 throw UnixDomainSocketError.systemCall(function: "accept", errno: ECANCELED)
             }
@@ -2612,6 +3041,28 @@ private final class ScriptedUnixDomainSocketSystemCalls: UnixDomainSocketSystemC
         lock.withLock { interruptedDescriptors.append(descriptor) }
         readRelease.signal()
     }
+    func makeHostDataPlaneAcceptWakePair() throws -> (read: Int32, write: Int32) {
+        (91, 92)
+    }
+    func waitForHostDataPlaneAccept(
+        listener: Int32,
+        wake: Int32
+    ) throws -> HostDataPlaneAcceptWaitResult {
+        let blocks = lock.withLock { () -> Bool in
+            enteredAccept = true
+            return acceptedDescriptors.isEmpty && blockAcceptWhenEmpty && !acceptWakeSignalled
+        }
+        if blocks { acceptRelease.wait() }
+        return lock.withLock {
+            acceptWakeSignalled ? .wake : .listenerReady
+        }
+    }
+    func signalHostDataPlaneAcceptWake(_ descriptor: Int32) {
+        lock.withLock { acceptWakeSignalled = true }
+        acceptRelease.signal()
+    }
+    func closeHostDataPlaneAcceptWake(_ descriptor: Int32) {}
+    func releaseAcceptForCleanup() { acceptRelease.signal() }
 }
 
 private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls, HostDataPlaneDescriptorInterrupting, @unchecked Sendable {
@@ -2619,17 +3070,25 @@ private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocket
     private let lock = NSLock()
     private let observe: @Sendable (String) -> Void
     private let blockSubscriptionAccepted: Bool
+    private let blockTreeDelta: Bool
     private let subscriptionAcceptedRelease = DispatchSemaphore(value: 0)
+    private let treeDeltaRelease = DispatchSemaphore(value: 0)
     private var listenerDescriptor: Int32?
     private var clientDescriptors: Set<Int32> = []
     private var blockedSubscriptionAccepted = false
     private var didBlockSubscriptionAccepted = false
+    private var blockedTreeDelta = false
+    private var didBlockTreeDelta = false
+    private var cancelledBlockedTreeDeltaTask = false
+    private var clientInterrupts = 0
 
     init(
         blockSubscriptionAccepted: Bool = false,
+        blockTreeDelta: Bool = false,
         observe: @escaping @Sendable (String) -> Void
     ) {
         self.blockSubscriptionAccepted = blockSubscriptionAccepted
+        self.blockTreeDelta = blockTreeDelta
         self.observe = observe
     }
 
@@ -2639,6 +3098,16 @@ private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocket
 
     func releaseSubscriptionAcceptedWrite() {
         subscriptionAcceptedRelease.signal()
+    }
+
+    var treeDeltaWriteBlocked: Bool { lock.withLock { blockedTreeDelta } }
+    var blockedTreeDeltaTaskCancelled: Bool {
+        lock.withLock { cancelledBlockedTreeDeltaTask }
+    }
+    var clientInterruptCount: Int { lock.withLock { clientInterrupts } }
+
+    func releaseTreeDeltaWriteForCleanup() {
+        treeDeltaRelease.signal()
     }
 
     func effectiveUserID() -> uid_t { base.effectiveUserID() }
@@ -2684,7 +3153,29 @@ private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocket
         try base.read(descriptor, into: buffer)
     }
     func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int {
+        let blocksTreeDelta = lock.withLock { () -> Bool in
+            guard blockTreeDelta,
+                  !didBlockTreeDelta,
+                  clientDescriptors.contains(descriptor),
+                  isTreeDeltaFrame(Data(buffer)) else {
+                return false
+            }
+            didBlockTreeDelta = true
+            blockedTreeDelta = true
+            return true
+        }
+        if blocksTreeDelta {
+            while treeDeltaRelease.wait(timeout: .now() + .milliseconds(10)) == .timedOut {
+                if withUnsafeCurrentTask(body: { $0?.isCancelled == true }) {
+                    lock.withLock { cancelledBlockedTreeDeltaTask = true }
+                }
+            }
+            if withUnsafeCurrentTask(body: { $0?.isCancelled == true }) {
+                lock.withLock { cancelledBlockedTreeDeltaTask = true }
+            }
+        }
         let written = try base.write(descriptor, from: buffer)
+        if isTreeCancelledFrame(Data(buffer)) { observe("tree-cancelled-write") }
         let blocks = lock.withLock { () -> Bool in
             guard blockSubscriptionAccepted,
                   !didBlockSubscriptionAccepted,
@@ -2701,7 +3192,13 @@ private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocket
         return written
     }
     func interruptHostDataPlaneDescriptor(_ descriptor: Int32) {
+        let isClient = lock.withLock { () -> Bool in
+            guard clientDescriptors.contains(descriptor) else { return false }
+            clientInterrupts += 1
+            return true
+        }
         base.interruptHostDataPlaneDescriptor(descriptor)
+        if isClient { treeDeltaRelease.signal() }
     }
 
     private func isSubscriptionAcceptedFrame(_ data: Data) -> Bool {
@@ -2710,6 +3207,29 @@ private final class RecordingDarwinUnixDomainSocketSystemCalls: UnixDomainSocket
               frames.count == 1,
               case let .fileTree(envelope) = try? HostDataPlaneMessages.decodeEnvelope(frames[0]),
               case .subscriptionAccepted? = envelope.payload else {
+            return false
+        }
+        return true
+    }
+
+
+    private func isTreeDeltaFrame(_ data: Data) -> Bool {
+        var decoder = FrameDecoder()
+        guard let frames = try? decoder.append(data),
+              frames.count == 1,
+              case let .fileTree(envelope) = try? HostDataPlaneMessages.decodeEnvelope(frames[0]),
+              case .deltaEvent? = envelope.payload else {
+            return false
+        }
+        return true
+    }
+
+    private func isTreeCancelledFrame(_ data: Data) -> Bool {
+        var decoder = FrameDecoder()
+        guard let frames = try? decoder.append(data),
+              frames.count == 1,
+              case let .fileTree(envelope) = try? HostDataPlaneMessages.decodeEnvelope(frames[0]),
+              case .cancelled? = envelope.payload else {
             return false
         }
         return true
@@ -3469,6 +3989,11 @@ private final class RawHostDataPlanePeer {
             &value,
             socklen_t(MemoryLayout.size(ofValue: value))
         ) == 0 else {
+            throw POSIXError(.init(rawValue: errno)!)
+        }
+    }
+    func halfCloseWrites() throws {
+        guard Darwin.shutdown(descriptor, SHUT_WR) == 0 else {
             throw POSIXError(.init(rawValue: errno)!)
         }
     }

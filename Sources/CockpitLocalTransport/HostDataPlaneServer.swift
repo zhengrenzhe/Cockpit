@@ -30,7 +30,12 @@ struct HostDataPlaneSubscriptionLivenessState: Sendable {
 public final class HostDataPlaneServer: @unchecked Sendable {
     private enum State {
         case idle
-        case ready(listener: HostDataPlaneDescriptorOwner, path: String, identity: UnixSocketPathStatus)
+        case ready(
+            listener: HostDataPlaneDescriptorOwner,
+            acceptController: HostDataPlaneAcceptController,
+            path: String,
+            identity: UnixSocketPathStatus
+        )
         case stopped
     }
 
@@ -135,6 +140,7 @@ public final class HostDataPlaneServer: @unchecked Sendable {
 
         let descriptor = try systemCalls.createStreamSocket()
         var cleanupIdentity: UnixSocketPathStatus?
+        var acceptController: HostDataPlaneAcceptController?
         do {
             try systemCalls.setCloseOnExec(descriptor)
             try systemCalls.setNoSigPipe(descriptor)
@@ -154,9 +160,19 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             else { throw UnixDomainSocketError.permissionMismatch }
             cleanupIdentity = identity
             try systemCalls.listen(descriptor, backlog: 32)
+            let controller = try HostDataPlaneAcceptController(systemCalls: systemCalls)
+            acceptController = controller
             let listener = HostDataPlaneDescriptorOwner(descriptor, calls: systemCalls)
-            lock.withLock { state = .ready(listener: listener, path: path, identity: identity) }
+            lock.withLock {
+                state = .ready(
+                    listener: listener,
+                    acceptController: controller,
+                    path: path,
+                    identity: identity
+                )
+            }
         } catch {
+            acceptController?.close()
             systemCalls.close(descriptor)
             if let cleanupIdentity,
                let current = try? systemCalls.pathStatus(path),
@@ -168,10 +184,17 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             }
             throw error
         }
+        guard let acceptController else {
+            preconditionFailure("accept controller was not retained after successful startup")
+        }
         workers.enter()
-        acceptQueue.async { [weak self] in
+        acceptQueue.async { [weak self, acceptController] in
             defer { self?.workers.leave() }
-            self?.acceptLoop(descriptor: descriptor, uid: uid)
+            self?.acceptLoop(
+                descriptor: descriptor,
+                acceptController: acceptController,
+                uid: uid
+            )
         }
     }
 
@@ -184,7 +207,7 @@ public final class HostDataPlaneServer: @unchecked Sendable {
     func readySocketPath() async throws -> String {
         try await waitUntilReady()
         return try lock.withLock {
-            guard case let .ready(_, path, _) = state else {
+            guard case let .ready(_, _, path, _) = state else {
                 throw HostDataPlaneTicketIssueError.serverNotReady
             }
             return path
@@ -192,39 +215,43 @@ public final class HostDataPlaneServer: @unchecked Sendable {
     }
 
     public func shutdown() async {
-        let snapshot = lock.withLock { () -> (HostDataPlaneDescriptorOwner, String, UnixSocketPathStatus, [HostDataPlaneServerConnection])? in
-            guard case let .ready(listener, path, identity) = state else {
+        let snapshot = lock.withLock { () -> (HostDataPlaneDescriptorOwner, HostDataPlaneAcceptController, String, UnixSocketPathStatus, [HostDataPlaneServerConnection])? in
+            guard case let .ready(listener, acceptController, path, identity) = state else {
                 state = .stopped
                 return nil
             }
             state = .stopped
             let clients = Array(connections.values)
             connections.removeAll()
-            return (listener, path, identity, clients)
+            return (listener, acceptController, path, identity, clients)
         }
         guard let snapshot else { return }
-        wakeAcceptLoop(path: snapshot.1)
-        for client in snapshot.3 { client.beginShutdownClose() }
-        for client in snapshot.3 { await client.cancelSubscriptionsForShutdown() }
+        snapshot.1.signal()
+        for client in snapshot.4 { client.beginShutdownClose() }
         await withCheckedContinuation { continuation in
             workers.notify(queue: .global()) { continuation.resume() }
         }
+        for client in snapshot.4 { await client.cancelSubscriptionsForShutdown() }
+        snapshot.1.close()
         snapshot.0.close()
-        if let current = try? systemCalls.pathStatus(snapshot.1), current == snapshot.2 {
-            try? systemCalls.unlink(snapshot.1)
+        if let current = try? systemCalls.pathStatus(snapshot.2), current == snapshot.3 {
+            try? systemCalls.unlink(snapshot.2)
         }
     }
 
-    private func wakeAcceptLoop(path: String) {
-        guard let descriptor = try? systemCalls.createStreamSocket() else { return }
-        defer { systemCalls.close(descriptor) }
-        try? systemCalls.setCloseOnExec(descriptor)
-        try? systemCalls.setNoSigPipe(descriptor)
-        try? systemCalls.connect(descriptor, to: UnixDomainSocketAddress(path: path))
-    }
-
-    private func acceptLoop(descriptor: Int32, uid: uid_t) {
+    private func acceptLoop(
+        descriptor: Int32,
+        acceptController: HostDataPlaneAcceptController,
+        uid: uid_t
+    ) {
         while true {
+            do {
+                guard try acceptController.wait(listener: descriptor) == .listenerReady else {
+                    return
+                }
+            } catch {
+                return
+            }
             let accepted: Int32
             do { accepted = try systemCalls.accept(descriptor) }
             catch { return }
@@ -321,7 +348,10 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
         }
     }
 
-    func closeAfterWorkerExit() { descriptorOwner.close() }
+    func closeAfterWorkerExit() {
+        descriptorOwner.interrupt()
+        descriptorOwner.close()
+    }
 
     func run() async {
         defer {
@@ -600,7 +630,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                     return acknowledgementWaiters.removeValue(forKey: value.eventID)
                 }
                 guard let waiter else {
-                    cancelSubscription(value.subscriptionID)
+                    await cancelSubscription(value.subscriptionID)
                     throw HostDataPlaneServerProtocolError(.treeBackpressure)
                 }
                 waiter.continuation.resume()
@@ -609,7 +639,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
                 try send(channel: .fileTreeEvents, acknowledgement: incomingSequence, payload: response.serializedData())
             case let .cancelRequest(value):
                 guard reserve(envelope.requestID) else { throw HostDataPlaneServerProtocolError(.requestIDReuse) }
-                cancelSubscription(value.subscriptionID)
+                await cancelSubscription(value.subscriptionID)
                 var cancelled = CPFileTreeCancelled(); cancelled.subscriptionID = value.subscriptionID
                 var response = CPFileTreeEnvelope(); response.requestID = envelope.requestID; response.binding = envelope.binding; response.cancelled = cancelled
                 try send(channel: .fileTreeEvents, acknowledgement: incomingSequence, payload: response.serializedData())
@@ -739,7 +769,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
             }
         }
     }
-    private func cancelSubscription(_ subscriptionID: String) {
+    private func cancelSubscription(_ subscriptionID: String) async {
         let snapshot = lock.withLock { () -> (Task<Void, Never>?, [CheckedContinuation<Void, any Error>]) in
             let task = subscriptionTasks.removeValue(forKey: subscriptionID)
             subscriptionLiveness.cancel(subscriptionID)
@@ -753,6 +783,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
         snapshot.1.forEach {
             $0.resume(throwing: HostDataPlaneClientError.requestCancelled)
         }
+        await snapshot.0?.value
     }
     private func cancelSubscriptions() -> [Task<Void, Never>] {
         let snapshot = lock.withLock { () -> ([Task<Void, Never>], [CheckedContinuation<Void, any Error>]) in

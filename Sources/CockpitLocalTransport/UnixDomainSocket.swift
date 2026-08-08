@@ -90,11 +90,79 @@ protocol HostDataPlaneDescriptorInterrupting: Sendable {
     func interruptHostDataPlaneDescriptor(_ descriptor: Int32)
 }
 
+enum HostDataPlaneAcceptWaitResult: Equatable, Sendable {
+    case listenerReady
+    case wake
+}
+
+protocol HostDataPlaneAcceptPolling: Sendable {
+    func makeHostDataPlaneAcceptWakePair() throws -> (read: Int32, write: Int32)
+    func waitForHostDataPlaneAccept(
+        listener: Int32,
+        wake: Int32
+    ) throws -> HostDataPlaneAcceptWaitResult
+    func signalHostDataPlaneAcceptWake(_ descriptor: Int32)
+    func closeHostDataPlaneAcceptWake(_ descriptor: Int32)
+}
+
+final class HostDataPlaneAcceptController: @unchecked Sendable {
+    private let lock = NSLock()
+    private let polling: any HostDataPlaneAcceptPolling
+    private var wakeRead: Int32?
+    private var wakeWrite: Int32?
+    private var signalled = false
+
+    init(systemCalls: any UnixDomainSocketSystemCalls) throws {
+        polling = (systemCalls as? any HostDataPlaneAcceptPolling)
+            ?? DarwinUnixDomainSocketSystemCalls()
+        let pair = try polling.makeHostDataPlaneAcceptWakePair()
+        wakeRead = pair.read
+        wakeWrite = pair.write
+    }
+
+    func wait(listener: Int32) throws -> HostDataPlaneAcceptWaitResult {
+        let wake = try lock.withLock { () throws -> Int32 in
+            guard let wakeRead else {
+                throw UnixDomainSocketError.systemCall(function: "poll", errno: EBADF)
+            }
+            return wakeRead
+        }
+        return try polling.waitForHostDataPlaneAccept(listener: listener, wake: wake)
+    }
+
+    func signal() {
+        let descriptor = lock.withLock { () -> Int32? in
+            guard !signalled, let wakeWrite else { return nil }
+            signalled = true
+            return wakeWrite
+        }
+        if let descriptor {
+            polling.signalHostDataPlaneAcceptWake(descriptor)
+        }
+    }
+
+    func close() {
+        let descriptors = lock.withLock { () -> (Int32?, Int32?) in
+            let descriptors = (wakeRead, wakeWrite)
+            wakeRead = nil
+            wakeWrite = nil
+            return descriptors
+        }
+        if let read = descriptors.0 {
+            polling.closeHostDataPlaneAcceptWake(read)
+        }
+        if let write = descriptors.1, write != descriptors.0 {
+            polling.closeHostDataPlaneAcceptWake(write)
+        }
+    }
+}
+
 final class HostDataPlaneDescriptorOwner: @unchecked Sendable {
     private let condition = NSCondition()
     private let calls: any UnixDomainSocketSystemCalls
     private var value: Int32?
     private var acceptsOperations = true
+    private var interrupted = false
     private var activeOperations = 0
 
     init(_ value: Int32, calls: any UnixDomainSocketSystemCalls) {
@@ -126,11 +194,12 @@ final class HostDataPlaneDescriptorOwner: @unchecked Sendable {
     @discardableResult
     func interrupt() -> Bool {
         condition.lock()
-        guard acceptsOperations, let descriptor = value else {
+        guard !interrupted, let descriptor = value else {
             condition.unlock()
             return false
         }
         acceptsOperations = false
+        interrupted = true
         if let interrupting = calls as? any HostDataPlaneDescriptorInterrupting {
             interrupting.interruptHostDataPlaneDescriptor(descriptor)
         } else {
@@ -307,5 +376,54 @@ public struct DarwinUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls {
 extension DarwinUnixDomainSocketSystemCalls: HostDataPlaneDescriptorInterrupting {
     func interruptHostDataPlaneDescriptor(_ descriptor: Int32) {
         _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+    }
+}
+
+extension DarwinUnixDomainSocketSystemCalls: HostDataPlaneAcceptPolling {
+    func makeHostDataPlaneAcceptWakePair() throws -> (read: Int32, write: Int32) {
+        var descriptors: [Int32] = [-1, -1]
+        guard Darwin.pipe(&descriptors) == 0 else {
+            throw UnixDomainSocketError.systemCall(function: "pipe", errno: errno)
+        }
+        do {
+            guard fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) == 0,
+                  fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) == 0 else {
+                throw UnixDomainSocketError.systemCall(function: "fcntl", errno: errno)
+            }
+        } catch {
+            Darwin.close(descriptors[0])
+            Darwin.close(descriptors[1])
+            throw error
+        }
+        return (descriptors[0], descriptors[1])
+    }
+
+    func waitForHostDataPlaneAccept(
+        listener: Int32,
+        wake: Int32
+    ) throws -> HostDataPlaneAcceptWaitResult {
+        var descriptors = [
+            pollfd(fd: listener, events: Int16(POLLIN), revents: 0),
+            pollfd(fd: wake, events: Int16(POLLIN), revents: 0),
+        ]
+        while true {
+            let result = Darwin.poll(&descriptors, nfds_t(descriptors.count), -1)
+            if result < 0, errno == EINTR { continue }
+            guard result >= 0 else {
+                throw UnixDomainSocketError.systemCall(function: "poll", errno: errno)
+            }
+            if descriptors[1].revents != 0 { return .wake }
+            if descriptors[0].revents & Int16(POLLIN) != 0 { return .listenerReady }
+            throw UnixDomainSocketError.systemCall(function: "poll", errno: EBADF)
+        }
+    }
+
+    func signalHostDataPlaneAcceptWake(_ descriptor: Int32) {
+        var byte: UInt8 = 1
+        while Darwin.write(descriptor, &byte, 1) < 0, errno == EINTR {}
+    }
+
+    func closeHostDataPlaneAcceptWake(_ descriptor: Int32) {
+        Darwin.close(descriptor)
     }
 }

@@ -62,6 +62,7 @@ public actor HostDataPlaneClient: DocumentDataTransport, FileTreeDataTransport {
         let id: UUID
         let bootstrap: HostDataPlaneClientBootstrap
         let task: Task<HostDataPlaneClientConnection, Error>
+        var waiters: [UUID: CheckedContinuation<Void, any Error>]
     }
 
     private let binding: HostDataPlaneBinding
@@ -83,12 +84,36 @@ public actor HostDataPlaneClient: DocumentDataTransport, FileTreeDataTransport {
     }
 
     public func connect() async throws {
+        guard !Task.isCancelled else {
+            throw HostDataPlaneClientError.requestCancelled
+        }
         if let connection, !connection.isClosed { return }
         connection = nil
-        if let attempt = connectionAttempt {
-            try await finishConnectionAttempt(attempt)
-            return
+        let attemptID = try connectionAttempt?.id ?? startConnectionAttempt()
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                registerConnectionWaiter(
+                    attemptID: attemptID,
+                    waiterID: waiterID,
+                    alreadyCancelled: withUnsafeCurrentTask { $0?.isCancelled == true },
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task {
+                await self.cancelConnectionWaiter(
+                    attemptID: attemptID,
+                    waiterID: waiterID
+                )
+            }
         }
+        guard !Task.isCancelled else {
+            throw HostDataPlaneClientError.requestCancelled
+        }
+    }
+
+    private func startConnectionAttempt() throws -> UUID {
         let context = try requestContext()
         let bootstrap = HostDataPlaneClientBootstrap()
         let id = UUID()
@@ -140,35 +165,101 @@ public actor HostDataPlaneClient: DocumentDataTransport, FileTreeDataTransport {
                 throw normalizeConnectionError(error)
             }
         }
-        let attempt = ConnectionAttempt(id: id, bootstrap: bootstrap, task: task)
-        connectionAttempt = attempt
-        try await finishConnectionAttempt(attempt)
+        connectionAttempt = ConnectionAttempt(
+            id: id,
+            bootstrap: bootstrap,
+            task: task,
+            waiters: [:]
+        )
+        Task { [task] in
+            await completeConnectionAttempt(id: id, result: await task.result)
+        }
+        return id
     }
 
-    private func finishConnectionAttempt(_ attempt: ConnectionAttempt) async throws {
-        do {
-            let established = try await attempt.task.value
-            if connectionAttempt?.id == attempt.id {
+    private func registerConnectionWaiter(
+        attemptID: UUID,
+        waiterID: UUID,
+        alreadyCancelled: Bool,
+        continuation: CheckedContinuation<Void, any Error>
+    ) {
+        guard var attempt = connectionAttempt, attempt.id == attemptID else {
+            if let connection, !connection.isClosed, !alreadyCancelled {
+                continuation.resume()
+            } else {
+                continuation.resume(
+                    throwing: alreadyCancelled
+                        ? HostDataPlaneClientError.requestCancelled
+                        : HostDataPlaneClientError.disconnected
+                )
+            }
+            return
+        }
+        guard !alreadyCancelled else {
+            continuation.resume(throwing: HostDataPlaneClientError.requestCancelled)
+            if attempt.waiters.isEmpty {
                 connectionAttempt = nil
-                if connection == nil || connection?.isClosed == true {
-                    connection = established
-                    established.start()
-                }
-                return
+                attempt.bootstrap.cancel()
+                attempt.task.cancel()
             }
-            guard connection === established, !established.isClosed else {
+            return
+        }
+        attempt.waiters[waiterID] = continuation
+        connectionAttempt = attempt
+    }
+
+    private func cancelConnectionWaiter(attemptID: UUID, waiterID: UUID) {
+        guard var attempt = connectionAttempt,
+              attempt.id == attemptID,
+              let continuation = attempt.waiters.removeValue(forKey: waiterID) else {
+            return
+        }
+        continuation.resume(throwing: HostDataPlaneClientError.requestCancelled)
+        if attempt.waiters.isEmpty {
+            connectionAttempt = nil
+            attempt.bootstrap.cancel()
+            attempt.task.cancel()
+        } else {
+            connectionAttempt = attempt
+        }
+    }
+
+    private func completeConnectionAttempt(
+        id: UUID,
+        result: Result<HostDataPlaneClientConnection, any Error>
+    ) async {
+        guard let attempt = connectionAttempt, attempt.id == id else {
+            if case let .success(established) = result {
                 await established.shutdown()
-                throw HostDataPlaneClientError.disconnected
             }
-        } catch {
-            if connectionAttempt?.id == attempt.id { connectionAttempt = nil }
-            throw normalizeConnectionError(error)
+            return
+        }
+        connectionAttempt = nil
+        switch result {
+        case let .success(established):
+            if connection == nil || connection?.isClosed == true {
+                connection = established
+                established.start()
+            } else if connection !== established {
+                await established.shutdown()
+            }
+            for continuation in attempt.waiters.values {
+                continuation.resume()
+            }
+        case let .failure(error):
+            for continuation in attempt.waiters.values {
+                continuation.resume(throwing: normalizeConnectionError(error))
+            }
         }
     }
 
     public func disconnect() async {
         let attempt = connectionAttempt
         connectionAttempt = nil
+        let waiters = attempt.map { Array($0.waiters.values) } ?? []
+        for continuation in waiters {
+            continuation.resume(throwing: HostDataPlaneClientError.disconnected)
+        }
         attempt?.bootstrap.cancel()
         attempt?.task.cancel()
         let current = connection
@@ -422,8 +513,31 @@ public actor HostDataPlaneClient: DocumentDataTransport, FileTreeDataTransport {
 private struct HostDataPlaneResponseValidationError: Error {}
 private struct HostDataPlaneOutgoingSequenceOverflowError: Error {}
 
+struct HostDataPlaneTreeOwnerPublicationState: Sendable {
+    private(set) var cancelled = false
+
+    mutating func cancel() {
+        cancelled = true
+    }
+
+    mutating func publish(_ owner: HostDataPlaneDescriptorOwner) -> Bool {
+        guard !cancelled else {
+            owner.close()
+            return false
+        }
+        return true
+    }
+}
+
+enum HostDataPlaneUnaryRegistrationDisposition: Equatable {
+    case register
+    case cancelAndRetire
+    case requestIDReuse
+}
+
 struct HostDataPlaneUnaryCancellationState<Key: Hashable & Sendable>: Sendable {
     private var cancelledBeforeRegistration: Set<Key> = []
+    private var retiredRequestIDs: Set<String> = []
 
     mutating func recordBeforeRegistration(_ key: Key, requestIDWasUsed: Bool) -> Bool {
         guard !requestIDWasUsed else { return false }
@@ -434,8 +548,35 @@ struct HostDataPlaneUnaryCancellationState<Key: Hashable & Sendable>: Sendable {
         cancelledBeforeRegistration.remove(key) != nil
     }
 
+    mutating func registrationDisposition(
+        for key: Key,
+        requestID: String,
+        alreadyCancelled: Bool
+    ) -> HostDataPlaneUnaryRegistrationDisposition {
+        if alreadyCancelled {
+            _ = cancelledBeforeRegistration.remove(key)
+            guard retiredRequestIDs.insert(requestID).inserted else {
+                return .requestIDReuse
+            }
+            return .cancelAndRetire
+        }
+        if consumeBeforeRegistration(key) {
+            _ = retiredRequestIDs.insert(requestID)
+            return .cancelAndRetire
+        }
+        guard retiredRequestIDs.insert(requestID).inserted else {
+            return .requestIDReuse
+        }
+        return .register
+    }
+
+    func requestIDWasRetired(_ requestID: String) -> Bool {
+        retiredRequestIDs.contains(requestID)
+    }
+
     mutating func removeAll() {
         cancelledBeforeRegistration.removeAll()
+        retiredRequestIDs.removeAll()
     }
 }
 
@@ -561,7 +702,6 @@ final class HostDataPlaneClientConnection: @unchecked Sendable {
     private var closed = false
     private var pending: [PendingKey: PendingRequest] = [:]
     private var cancellationState = HostDataPlaneUnaryCancellationState<PendingKey>()
-    private var usedRequestIDs: Set<String> = []
     private var sequences: HostDataPlaneClientSequenceState
 
     init(
@@ -623,10 +763,6 @@ final class HostDataPlaneClientConnection: @unchecked Sendable {
         cancelled: Bool,
         continuation: CheckedContinuation<Frame, any Error>
     ) {
-        guard !cancelled else {
-            continuation.resume(throwing: HostDataPlaneClientError.requestCancelled)
-            return
-        }
         var registered = false
         var preRegistrationCancellation = false
         do {
@@ -635,12 +771,17 @@ final class HostDataPlaneClientConnection: @unchecked Sendable {
                     guard !closed else {
                         throw HostDataPlaneClientError.disconnected
                     }
-                    if cancellationState.consumeBeforeRegistration(key) {
-                        _ = usedRequestIDs.insert(key.requestID)
+                    switch cancellationState.registrationDisposition(
+                        for: key,
+                        requestID: key.requestID,
+                        alreadyCancelled: cancelled
+                    ) {
+                    case .cancelAndRetire:
                         return nil
-                    }
-                    guard usedRequestIDs.insert(key.requestID).inserted else {
+                    case .requestIDReuse:
                         throw HostDataPlaneClientError.disconnected
+                    case .register:
+                        break
                     }
                     guard case let .value(sequence, acknowledgement) = sequences.reserveOutgoing(
                         channel: channel.rawValue
@@ -688,12 +829,10 @@ final class HostDataPlaneClientConnection: @unchecked Sendable {
         let continuation = lock.withLock { () -> CheckedContinuation<Frame, any Error>? in
             guard !closed else { return nil }
             guard var request = pending[key] else {
-                if !usedRequestIDs.contains(key.requestID) {
-                    _ = cancellationState.recordBeforeRegistration(
-                        key,
-                        requestIDWasUsed: false
-                    )
-                }
+                _ = cancellationState.recordBeforeRegistration(
+                    key,
+                    requestIDWasUsed: cancellationState.requestIDWasRetired(key.requestID)
+                )
                 return nil
             }
             guard let continuation = request.continuation else { return nil }
@@ -830,11 +969,11 @@ private func authenticateHostDataPlaneClient(
     }
 }
 
-private actor HostDataPlaneTreeStream {
+actor HostDataPlaneTreeStream {
     private struct CancelWaiter {
         let requestID: String
         let subscriptionID: String
-        let continuation: CheckedContinuation<Void, Never>
+        var continuation: CheckedContinuation<Void, Never>?
     }
 
     private let binding: HostDataPlaneBinding
@@ -853,6 +992,8 @@ private actor HostDataPlaneTreeStream {
     private var established = false
     private var cancelled = false
     private var cancelWaiter: CancelWaiter?
+    private var ownerPublication = HostDataPlaneTreeOwnerPublicationState()
+    private var readerActive = false
 
     init(binding: HostDataPlaneBinding, xpcClient: HostXPCClient, systemCalls: any UnixDomainSocketSystemCalls, after: UInt64, expandedDirectories: Set<WorkspaceDirectory>) {
         self.binding = binding; self.xpcClient = xpcClient; calls = systemCalls; self.after = after
@@ -930,6 +1071,7 @@ private actor HostDataPlaneTreeStream {
     func cancel() async {
         guard !cancelled else { return }
         cancelled = true
+        ownerPublication.cancel()
         startup?.cancel()
         guard descriptorOwner != nil, let subscriptionID else {
             closeConnection()
@@ -942,18 +1084,35 @@ private actor HostDataPlaneTreeStream {
         envelope.requestID = requestID
         envelope.binding = try! HostDataPlaneMessages.encode(binding)
         envelope.cancelRequest = request
-        await withCheckedContinuation { continuation in
-            cancelWaiter = CancelWaiter(
-                requestID: requestID,
-                subscriptionID: subscriptionID,
-                continuation: continuation
-            )
+        cancelWaiter = CancelWaiter(
+            requestID: requestID,
+            subscriptionID: subscriptionID,
+            continuation: nil
+        )
+        do {
+            try send(envelope)
+        } catch {
+            abandonCancellationWaiter()
+            closeConnection()
+            return
+        }
+        if readerActive {
+            await withCheckedContinuation { continuation in
+                guard var waiter = cancelWaiter else {
+                    continuation.resume()
+                    return
+                }
+                waiter.continuation = continuation
+                cancelWaiter = waiter
+            }
+        } else {
             do {
-                try send(envelope)
+                while cancelWaiter != nil {
+                    let response = try await receive()
+                    _ = try completeCancellationIfMatched(response)
+                }
             } catch {
-                let waiter = cancelWaiter
-                cancelWaiter = nil
-                waiter?.continuation.resume()
+                abandonCancellationWaiter()
             }
         }
         closeConnection()
@@ -964,11 +1123,17 @@ private actor HostDataPlaneTreeStream {
         let ticket: CPHostDataPlaneTicketResponse
         do {
             ticket = try await xpcClient.issueHostDataPlaneTicket(context: context)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw HostDataPlaneClientError.disconnected
         }
+        try Task.checkCancellation()
         let fd = try calls.createStreamSocket()
         let owner = HostDataPlaneDescriptorOwner(fd, calls: calls)
+        guard ownerPublication.publish(owner) else {
+            throw CancellationError()
+        }
         descriptorOwner = owner
         do {
             try owner.withDescriptor { descriptor in
@@ -1119,6 +1284,11 @@ private actor HostDataPlaneTreeStream {
         guard let descriptorOwner else {
             throw HostDataPlaneClientError.disconnected
         }
+        guard !readerActive else {
+            throw HostDataPlaneResponseValidationError()
+        }
+        readerActive = true
+        defer { readerActive = false }
         let frame: Frame
         do {
             frame = try await readFrameAsync(calls, descriptorOwner, queue: readQueue)
@@ -1148,8 +1318,14 @@ private actor HostDataPlaneTreeStream {
             throw HostDataPlaneResponseValidationError()
         }
         cancelWaiter = nil
-        waiter.continuation.resume()
+        waiter.continuation?.resume()
         return true
+    }
+
+    private func abandonCancellationWaiter() {
+        let waiter = cancelWaiter
+        cancelWaiter = nil
+        waiter?.continuation?.resume()
     }
 
     private func closeConnection() {
@@ -1161,10 +1337,7 @@ private actor HostDataPlaneTreeStream {
         startup = nil
         subscriptionID = nil
         pendingEvent = nil
-        if let waiter = cancelWaiter {
-            cancelWaiter = nil
-            waiter.continuation.resume()
-        }
+        abandonCancellationWaiter()
     }
 }
 
