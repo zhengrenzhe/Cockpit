@@ -210,13 +210,14 @@ public final class HostDataPlaneServer: @unchecked Sendable {
         }
     }
 
-    func readySocketPath() async throws -> String {
-        try await waitUntilReady()
-        return try lock.withLock {
+    func deliverTicketWhileReady(
+        _ deliver: (String) throws -> Void
+    ) throws {
+        try lock.withLock {
             guard case let .ready(_, _, path, _) = state else {
                 throw HostDataPlaneTicketIssueError.serverNotReady
             }
-            return path
+            try deliver(path)
         }
     }
 

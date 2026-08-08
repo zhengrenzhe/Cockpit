@@ -228,11 +228,13 @@ public actor HostDataPlaneTicketIssuer {
             activeContextGeneration: validatedContext.activeContextGeneration
         )
         let ticket = try await store.issue(binding: binding, expectedPeerUID: effectiveUserID)
-        var response = CPHostDataPlaneTicketResponse()
-        response.socketPath = try await server.readySocketPath()
-        response.ticket = ticket.wireValue
-        response.validForMilliseconds = ticket.validForMilliseconds
-        try deliver(response)
+        try server.deliverTicketWhileReady { socketPath in
+            var response = CPHostDataPlaneTicketResponse()
+            response.socketPath = socketPath
+            response.ticket = ticket.wireValue
+            response.validForMilliseconds = ticket.validForMilliseconds
+            try deliver(response)
+        }
     }
 
     public func stopIssuingTickets() async {

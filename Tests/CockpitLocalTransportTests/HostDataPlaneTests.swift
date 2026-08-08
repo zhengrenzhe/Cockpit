@@ -541,6 +541,86 @@ import CockpitTypes
     ])
 }
 
+@Test func hostDataPlaneTicketDeliveryLinearizesWithTerminalAcceptTransition() async throws {
+    let fixture = try HostDataPlaneFixture()
+    let calls = ScriptedUnixDomainSocketSystemCalls(uid: 501)
+    calls.seedSafeDirectories(namespace: "ticket-terminal")
+    calls.acceptErrors = [
+        .systemCall(function: "accept", errno: EBADF),
+    ]
+    calls.blockAcceptWhenEmpty = true
+    let server = HostDataPlaneServer(
+        namespace: "ticket-terminal",
+        service: fixture.service,
+        ticketStore: fixture.ticketStore,
+        systemCalls: calls,
+        peerCredentials: FixedPeerCredentialReader(uid: 501)
+    )
+    try await server.start()
+    try await eventually { calls.acceptEntered }
+
+    let issuer = HostDataPlaneTicketIssuer(
+        server: server,
+        store: fixture.ticketStore,
+        effectiveUserID: 501
+    )
+    let deliveryEntered = DispatchSemaphore(value: 0)
+    let releaseDelivery = DispatchSemaphore(value: 0)
+    let terminalObserved = DispatchSemaphore(value: 0)
+    let order = LockedHostDataPlaneBox<[String]>([])
+    let deliveries = LockedHostDataPlaneBox(0)
+    let issue = Task { () -> Bool in
+        do {
+            try await issuer.issue(for: fixture.requestContext) { _ in
+                deliveryEntered.signal()
+                releaseDelivery.wait()
+                deliveries.withValue { $0 += 1 }
+                order.withValue { $0.append("deliver") }
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+    let deliveryGateEntered = await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: deliveryEntered.wait(timeout: .now() + 2))
+        }
+    }
+    #expect(deliveryGateEntered == .success)
+
+    let terminal = Task {
+        let observed = await hostDataPlaneWaitUntilNotReady(server)
+        if observed {
+            order.withValue { $0.append("terminal") }
+            terminalObserved.signal()
+        }
+        return observed
+    }
+    calls.releaseAcceptForCleanup()
+    let terminalBeforeDelivery = await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: terminalObserved.wait(timeout: .now() + .milliseconds(250)))
+        }
+    }
+
+    releaseDelivery.signal()
+    let issueSucceeded = await issue.value
+    let terminalCommitted = await terminal.value
+    await issuer.stopIssuingTickets()
+    await server.shutdown()
+
+    #expect(terminalBeforeDelivery == .timedOut)
+    #expect(issueSucceeded)
+    #expect(terminalCommitted)
+    #expect(deliveries.value == 1)
+    #expect(order.value == ["deliver", "terminal"])
+    #expect(calls.closedDescriptors.filter { $0 == 41 }.count == 1)
+    #expect(calls.unlinkedPaths == [
+        "/private/tmp/cockpit.501/host/ticket-terminal/host.sock",
+    ])
+}
+
 @Test func hostDataPlaneServerJoinsNamedTreeTaskBeforeCancelledReply() async throws {
     let cancellationEntered = LockedHostDataPlaneBox(false)
     let cancellationRelease = DispatchSemaphore(value: 0)
