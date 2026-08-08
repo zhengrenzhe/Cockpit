@@ -86,26 +86,74 @@ public protocol UnixDomainSocketSystemCalls: Sendable {
     func write(_ descriptor: Int32, from buffer: UnsafeRawBufferPointer) throws -> Int
 }
 
+protocol HostDataPlaneDescriptorInterrupting: Sendable {
+    func interruptHostDataPlaneDescriptor(_ descriptor: Int32)
+}
+
 final class HostDataPlaneDescriptorOwner: @unchecked Sendable {
-    private let lock = NSLock()
+    private let condition = NSCondition()
     private let calls: any UnixDomainSocketSystemCalls
     private var value: Int32?
+    private var acceptsOperations = true
+    private var activeOperations = 0
 
     init(_ value: Int32, calls: any UnixDomainSocketSystemCalls) {
         self.value = value
         self.calls = calls
     }
 
-    var descriptor: Int32? { lock.withLock { value } }
+    var descriptor: Int32? {
+        condition.withLock { acceptsOperations ? value : nil }
+    }
+
+    func withDescriptor<Result>(_ operation: (Int32) throws -> Result) throws -> Result {
+        let descriptor = try condition.withLock { () throws -> Int32 in
+            guard acceptsOperations, let value else {
+                throw HostDataPlaneClientError.disconnected
+            }
+            activeOperations += 1
+            return value
+        }
+        defer {
+            condition.withLock {
+                activeOperations -= 1
+                if activeOperations == 0 { condition.broadcast() }
+            }
+        }
+        return try operation(descriptor)
+    }
+
+    @discardableResult
+    func interrupt() -> Bool {
+        condition.lock()
+        guard acceptsOperations, let descriptor = value else {
+            condition.unlock()
+            return false
+        }
+        acceptsOperations = false
+        if let interrupting = calls as? any HostDataPlaneDescriptorInterrupting {
+            interrupting.interruptHostDataPlaneDescriptor(descriptor)
+        } else {
+            _ = Darwin.shutdown(descriptor, SHUT_RDWR)
+        }
+        condition.broadcast()
+        condition.unlock()
+        return true
+    }
 
     @discardableResult
     func close() -> Bool {
-        let descriptor = lock.withLock { () -> Int32? in
-            defer { value = nil }
-            return value
+        condition.lock()
+        acceptsOperations = false
+        while activeOperations != 0 { condition.wait() }
+        guard let descriptor = value else {
+            condition.unlock()
+            return false
         }
-        guard let descriptor else { return false }
+        value = nil
         calls.close(descriptor)
+        condition.broadcast()
+        condition.unlock()
         return true
     }
 }
@@ -253,5 +301,11 @@ public struct DarwinUnixDomainSocketSystemCalls: UnixDomainSocketSystemCalls {
 
     private func systemCall(_ function: String) -> UnixDomainSocketError {
         .systemCall(function: function, errno: errno)
+    }
+}
+
+extension DarwinUnixDomainSocketSystemCalls: HostDataPlaneDescriptorInterrupting {
+    func interruptHostDataPlaneDescriptor(_ descriptor: Int32) {
+        _ = Darwin.shutdown(descriptor, SHUT_RDWR)
     }
 }
