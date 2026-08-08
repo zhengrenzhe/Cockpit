@@ -4,8 +4,8 @@
   "version": "0.0.1",
   "packageManager": "pnpm@11.20.0",
   "engines": {
-    "node": "25.9.0 || 26.7.0",
-    "pnpm": "9.15.9 || 11.20.0"
+    "node": "26.7.0",
+    "pnpm": "11.20.0"
   },
   "type": "module",
   "scripts": {

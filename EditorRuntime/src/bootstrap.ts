@@ -4,9 +4,21 @@ import { createEditorProtocol } from './protocol.mjs';
 
 declare global {
   interface Window {
+    cockpitWebContentGeneration?: number;
     cockpitEditorProtocol: {
       version: 1;
       openText(uri: string, text: string, language: string): void;
+      receiveNativeMessage(message: unknown): { ok: boolean; error?: string };
+      ready(): void;
+      save(): void;
+    };
+    cockpitMonacoReceive(message: unknown): { ok: boolean; error?: string };
+    webkit: {
+      messageHandlers: {
+        cockpitMonaco: {
+          postMessage(message: unknown): Promise<unknown>;
+        };
+      };
     };
   }
 }
@@ -23,4 +35,15 @@ const editor = monaco.editor.create(root, {
   minimap: { enabled: false },
 });
 
-window.cockpitEditorProtocol = createEditorProtocol(monaco, editor);
+const webContentGeneration = window.cockpitWebContentGeneration ?? 1;
+const protocol = createEditorProtocol(monaco, editor, {
+  webContentGeneration,
+  postMessage(message: unknown) {
+    return window.webkit.messageHandlers.cockpitMonaco.postMessage(message);
+  },
+});
+window.cockpitEditorProtocol = protocol;
+window.cockpitMonacoReceive = (message: unknown) => (
+  protocol.receiveNativeMessage(message)
+);
+protocol.ready();

@@ -44,6 +44,160 @@ import CockpitTypes
     )) == nil)
 }
 
+@Test func workspaceClientStateViewStateReportsExactLookupErrorsWithoutCreatingState() async throws {
+    let coordinator = WorkspaceClientState()
+    let key = ClientWorkspaceStateKey(
+        deviceID: DeviceID(),
+        windowID: WindowID(),
+        workspaceContextID: .project(ProjectID())
+    )
+    let tabID = TabID()
+    let documentID = DocumentID()
+
+    await #expect(throws: WorkspaceClientStateError.stateNotFound) {
+        try await coordinator.updateFileViewState(
+            key: key,
+            tabID: tabID,
+            documentID: documentID,
+            viewState: .initial()
+        )
+    }
+
+    let stored = try makeClientState(
+        key: key,
+        tabID: tabID,
+        documentID: documentID,
+        leadingWidth: 200,
+        trailingWidth: 300
+    )
+    try await coordinator.store(stored)
+    await #expect(throws: WorkspaceClientStateError.tabNotFound) {
+        try await coordinator.updateFileViewState(
+            key: key,
+            tabID: TabID(),
+            documentID: documentID,
+            viewState: .initial()
+        )
+    }
+    await #expect(throws: WorkspaceClientStateError.tabDocumentMismatch) {
+        try await coordinator.updateFileViewState(
+            key: key,
+            tabID: tabID,
+            documentID: DocumentID(),
+            viewState: .initial()
+        )
+    }
+}
+
+@Test func workspaceClientStateViewStateUpdatesOnlyTheExactFileTab() async throws {
+    let coordinator = WorkspaceClientState()
+    let key = ClientWorkspaceStateKey(
+        deviceID: DeviceID(),
+        windowID: WindowID(),
+        workspaceContextID: .conversation(ConversationID())
+    )
+    let tabID = TabID()
+    let documentID = DocumentID()
+    let original = try makeClientState(
+        key: key,
+        tabID: tabID,
+        documentID: documentID,
+        leadingWidth: 210,
+        trailingWidth: 320
+    )
+    let replacement = try makeViewState(line: 44, horizontalOffset: 19)
+    try await coordinator.store(original)
+
+    try await coordinator.updateFileViewState(
+        key: key,
+        tabID: tabID,
+        documentID: documentID,
+        viewState: replacement
+    )
+
+    let updated = try #require(await coordinator.state(for: key))
+    #expect(updated.tabs.count == 1)
+    #expect(updated.tabs[0].id == tabID)
+    #expect(updated.tabs[0].resource == .file(documentID))
+    #expect(updated.tabs[0].fileViewState == replacement)
+    #expect(updated.selectedTabID == original.selectedTabID)
+    #expect(updated.sidebar == original.sidebar)
+    #expect(updated.splitView == original.splitView)
+}
+
+@Test func workspaceClientStateViewStateConcurrentSameDocumentTabsPreserveBothUpdates() async throws {
+    let coordinator = WorkspaceClientState()
+    let key = ClientWorkspaceStateKey(
+        deviceID: DeviceID(),
+        windowID: WindowID(),
+        workspaceContextID: .project(ProjectID())
+    )
+    let documentID = DocumentID()
+    let firstTabID = TabID()
+    let secondTabID = TabID()
+    let firstOriginal = try makeFileTab(id: firstTabID, documentID: documentID, line: 1)
+    let secondOriginal = try makeFileTab(id: secondTabID, documentID: documentID, line: 2)
+    let initial = try ClientWorkspaceState(
+        validatingKey: key,
+        tabs: [firstOriginal, secondOriginal],
+        selectedTabID: firstTabID,
+        sidebar: SidebarState(isCollapsed: false),
+        splitView: SplitViewState(validatingLeadingPaneWidth: 200, trailingPaneWidth: 300)
+    )
+    let firstUpdate = try makeViewState(line: 31, horizontalOffset: 3)
+    let secondUpdate = try makeViewState(line: 72, horizontalOffset: 7)
+    try await coordinator.store(initial)
+
+    async let first: Void = coordinator.updateFileViewState(
+        key: key,
+        tabID: firstTabID,
+        documentID: documentID,
+        viewState: firstUpdate
+    )
+    async let second: Void = coordinator.updateFileViewState(
+        key: key,
+        tabID: secondTabID,
+        documentID: documentID,
+        viewState: secondUpdate
+    )
+    _ = try await (first, second)
+
+    let updated = try #require(await coordinator.state(for: key))
+    #expect(updated.tabs.first(where: { $0.id == firstTabID })?.fileViewState == firstUpdate)
+    #expect(updated.tabs.first(where: { $0.id == secondTabID })?.fileViewState == secondUpdate)
+}
+
+@Test func workspaceClientStateViewStateRejectsInvalidViewStateBeforeMutation() async throws {
+    let coordinator = WorkspaceClientState()
+    let key = ClientWorkspaceStateKey(
+        deviceID: DeviceID(),
+        windowID: WindowID(),
+        workspaceContextID: .project(ProjectID())
+    )
+    let tabID = TabID()
+    let documentID = DocumentID()
+    let initial = try makeClientState(
+        key: key,
+        tabID: tabID,
+        documentID: documentID,
+        leadingWidth: 200,
+        trailingWidth: 300
+    )
+    try await coordinator.store(initial)
+    var invalid = DocumentViewState.initial()
+    invalid.horizontalScrollOffset = .nan
+
+    await #expect(throws: CockpitDomainValidationError.invalidHorizontalScrollOffset) {
+        try await coordinator.updateFileViewState(
+            key: key,
+            tabID: tabID,
+            documentID: documentID,
+            viewState: invalid
+        )
+    }
+    #expect(await coordinator.state(for: key) == initial)
+}
+
 @Test func splitViewRejectsNonfiniteAndNegativeWidthsThroughEveryValidationPath() throws {
     #expect(throws: CockpitDomainValidationError.invalidSplitViewWidth) {
         _ = try SplitViewState(validatingLeadingPaneWidth: -.infinity, trailingPaneWidth: 1)
@@ -176,5 +330,15 @@ private func makeFileTab(id: TabID, documentID: DocumentID, line: UInt64) throws
             firstVisibleLine: line,
             horizontalScrollOffset: 12
         )
+    )
+}
+
+private func makeViewState(line: UInt64, horizontalOffset: Double) throws -> DocumentViewState {
+    let cursor = try TextPosition(validatingLine: line, column: 2)
+    return try DocumentViewState(
+        validatingCursor: cursor,
+        selections: [TextRange(validatingAnchor: cursor, active: cursor)],
+        firstVisibleLine: line,
+        horizontalScrollOffset: horizontalOffset
     )
 }

@@ -3,7 +3,7 @@ import CockpitHostCore
 import CockpitProtocol
 import CockpitTypes
 
-package final class HostShutdownCoordinator: @unchecked Sendable {
+public final class HostShutdownCoordinator: @unchecked Sendable {
     private let lock = NSLock()
     private var started = false
     private let ticketIssuer: HostDataPlaneTicketIssuer
@@ -11,7 +11,7 @@ package final class HostShutdownCoordinator: @unchecked Sendable {
     private let invalidateListener: () -> Void
     private let stopProcess: () -> Void
 
-    package init(
+    public init(
         ticketIssuer: HostDataPlaneTicketIssuer,
         dataPlaneServer: HostDataPlaneServer,
         invalidateListener: @escaping () -> Void,
@@ -40,7 +40,7 @@ package final class HostShutdownCoordinator: @unchecked Sendable {
         Task { await shutdown() }
     }
 
-    package var eventHandler: @Sendable () -> Void {
+    public var eventHandler: @Sendable () -> Void {
         { [weak self] in self?.handleTermination() }
     }
 }

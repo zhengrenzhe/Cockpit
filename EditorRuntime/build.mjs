@@ -3,7 +3,6 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   access,
-  cp,
   lstat,
   mkdir,
   readFile,
@@ -31,6 +30,8 @@ const ownerManifestSuffix = '.owner.json';
 const ownerToken = `${process.pid}-${randomUUID()}`;
 const staging = join(dist, `${stagingPrefix}${ownerToken}`);
 const expectedFiles = ['editor.css', 'editor.js', 'editor.js.map', 'index.html'];
+const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self'; font-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'";
+const contentSecurityPolicyMeta = `<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">`;
 const stagingFileAllowlist = new Set([...expectedFiles, 'editor.css.map']);
 const canonicalRuntimeRoot = await realpath(runtimeRoot);
 const expectedCanonicalDist = join(canonicalRuntimeRoot, 'dist');
@@ -497,7 +498,13 @@ async function recoverPublishedBundle() {
 async function buildStagingBundle() {
   await mkdir(staging);
   await writeOwnershipManifest(staging, 'staging', await lstat(staging));
-  await cp(join(runtimeRoot, 'src/index.html'), join(staging, 'index.html'));
+  const sourceIndexHTML = await readFile(join(runtimeRoot, 'src/index.html'), 'utf8');
+  const headOpening = /<head>/i.exec(sourceIndexHTML);
+  if (!headOpening || /http-equiv=["']Content-Security-Policy["']/i.test(sourceIndexHTML)) {
+    throw new Error('runtime index must contain one CSP-free head element');
+  }
+  const generatedIndexHTML = `${sourceIndexHTML.slice(0, headOpening.index + headOpening[0].length)}${contentSecurityPolicyMeta}${sourceIndexHTML.slice(headOpening.index + headOpening[0].length)}`;
+  await writeFile(join(staging, 'index.html'), generatedIndexHTML);
   const entryPoint = (
     process.env.NODE_ENV === 'test'
     && process.env.COCKPIT_BUILD_TEST_ESBUILD_ENTRY
@@ -513,6 +520,7 @@ async function buildStagingBundle() {
     target: 'safari18',
     minify: true,
     sourcemap: 'external',
+    sourcesContent: false,
     legalComments: 'none',
     logLevel: 'info',
   });

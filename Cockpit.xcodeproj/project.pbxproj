@@ -8,22 +8,31 @@
 
 /* Begin PBXBuildFile section */
 		00F2CE09C916763801CA9F85 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 521FA9CA3D31F33E20B0CC22 /* main.swift */; };
-		212557A2ACC955D30965D047 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
+		072B27985D56CF0B48E847DE /* MonacoRuntime.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */; };
+		212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
 		351D3D324BAED80562181E32 /* CockpitWorkspace in Frameworks */ = {isa = PBXBuildFile; productRef = 6B63A056B655604A5CAB68B6 /* CockpitWorkspace */; };
+		493D8CBE3E815C9A151FF0F3 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		5504EF2E91B30EAA53DE6A0E /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */; };
 		591C5D12CD00A336A5410F70 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 97443DD81BE67B657ED3816E /* CockpitPersistence */; };
-		60026EC79653E301CEE5491E /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
+		60026EC79653E301CEE5491E /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9F4222C3217C5CD667A61F57 /* CockpitHostCore */; };
+		636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */; };
 		67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */; };
 		69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3A65312477EAD5232A52B0 /* main.swift */; };
 		6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */ = {isa = PBXBuildFile; productRef = 805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */; };
+		739F84561841F69B335B8581 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		80169161B195865C65678342 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 75A939B292A29F0EA7497870 /* CockpitLocalTransport */; };
+		8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */; };
 		995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BFB39C38A17E2083706555 /* AppDelegate.swift */; };
-		A370B28B6F0C30D43CAE9AC9 /* CockpitTerminalClient in Frameworks */ = {isa = PBXBuildFile; productRef = 5A754E919142603676936801 /* CockpitTerminalClient */; };
+		9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */ = {isa = PBXBuildFile; productRef = 5A754E919142603676936801 /* CockpitTerminalClient */; };
+		A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
 		A7DFA31121D9E31C872E4793 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 41F1F75F27D0D4B661D8228C /* CockpitPersistence */; };
 		B984303D116E24D3B243414B /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = D51DF015FEF9086662DEC115 /* CockpitTerminalCore */; };
+		BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 263DA7B80F345C7A4A093699 /* MonacoBridge.swift */; };
 		BD4D067AEA4D8DD58643509F /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D380A6D5A0B758FBC879A0 /* main.swift */; };
+		D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */; };
 		DE1A356D6AFAC3DA1F075DCB /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 98B021792EC132C38CE754AF /* CockpitLocalTransport */; };
 		E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */; };
+		F2FA65E881BC08614E18A4F4 /* MonacoEditorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */; };
 		FF4336728B6B261A41D126A2 /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 80E0EDA5DF236D4B796E1DC4 /* CockpitHostCore */; };
 /* End PBXBuildFile section */
 
@@ -59,22 +68,37 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridgeTests.swift; sourceTree = "<group>"; };
+		263DA7B80F345C7A4A093699 /* MonacoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridge.swift; sourceTree = "<group>"; };
 		2C3A65312477EAD5232A52B0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		434FD56C66EABF9EB68397FE /* CockpitHost */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitHost; sourceTree = BUILT_PRODUCTS_DIR; };
+		44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoMessage.swift; sourceTree = "<group>"; };
 		48D380A6D5A0B758FBC879A0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MonacoRuntime.bundle; path = EditorRuntime/dist/MonacoRuntime.bundle; sourceTree = SOURCE_ROOT; };
+		4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoWindowSessionResolver.swift; sourceTree = "<group>"; };
 		521FA9CA3D31F33E20B0CC22 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTestScaffoldTests.swift; sourceTree = "<group>"; };
 		70F73173468B21D2CA4D246A /* Cockpit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cockpit.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoEditorViewController.swift; sourceTree = "<group>"; };
 		8353F9ACCD56E1BF6CB456FC /* phase-1 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "phase-1"; path = .; sourceTree = SOURCE_ROOT; };
 		957D0FDA811FE85865AA5EF4 /* CockpitAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CockpitAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A0BFB39C38A17E2083706555 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		C1FB833EEF9FB302DB53867C /* CockpitTerminalSupervisor */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitTerminalSupervisor; sourceTree = BUILT_PRODUCTS_DIR; };
 		C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceStatusViewModel.swift; sourceTree = "<group>"; };
+		C4FA2BE19C1AAE871BA1097F /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		C5C87AF4E75B23201A214E82 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		E7CC18242186F71956E15599 /* CockpitPTYKeeper */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitPTYKeeper; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		053392186A5577669721C911 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				493D8CBE3E815C9A151FF0F3 /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		19C62675F31436DA9D65E793 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -99,9 +123,11 @@
 			buildActionMask = 2147483647;
 			files = (
 				6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */,
-				60026EC79653E301CEE5491E /* CockpitLocalTransport in Frameworks */,
-				212557A2ACC955D30965D047 /* CockpitTypes in Frameworks */,
-				A370B28B6F0C30D43CAE9AC9 /* CockpitTerminalClient in Frameworks */,
+				60026EC79653E301CEE5491E /* CockpitHostCore in Frameworks */,
+				212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */,
+				A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */,
+				9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */,
+				739F84561841F69B335B8581 /* WebKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -132,9 +158,18 @@
 			children = (
 				A0BFB39C38A17E2083706555 /* AppDelegate.swift */,
 				C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */,
+				6E46CDDC13239DD598F7204A /* Monaco */,
 			);
 			name = CockpitApp;
 			path = Applications/CockpitApp;
+			sourceTree = "<group>";
+		};
+		41C347DBB0B84DA34DB20958 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				C4FA2BE19C1AAE871BA1097F /* WebKit.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		457080120E476759F1EC65C5 /* CockpitPTYKeeper */ = {
@@ -146,9 +181,21 @@
 			path = Applications/CockpitPTYKeeper;
 			sourceTree = "<group>";
 		};
+		6E46CDDC13239DD598F7204A /* Monaco */ = {
+			isa = PBXGroup;
+			children = (
+				263DA7B80F345C7A4A093699 /* MonacoBridge.swift */,
+				74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */,
+				44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */,
+				4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */,
+			);
+			path = Monaco;
+			sourceTree = "<group>";
+		};
 		74779E6081372CCA11FC07A2 = {
 			isa = PBXGroup;
 			children = (
+				48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */,
 				0028AB5E5FA1BF5A5FCAF626 /* Build */,
 				17AE0B84631936BB32DF470B /* CockpitApp */,
 				FFA0B107F09BC2BE194062CE /* CockpitAppTests */,
@@ -156,6 +203,7 @@
 				457080120E476759F1EC65C5 /* CockpitPTYKeeper */,
 				DB534674FC3ED4B84218F3D7 /* CockpitTerminalSupervisor */,
 				D313BC9B79196468316EC60E /* Packages */,
+				41C347DBB0B84DA34DB20958 /* Frameworks */,
 				DEFE04B8F8911E7471915F68 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -202,6 +250,7 @@
 			isa = PBXGroup;
 			children = (
 				6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */,
+				03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */,
 			);
 			name = CockpitAppTests;
 			path = Tests/CockpitAppTests;
@@ -234,6 +283,7 @@
 			buildConfigurationList = DDD9035969FB44F62AE4FFCE /* Build configuration list for PBXNativeTarget "Cockpit" */;
 			buildPhases = (
 				1CF695282F179492BC025448 /* Sources */,
+				EDEA104B055DB77E276D3D4E /* Resources */,
 				D1C978041566B0F8E0E6904B /* Frameworks */,
 				250EBF7F377C541A365098D0 /* Embed LaunchAgents */,
 			);
@@ -247,6 +297,7 @@
 			name = Cockpit;
 			packageProductDependencies = (
 				805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */,
+				9F4222C3217C5CD667A61F57 /* CockpitHostCore */,
 				29A3733E9D6777F50A36E911 /* CockpitLocalTransport */,
 				301696E7B6689F1F7F644EA6 /* CockpitTypes */,
 				5A754E919142603676936801 /* CockpitTerminalClient */,
@@ -260,6 +311,7 @@
 			buildConfigurationList = 1A1D80AB50A1BDB51F7CADCC /* Build configuration list for PBXNativeTarget "CockpitAppTests" */;
 			buildPhases = (
 				BA3B4619356F65272F03A4BF /* Sources */,
+				053392186A5577669721C911 /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -368,6 +420,17 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		EDEA104B055DB77E276D3D4E /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				072B27985D56CF0B48E847DE /* MonacoRuntime.bundle in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXShellScriptBuildPhase section */
 		250EBF7F377C541A365098D0 /* Embed LaunchAgents */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -414,6 +477,10 @@
 			buildActionMask = 2147483647;
 			files = (
 				995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */,
+				BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */,
+				F2FA65E881BC08614E18A4F4 /* MonacoEditorViewController.swift in Sources */,
+				636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */,
+				8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */,
 				E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -439,6 +506,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */,
+				D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -849,6 +917,10 @@
 		98B021792EC132C38CE754AF /* CockpitLocalTransport */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = CockpitLocalTransport;
+		};
+		9F4222C3217C5CD667A61F57 /* CockpitHostCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitHostCore;
 		};
 		D51DF015FEF9086662DEC115 /* CockpitTerminalCore */ = {
 			isa = XCSwiftPackageProductDependency;

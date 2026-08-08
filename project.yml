@@ -65,7 +65,11 @@ targets:
   Cockpit:
     type: application
     platform: macOS
-    sources: [Applications/CockpitApp]
+    sources:
+      - Applications/CockpitApp
+      - path: EditorRuntime/dist/MonacoRuntime.bundle
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.Cockpit
@@ -77,11 +81,14 @@ targets:
       - package: CockpitKit
         product: CockpitClientCore
       - package: CockpitKit
+        product: CockpitHostCore
+      - package: CockpitKit
         product: CockpitLocalTransport
       - package: CockpitKit
         product: CockpitTypes
       - package: CockpitKit
         product: CockpitTerminalClient
+      - sdk: WebKit.framework
       - target: CockpitHost
         embed: false
       - target: CockpitTerminalSupervisor
@@ -146,6 +153,7 @@ targets:
         BUNDLE_LOADER: $(TEST_HOST)
     dependencies:
       - target: Cockpit
+      - sdk: WebKit.framework
 schemes:
   Cockpit:
     build:
@@ -158,5 +166,7 @@ schemes:
       config: Debug
     test:
       config: Debug
+      commandLineArguments:
+        -XCTDisableAggressiveSymbolication: true
       targets:
         - CockpitAppTests

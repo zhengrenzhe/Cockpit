@@ -25,6 +25,7 @@ import {
   evaluateToolchain,
   parsePnpmUserAgent,
   parseVersion,
+  profileName,
 } from '../toolchain-contract.mjs';
 
 const runtimeRoot = new URL('../', import.meta.url);
@@ -33,6 +34,8 @@ const runtimePath = fileURLToPath(runtimeRoot);
 const distPath = fileURLToPath(new URL('dist', runtimeRoot));
 const outputPath = fileURLToPath(new URL('dist/MonacoRuntime.bundle', runtimeRoot));
 const expectedFiles = ['editor.css', 'editor.js', 'editor.js.map', 'index.html'];
+const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self'; font-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'";
+const contentSecurityPolicyMeta = `<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">`;
 const testHookName = 'before-public-detach';
 const runFile = promisify(execFile);
 
@@ -223,31 +226,31 @@ async function cleanupOwnedArtifactFixture(...paths) {
   }
 }
 
-test('package declares the supported paired runtime toolchains', async () => {
+test('package declares the canonical runtime toolchain', async () => {
   const manifest = JSON.parse(
     await readFile(new URL('package.json', runtimeRoot), 'utf8'),
   );
   assert.equal(manifest.packageManager, 'pnpm@11.20.0');
   assert.deepEqual(manifest.engines, {
-    node: '25.9.0 || 26.7.0',
-    pnpm: '9.15.9 || 11.20.0',
+    node: '26.7.0',
+    pnpm: '11.20.0',
   });
   assert.deepEqual(manifest.dependencies, { 'monaco-editor': '0.56.0' });
   assert.deepEqual(manifest.devDependencies, { esbuild: '0.28.1' });
 });
 
-test('toolchain contract accepts only supported paired profile boundaries', () => {
-  const accepted = [
-    ['25.9.0', 'pnpm/9.15.9 npm/? node/v25.9.0 darwin arm64'],
-    ['26.7.0', 'pnpm/11.20.0 npm/? node/v26.7.0 darwin arm64'],
-  ];
-  for (const [nodeVersion, userAgent] of accepted) {
-    assert.deepEqual(evaluateToolchain({ nodeVersion, userAgent }), { ok: true });
-  }
+test('toolchain contract accepts only the canonical current pair', () => {
+  const input = {
+    nodeVersion: '26.7.0',
+    userAgent: 'pnpm/11.20.0 npm/? node/v26.7.0 darwin arm64',
+  };
+  assert.deepEqual(evaluateToolchain(input), { ok: true });
+  assert.equal(profileName(input), 'current');
 });
 
 test('toolchain contract rejects unpaired, unsupported, and malformed versions', () => {
   const rejected = [
+    ['25.9.0', 'pnpm/9.15.9 npm/? node/v25.9.0 darwin arm64'],
     ['25.9.0', 'pnpm/11.20.0 npm/? node/v25.9.0 darwin arm64'],
     ['26.7.0', 'pnpm/9.15.9 npm/? node/v26.7.0 darwin arm64'],
     ['26.6.99', 'pnpm/11.20.0 npm/? node/v26.6.99 darwin arm64'],
@@ -266,6 +269,7 @@ test('toolchain contract rejects unpaired, unsupported, and malformed versions',
   ];
   for (const [nodeVersion, userAgent] of rejected) {
     assert.equal(evaluateToolchain({ nodeVersion, userAgent }).ok, false, `${nodeVersion} / ${userAgent}`);
+    assert.equal(profileName({ nodeVersion, userAgent }), null, `${nodeVersion} / ${userAgent}`);
   }
   assert.deepEqual(parseVersion('v25.9.0'), { major: 25, minor: 9, patch: 0 });
   assert.equal(parseVersion('25.9'), null);
@@ -287,7 +291,20 @@ test('build emits a self-contained local editor bundle', async () => {
   ].map((match) => match[1]).sort();
 
   assert.deepEqual(files.sort(), expectedFiles);
+  for (const file of files) {
+    const stats = await lstat(new URL(file, output));
+    assert.equal(stats.isSymbolicLink(), false, `${file} must not be a symbolic link`);
+    assert.equal(stats.isFile(), true, `${file} must be a regular file`);
+    assert.ok(stats.size > 0, `${file} must not be empty`);
+  }
   assert.deepEqual(assetReferences, ['./editor.css', './editor.js']);
+  const head = /<head>([\s\S]*?)<\/head>/i.exec(html)?.[1];
+  assert.equal(typeof head, 'string');
+  assert.equal(head.trimStart().startsWith(contentSecurityPolicyMeta), true);
+  assert.equal(
+    [...html.matchAll(/<meta\b[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi)].length,
+    1,
+  );
   assert.match(js, /cockpitEditorProtocol/);
   assert.match(js, /version:1/);
   assert.ok(js.length > 0);
@@ -299,6 +316,7 @@ test('build emits a self-contained local editor bundle', async () => {
   assert.ok(sourceMap.sources.every((sourcePath) => !isAbsolute(sourcePath)));
   assert.ok(sourceMap.sources.every((sourcePath) => !sourcePath.startsWith('file:')));
   assert.doesNotMatch(JSON.stringify(sourceMap), new RegExp(runtimePath));
+  assert.equal(Object.hasOwn(sourceMap, 'sourcesContent'), false);
   assert.match(source, /editor\/contrib\/find\/browser\/findController/);
 });
 
