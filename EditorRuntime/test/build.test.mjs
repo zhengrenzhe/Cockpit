@@ -21,6 +21,7 @@ import { basename, dirname, isAbsolute, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { Script } from 'node:vm';
 import {
   evaluateToolchain,
   parsePnpmUserAgent,
@@ -318,6 +319,36 @@ test('build emits a self-contained local editor bundle', async () => {
   assert.doesNotMatch(JSON.stringify(sourceMap), new RegExp(runtimePath));
   assert.equal(Object.hasOwn(sourceMap, 'sourcesContent'), false);
   assert.match(source, /editor\/contrib\/find\/browser\/findController/);
+});
+
+test('build declares the classic editor JavaScript MIME', async () => {
+  const html = await readFile(new URL('index.html', output), 'utf8');
+
+  assert.match(
+    html,
+    /<script type="application\/javascript" src="\.\/editor\.js"><\/script>/,
+  );
+  assert.doesNotMatch(html, /<script\b[^>]*\btype="module"/);
+});
+
+test('build emits editor JavaScript without module-only syntax', async () => {
+  const js = await readFile(new URL('editor.js', output), 'utf8');
+
+  assert.doesNotMatch(js, /\bimport\.meta\.url\b/);
+  assert.doesNotThrow(() => new Script(js, { filename: 'editor.js' }));
+});
+
+test('build preserves worker URL resolution for the file page', async () => {
+  const js = await readFile(new URL('editor.js', output), 'utf8');
+
+  const workerURL = /esmModuleLocationBundler:\(\)=>new URL\("([^"]+)",globalThis\.location\.href\)/
+    .exec(js)?.[1];
+  assert.equal(workerURL, '../../common/services/editorWebWorkerMain.js');
+  const indexURL = new URL(
+    'file:///Applications/Cockpit.app/Contents/Resources/MonacoRuntime.bundle/index.html',
+  );
+  const editorURL = new URL('./editor.js', indexURL);
+  assert.equal(new URL(workerURL, indexURL).href, new URL(workerURL, editorURL).href);
 });
 
 test('openText reuses a URI model and synchronizes text and language', async () => {

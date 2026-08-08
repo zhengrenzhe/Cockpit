@@ -210,6 +210,7 @@ public enum MonacoMessageCodec {
     }
 
     public static func javaScriptObject(for message: MonacoNativeMessage) throws -> [String: Any] {
+        try validate(message)
         switch message {
         case let .open(generation, access, language, snapshot, viewState):
             var value = documentObject(type: "open", generation: generation, access: access)
@@ -393,6 +394,75 @@ public enum MonacoMessageCodec {
 
     private static func positionObject(_ value: TextPosition) -> [String: Any] {
         ["line": value.line, "column": value.column]
+    }
+
+    private static func validate(_ message: MonacoNativeMessage) throws {
+        let generation: UInt64
+        let access: MonacoDocumentAccess
+        let viewState: DocumentViewState?
+        switch message {
+        case let .open(value, tuple, language, snapshot, state):
+            generation = value
+            access = tuple
+            viewState = state
+            guard !language.isEmpty,
+                  snapshot.documentID == tuple.reference.documentID,
+                  snapshot.documentVersion <= maximumInteger
+            else { throw MonacoBridgeError.invalidSchema }
+        case let .acknowledgement(value, tuple, acknowledgement):
+            generation = value
+            access = tuple
+            viewState = nil
+            guard acknowledgement.documentID == tuple.reference.documentID,
+                  acknowledgement.clientSequence <= maximumInteger,
+                  acknowledgement.documentVersion <= maximumInteger
+            else { throw MonacoBridgeError.invalidSchema }
+        case let .replace(value, tuple, snapshot, state):
+            generation = value
+            access = tuple
+            viewState = state
+            guard snapshot.documentID == tuple.reference.documentID,
+                  snapshot.documentVersion <= maximumInteger
+            else { throw MonacoBridgeError.invalidSchema }
+        case let .setWritable(value, tuple), let .disposeModel(value, tuple):
+            generation = value
+            access = tuple
+            viewState = nil
+        case let .renameModel(value, tuple, oldURI, language, snapshot, state):
+            generation = value
+            access = tuple
+            viewState = state
+            guard MonacoFileURI.isCanonical(oldURI), !language.isEmpty,
+                  snapshot.documentID == tuple.reference.documentID,
+                  snapshot.documentVersion <= maximumInteger
+            else { throw MonacoBridgeError.invalidSchema }
+        case let .selectModel(value, tuple, state):
+            generation = value
+            access = tuple
+            viewState = state
+        }
+        guard generation > 0, generation <= maximumInteger,
+              access.lastAcceptedClientSequence <= maximumInteger,
+              MonacoFileURI.isCanonical(access.uri),
+              access.writable == (access.editLeaseID != nil)
+        else { throw MonacoBridgeError.invalidSchema }
+        if let viewState { try validate(viewState) }
+    }
+
+    private static func validate(_ viewState: DocumentViewState) throws {
+        guard viewState.cursor.line <= maximumInteger,
+              viewState.cursor.column <= maximumInteger,
+              viewState.firstVisibleLine > 0,
+              viewState.firstVisibleLine <= maximumInteger,
+              viewState.horizontalScrollOffset.isFinite,
+              viewState.horizontalScrollOffset >= 0,
+              viewState.selections.allSatisfy({ range in
+                  range.anchor.line <= maximumInteger
+                      && range.anchor.column <= maximumInteger
+                      && range.active.line <= maximumInteger
+                      && range.active.column <= maximumInteger
+              })
+        else { throw MonacoBridgeError.invalidSchema }
     }
 
     private static func dictionary(_ value: Any) throws -> [String: Any] {

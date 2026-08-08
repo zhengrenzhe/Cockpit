@@ -32,7 +32,7 @@ public enum MonacoRelocationDisposition: Hashable, Sendable {
     case abandonedAllStale
 }
 
-public typealias MonacoNativeMessageSink = @MainActor @Sendable (MonacoNativeMessage) throws -> Void
+public typealias MonacoNativeMessageSink = @MainActor @Sendable (MonacoNativeMessage) async throws -> Void
 public typealias MonacoOwnerErrorHandler = @MainActor @Sendable (DocumentID, MonacoBridgeError) -> Void
 
 @MainActor
@@ -55,6 +55,7 @@ public final class MonacoBridge {
         var pendingDocumentIDs: Set<DocumentID>
         var migratedDocumentIDs: Set<DocumentID> = []
         var destinationSnapshots: [DocumentID: DocumentSnapshot] = [:]
+        var disposedAccesses: Set<MonacoDocumentAccess> = []
 
         init(
             token: MonacoRelocationToken,
@@ -74,6 +75,7 @@ public final class MonacoBridge {
     private var blockedDocumentIDs: Set<DocumentID> = []
     private var restartPending = false
     private var restartSelection: MonacoDocumentReference?
+    private var readyGeneration: UInt64?
 
     public init(
         resolver: MonacoWindowSessionResolver,
@@ -86,6 +88,16 @@ public final class MonacoBridge {
         self.webContentGeneration = webContentGeneration
         self.sink = sink
         self.ownerErrorHandler = ownerErrorHandler
+        resolver.setReferenceLifecycle(
+            retain: { [weak self] session, reference in
+                guard let self else { throw MonacoBridgeError.transportFailure }
+                try await self.openRetainedReferenceIfReady(reference, session: session)
+            },
+            release: { [weak self] session, reference in
+                guard let self else { throw MonacoBridgeError.transportFailure }
+                try await self.disposeReleasedReferenceIfReady(reference, session: session)
+            }
+        )
     }
 
     public func setSink(_ sink: @escaping MonacoNativeMessageSink) {
@@ -100,7 +112,11 @@ public final class MonacoBridge {
             }
             switch message {
             case .ready:
-                if restartPending { try await rebuildAfterWebContentRestart() }
+                if restartPending {
+                    try await rebuildAfterWebContentRestart()
+                } else {
+                    try await openInitialContentIfNeeded()
+                }
                 return .success(nil)
             case let .edit(_, incomingAccess, baseVersion, changes):
                 let (session, snapshot, access) = try await validatedAccess(incomingAccess)
@@ -173,7 +189,7 @@ public final class MonacoBridge {
         )
         let (_, access) = try await currentSnapshotAndAccess(reference: reference, session: session)
         let viewState = await resolver.loadViewState(contextID, tabID, documentID)
-        try sink(.selectModel(
+        try await sink(.selectModel(
             webContentGeneration: webContentGeneration,
             access: access,
             viewState: viewState
@@ -187,6 +203,7 @@ public final class MonacoBridge {
         webContentGeneration = generation
         restartPending = true
         restartSelection = resolver.selectedReference
+        readyGeneration = nil
     }
 
     public func prepareRelocation(
@@ -198,7 +215,12 @@ public final class MonacoBridge {
             $0.token.workspaceContextID == workspaceContextID && $0.token.operation == operation
         }) else { throw MonacoBridgeError.staleDocumentState }
 
-        let sessions = resolver.allSessionsSortedByDocumentID()
+        let sessions = resolver.allSessionsSortedByDocumentID().filter { session in
+            session.references.contains { $0.workspaceContextID == workspaceContextID }
+                && session.lastAuthoritativePath.map {
+                    Self.path($0, isEqualToOrDescendantOf: sourcePath)
+                } == true
+        }
 
         var prepared: [DocumentID: PreparedDocument] = [:]
         for session in sessions {
@@ -224,9 +246,11 @@ public final class MonacoBridge {
             guard snapshot.documentID == session.documentID else {
                 throw MonacoBridgeError.staleDocumentState
             }
-            guard Self.path(snapshot.relativePath, isEqualToOrDescendantOf: sourcePath) else {
-                continue
-            }
+            guard snapshot.environmentID == session.lastAuthoritativeEnvironmentID,
+                  snapshot.relativePath == session.lastAuthoritativePath,
+                  Self.path(snapshot.relativePath, isEqualToOrDescendantOf: sourcePath)
+            else { throw MonacoBridgeError.staleDocumentState }
+            session.remember(snapshot)
             prepared[session.documentID] = PreparedDocument(
                 documentID: session.documentID,
                 environmentID: snapshot.environmentID,
@@ -312,7 +336,7 @@ public final class MonacoBridge {
 
     public func abandonCommittedRelocation(
         _ token: MonacoRelocationToken
-    ) throws -> MonacoRelocationDisposition {
+    ) async throws -> MonacoRelocationDisposition {
         let state = try liveRelocation(for: token)
         guard state.committedResult != nil else { throw MonacoBridgeError.staleDocumentState }
         for documentID in token.affectedDocumentIDs {
@@ -327,8 +351,18 @@ public final class MonacoBridge {
                         clientInstanceID: resolver.clientInstanceID,
                         forcedWritable: prepared.priorWritable
                     )
-                    guard disposedURIs.insert(access.uri).inserted else { continue }
-                    try sink(.disposeModel(webContentGeneration: webContentGeneration, access: access))
+                    guard disposedURIs.insert(access.uri).inserted,
+                          !state.disposedAccesses.contains(access)
+                    else { continue }
+                    do {
+                        try await sink(.disposeModel(
+                            webContentGeneration: webContentGeneration,
+                            access: access
+                        ))
+                    } catch MonacoBridgeError.unknownDocument {
+                        // Relocation may already have moved this exact reference away from one URI.
+                    }
+                    state.disposedAccesses.insert(access)
                 }
             }
         }
@@ -383,6 +417,7 @@ public final class MonacoBridge {
         guard snapshot.documentID == reference.documentID else {
             throw MonacoBridgeError.staleDocumentState
         }
+        session.remember(snapshot)
         return (
             snapshot,
             try Self.access(
@@ -394,9 +429,82 @@ public final class MonacoBridge {
         )
     }
 
+    private func openInitialContentIfNeeded() async throws {
+        guard readyGeneration != webContentGeneration else { return }
+        for session in resolver.allSessionsSortedByDocumentID() {
+            for reference in session.references {
+                try await open(reference, session: session)
+            }
+        }
+        if let selected = resolver.selectedReference,
+           let session = resolver.session(documentID: selected.documentID) {
+            let (_, access) = try await currentSnapshotAndAccess(
+                reference: selected,
+                session: session
+            )
+            let viewState = await resolver.loadViewState(
+                selected.workspaceContextID,
+                selected.tabID,
+                selected.documentID
+            )
+            try await sink(.selectModel(
+                webContentGeneration: webContentGeneration,
+                access: access,
+                viewState: viewState
+            ))
+        }
+        readyGeneration = webContentGeneration
+    }
+
+    private func openRetainedReferenceIfReady(
+        _ reference: MonacoDocumentReference,
+        session: MonacoWindowSession
+    ) async throws {
+        guard readyGeneration == webContentGeneration, !restartPending else { return }
+        try await open(reference, session: session)
+    }
+
+    private func open(
+        _ reference: MonacoDocumentReference,
+        session: MonacoWindowSession
+    ) async throws {
+        let (snapshot, access) = try await currentSnapshotAndAccess(
+            reference: reference,
+            session: session
+        )
+        let viewState = await resolver.loadViewState(
+            reference.workspaceContextID,
+            reference.tabID,
+            reference.documentID
+        )
+        try await sink(.open(
+            webContentGeneration: webContentGeneration,
+            access: access,
+            language: session.language,
+            snapshot: snapshot,
+            viewState: viewState
+        ))
+    }
+
+    private func disposeReleasedReferenceIfReady(
+        _ reference: MonacoDocumentReference,
+        session: MonacoWindowSession
+    ) async throws {
+        guard readyGeneration == webContentGeneration, !restartPending else { return }
+        let (_, access) = try await currentSnapshotAndAccess(
+            reference: reference,
+            session: session
+        )
+        try await sink(.disposeModel(
+            webContentGeneration: webContentGeneration,
+            access: access
+        ))
+    }
+
     private func rebuildAfterWebContentRestart() async throws {
         let selected = restartSelection
         var rebuilt: Set<DocumentID> = []
+        var didFail = false
         for session in resolver.allSessionsSortedByDocumentID() {
             let requestWriteAccess: Bool
             switch await session.controller.state {
@@ -405,7 +513,9 @@ public final class MonacoBridge {
             case .readOnly:
                 requestWriteAccess = false
             case .closed, .resynchronizing:
+                blockedDocumentIDs.insert(session.documentID)
                 ownerErrorHandler(session.documentID, .resynchronizing)
+                didFail = true
                 continue
             }
             do {
@@ -423,7 +533,7 @@ public final class MonacoBridge {
                         reference.tabID,
                         reference.documentID
                     )
-                    try sink(.open(
+                    try await sink(.open(
                         webContentGeneration: webContentGeneration,
                         access: access,
                         language: session.language,
@@ -435,6 +545,7 @@ public final class MonacoBridge {
             } catch {
                 blockedDocumentIDs.insert(session.documentID)
                 ownerErrorHandler(session.documentID, .transportFailure)
+                didFail = true
             }
         }
         if let selected, rebuilt.contains(selected.documentID),
@@ -445,14 +556,16 @@ public final class MonacoBridge {
                 selected.tabID,
                 selected.documentID
             )
-            try sink(.selectModel(
+            try await sink(.selectModel(
                 webContentGeneration: webContentGeneration,
                 access: access,
                 viewState: viewState
             ))
         }
+        guard !didFail else { throw MonacoBridgeError.transportFailure }
         restartPending = false
         restartSelection = nil
+        readyGeneration = webContentGeneration
     }
 
     private func migratePendingDocuments(
@@ -496,7 +609,7 @@ public final class MonacoBridge {
                         environmentID: prepared.originalSnapshot.environmentID,
                         path: prepared.originalSnapshot.relativePath
                     )
-                    try sink(.renameModel(
+                    try await sink(.renameModel(
                         webContentGeneration: webContentGeneration,
                         access: access,
                         oldURI: oldURI,

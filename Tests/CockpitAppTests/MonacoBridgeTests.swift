@@ -96,7 +96,7 @@ final class MonacoBridgeTests: XCTestCase {
         controller.loadViewIfNeeded()
         controller.loadRuntime()
         let waiter = try await waitForRuntimeLoad(controller.webView)
-        XCTAssertTrue(waiter)
+        guard waiter else { return XCTFail("production runtime navigation did not finish") }
         let opened = try await controller.webView.callAsyncJavaScript(
             "return window.open('https://example.invalid/cockpit-window') === null",
             arguments: [:],
@@ -176,7 +176,7 @@ final class MonacoBridgeTests: XCTestCase {
         let controller = DocumentClientController(clientInstanceID: clientID, transport: transport)
         _ = try await controller.open(in: environmentID, at: RelativePath("src/main.ts"), requestWriteAccess: true)
         let fixture = makeBridgeFixture(clientID: clientID)
-        try fixture.resolver.retain(
+        try await fixture.resolver.retain(
             contextID: fixture.contextID,
             tabID: tabID,
             documentID: documentID,
@@ -226,7 +226,7 @@ final class MonacoBridgeTests: XCTestCase {
         _ = try await controller.open(in: environmentID, at: RelativePath("shared.txt"), requestWriteAccess: true)
         let fixture = makeBridgeFixture(clientID: clientID, recorder: store)
         for tab in [firstTab, secondTab] {
-            try fixture.resolver.retain(
+            try await fixture.resolver.retain(
                 contextID: fixture.contextID,
                 tabID: tab,
                 documentID: documentID,
@@ -268,7 +268,7 @@ final class MonacoBridgeTests: XCTestCase {
         let controller = DocumentClientController(clientInstanceID: localClient, transport: transport)
         _ = try await controller.open(in: environmentID, at: RelativePath("remote.txt"), requestWriteAccess: false)
         let fixture = makeBridgeFixture(clientID: localClient)
-        try fixture.resolver.retain(
+        try await fixture.resolver.retain(
             contextID: fixture.contextID, tabID: tabID, documentID: documentID,
             controller: controller, language: "plaintext"
         )
@@ -424,10 +424,8 @@ final class MonacoBridgeTests: XCTestCase {
         XCTAssertThrowsError(try fixture.bridge.cancelRelocation(token)) {
             XCTAssertEqual($0 as? MonacoBridgeError, .staleDocumentState)
         }
-        XCTAssertEqual(
-            try fixture.bridge.abandonCommittedRelocation(token),
-            .abandonedAllStale
-        )
+        let abandoned = try await fixture.bridge.abandonCommittedRelocation(token)
+        XCTAssertEqual(abandoned, .abandonedAllStale)
         let reply = await fixture.bridge.handleMessageBody(try saveBody(
             contextID: fixture.contextID,
             tabID: session.tabIDs[0],
@@ -442,9 +440,35 @@ final class MonacoBridgeTests: XCTestCase {
 
     func testRelocationRejectsNonOwnerClosedAndResynchronizingWithoutTokenOrFlush() async throws {
         let clientID = ClientInstanceID()
+        let closedFixture = makeBridgeFixture(clientID: clientID)
+        let closedDocumentID = DocumentID()
+        let closedTransport = try TestDocumentTransport.ready(
+            clientID: clientID,
+            documentID: closedDocumentID,
+            environmentID: EnvironmentID(),
+            path: RelativePath("fixture-only.txt")
+        )
+        let closedController = DocumentClientController(
+            clientInstanceID: clientID,
+            transport: closedTransport
+        )
+        try await closedFixture.resolver.retain(
+            contextID: closedFixture.contextID,
+            tabID: TabID(),
+            documentID: closedDocumentID,
+            controller: closedController,
+            language: "plaintext"
+        )
+        let closedToken = try await closedFixture.bridge.prepareRelocation(
+            workspaceContextID: closedFixture.contextID,
+            operation: .rename(source: RelativePath("authoritative-source.txt"), newName: "new.txt")
+        )
+        XCTAssertEqual(closedToken.affectedDocumentIDs, [])
+        let closedMetrics = await closedTransport.metrics()
+        XCTAssertEqual(closedMetrics.flushCount, 0)
+
         let cases: [(MonacoBridgeError, Bool, Bool)] = [
             (.staleDocumentState, true, false),
-            (.unknownDocument, false, false),
             (.resynchronizing, true, true),
         ]
         for (expectedError, opens, forceResync) in cases {
@@ -465,12 +489,12 @@ final class MonacoBridgeTests: XCTestCase {
                     requestWriteAccess: true
                 )
             }
-            if forceResync { await transport.setFlushError(.recoveryRequired) }
-            if forceResync { _ = try? await controller.flush() }
-            try fixture.resolver.retain(
+            try await fixture.resolver.retain(
                 contextID: fixture.contextID, tabID: TabID(), documentID: documentID,
                 controller: controller, language: "plaintext"
             )
+            if forceResync { await transport.setFlushError(.recoveryRequired) }
+            if forceResync { _ = try? await controller.flush() }
             do {
                 _ = try await fixture.bridge.prepareRelocation(
                     workspaceContextID: fixture.contextID,
@@ -513,17 +537,804 @@ final class MonacoBridgeTests: XCTestCase {
         let readyReply = await fixture.bridge.handleMessageBody([
             "type": "ready", "webContentGeneration": 2,
         ])
-        XCTAssertEqual(readyReply, .success(nil))
+        XCTAssertEqual(readyReply, .failure(.transportFailure))
         XCTAssertEqual(fixture.sink.openCount(documentID: first.documentID), 1)
         XCTAssertEqual(fixture.sink.openCount(documentID: second.documentID), 0)
         XCTAssertEqual(fixture.sink.lastSelected?.reference.tabID, first.tabIDs[0])
         XCTAssertEqual(fixture.errors.values[second.documentID], .transportFailure)
+        let recoveredReply = await fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 2,
+        ])
+        XCTAssertEqual(recoveredReply, .success(nil))
+        XCTAssertEqual(fixture.sink.openCount(documentID: second.documentID), 1)
         controller.tearDown()
+    }
+
+    func testRealWKWebViewGenerationOneRetainReadySelectAndReleaseMirrorsReferenceLifecycle() async throws {
+        let clientID = ClientInstanceID()
+        let documentID = DocumentID()
+        let environmentID = EnvironmentID()
+        let firstTabID = TabID()
+        let secondTabID = TabID()
+        let transport = try TestDocumentTransport.ready(
+            clientID: clientID,
+            documentID: documentID,
+            environmentID: environmentID,
+            path: RelativePath("lifecycle.txt")
+        )
+        let documentController = DocumentClientController(
+            clientInstanceID: clientID,
+            transport: transport
+        )
+        _ = try await documentController.open(
+            in: environmentID,
+            at: RelativePath("lifecycle.txt"),
+            requestWriteAccess: true
+        )
+        let fixture = makeBridgeFixture(clientID: clientID)
+        for tabID in [firstTabID, secondTabID] {
+            try await fixture.resolver.retain(
+                contextID: fixture.contextID,
+                tabID: tabID,
+                documentID: documentID,
+                controller: documentController,
+                language: "plaintext"
+            )
+        }
+        try fixture.resolver.select(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: documentID
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        let runtimeLoaded = try await waitForRuntimeLoad(controller.webView)
+        guard runtimeLoaded else { return XCTFail("production runtime navigation did not finish") }
+        try await Task.sleep(for: .milliseconds(200))
+
+        let uri = try MonacoFileURI.make(
+            environmentID: environmentID,
+            path: RelativePath("lifecycle.txt")
+        )
+        let initialReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        XCTAssertEqual(initialReferenceCount, 2)
+        try await fixture.bridge.select(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: documentID
+        )
+        let selectedReferenceCount = try await controller.webView.callAsyncJavaScript(
+            "return globalThis.cockpitEditorProtocol.referenceCount(uri)",
+            arguments: ["uri": uri],
+            in: nil,
+            contentWorld: .page
+        )
+        XCTAssertEqual(selectedReferenceCount as? Int, 2)
+
+        try await fixture.resolver.release(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: documentID
+        )
+        let retainedReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        XCTAssertEqual(retainedReferenceCount, 1)
+        try await fixture.resolver.release(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: documentID
+        )
+        let releasedReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        let releasedModelCount = try await javaScriptModelCount(in: controller.webView)
+        XCTAssertEqual(releasedReferenceCount, 0)
+        XCTAssertEqual(releasedModelCount, 0)
+        controller.tearDown()
+    }
+
+    func testRealWKWebViewJavaScriptRenameFailureRetainsRelocationForRetry() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let source = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "source.txt",
+            writable: true,
+            contexts: [fixture.contextID]
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        let runtimeLoaded = try await waitForRuntimeLoad(controller.webView)
+        guard runtimeLoaded else { return XCTFail("production runtime navigation did not finish") }
+        try await Task.sleep(for: .milliseconds(200))
+
+        let destinationPath = try RelativePath("destination.txt")
+        let collision = try makeOpenMessage(
+            contextID: .conversation(ConversationID()),
+            tabID: TabID(),
+            documentID: DocumentID(),
+            environmentID: source.environmentID,
+            path: destinationPath,
+            text: "collision\n"
+        )
+        let collisionReply = try await sendNativeMessage(collision, to: controller.webView)
+        XCTAssertEqual(collisionReply["ok"] as? Bool, true)
+        try await source.transport.setSnapshotPath(destinationPath)
+        let sourcePath = try RelativePath("source.txt")
+        let token = try await fixture.bridge.prepareRelocation(
+            workspaceContextID: fixture.contextID,
+            operation: .rename(source: sourcePath, newName: "destination.txt")
+        )
+        let first = try await fixture.bridge.commitRelocation(
+            token,
+            result: .relocated(from: sourcePath, to: destinationPath)
+        )
+        XCTAssertEqual(first, .incomplete(pendingDocumentIDs: [source.documentID]))
+
+        let staleSave = await fixture.bridge.handleMessageBody(try saveBody(
+            contextID: fixture.contextID,
+            tabID: source.tabIDs[0],
+            documentID: source.documentID,
+            environmentID: source.environmentID,
+            path: "source.txt",
+            leaseID: await source.transport.leaseID(),
+            writable: true
+        ))
+        XCTAssertEqual(staleSave, .failure(.resynchronizing))
+
+        let collisionAccess = access(from: collision)
+        let disposeCollisionReply = try await sendNativeMessage(
+            .disposeModel(webContentGeneration: 1, access: collisionAccess),
+            to: controller.webView
+        )
+        XCTAssertEqual(disposeCollisionReply["ok"] as? Bool, true)
+        let retry = try await fixture.bridge.retryRelocation(token)
+        XCTAssertEqual(retry, .complete)
+        let destinationURI = try MonacoFileURI.make(
+            environmentID: source.environmentID,
+            path: destinationPath
+        )
+        let destinationReferenceCount = try await javaScriptReferenceCount(
+            destinationURI,
+            in: controller.webView
+        )
+        XCTAssertEqual(destinationReferenceCount, 1)
+        controller.tearDown()
+    }
+
+    func testRealWKWebViewCrashDispatchFailureKeepsRestartPendingUntilExactSuccessReply() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let session = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "restart.txt",
+            writable: true,
+            contexts: [fixture.contextID]
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        let runtimeLoaded = try await waitForRuntimeLoad(controller.webView)
+        guard runtimeLoaded else { return XCTFail("production runtime navigation did not finish") }
+        try await Task.sleep(for: .milliseconds(200))
+        _ = try await controller.webView.evaluateJavaScript(
+            "globalThis.savedCockpitMonacoReceive = globalThis.cockpitMonacoReceive; delete globalThis.cockpitMonacoReceive; true"
+        )
+        try fixture.bridge.prepareForWebContentRestart(generation: 2)
+
+        let failed = await fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 2,
+        ])
+        XCTAssertEqual(failed, .failure(.transportFailure))
+        let userContentController = controller.webView.configuration.userContentController
+        userContentController.removeScriptMessageHandler(
+            forName: "cockpitMonaco",
+            contentWorld: .page
+        )
+        controller.loadRuntime()
+        let generationTwoLoaded = try await waitForRuntimeLoad(controller.webView)
+        guard generationTwoLoaded else {
+            return XCTFail("generation 2 production runtime navigation did not finish")
+        }
+        userContentController.addScriptMessageHandler(
+            try XCTUnwrap(controller.forwarder),
+            contentWorld: .page,
+            name: "cockpitMonaco"
+        )
+        let recovered = await fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 2,
+        ])
+        XCTAssertEqual(recovered, .success(nil))
+        let uri = try MonacoFileURI.make(
+            environmentID: session.environmentID,
+            path: RelativePath("restart.txt")
+        )
+        let rebuiltReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        XCTAssertEqual(rebuiltReferenceCount, 1)
+        controller.tearDown()
+    }
+
+    func testRelocationFiltersByLastAuthoritativePathBeforeUnrelatedInvalidStateValidation() async throws {
+        let invalidKinds: [UnrelatedInvalidSessionKind] = [.closed, .resynchronizing, .nonOwnerReady]
+        for invalidKind in invalidKinds {
+            let clientID = ClientInstanceID()
+            let fixture = makeBridgeFixture(clientID: clientID)
+            let affected = try await attachSession(
+                fixture: fixture,
+                clientID: clientID,
+                path: "source/affected.txt",
+                writable: true,
+                contexts: [fixture.contextID]
+            )
+            try await attachUnrelatedInvalidSession(
+                invalidKind,
+                fixture: fixture,
+                clientID: clientID,
+                path: RelativePath("unrelated/invalid.txt")
+            )
+            do {
+                let token = try await fixture.bridge.prepareRelocation(
+                    workspaceContextID: fixture.contextID,
+                    operation: .rename(source: RelativePath("source"), newName: "renamed")
+                )
+                XCTAssertEqual(token.affectedDocumentIDs, [affected.documentID])
+                try fixture.bridge.cancelRelocation(token)
+            } catch {
+                XCTFail("unrelated \(invalidKind) blocked affected relocation: \(error)")
+            }
+            let metrics = await affected.transport.metrics()
+            XCTAssertEqual(metrics.flushCount, 1)
+        }
+    }
+
+    func testNativeMessageEncoderEnforcesEverySafeBoundAndRejectsBeforeWebKitDispatch() async throws {
+        let maximum = documentJavaScriptMaximum
+        let validViewState = try makeViewState(line: maximum)
+        let invalidViewState = try makeViewState(line: maximum + 1)
+        let contextID = WorkspaceContextID.project(ProjectID())
+        let tabID = TabID()
+        let documentID = DocumentID()
+        let environmentID = EnvironmentID()
+        let leaseID = EditLeaseID()
+        let validAccess = MonacoDocumentAccess(
+            reference: MonacoDocumentReference(
+                workspaceContextID: contextID,
+                tabID: tabID,
+                documentID: documentID
+            ),
+            uri: try MonacoFileURI.make(
+                environmentID: environmentID,
+                path: RelativePath("bounds.txt")
+            ),
+            lastAcceptedClientSequence: maximum,
+            editLeaseID: leaseID,
+            writable: true
+        )
+        let validSnapshot = try makeSnapshot(
+            documentID: documentID,
+            environmentID: environmentID,
+            path: RelativePath("bounds.txt"),
+            documentVersion: maximum,
+            lease: try EditLease(
+                validatingID: leaseID,
+                documentID: documentID,
+                clientInstanceID: ClientInstanceID()
+            )
+        )
+        let validMessages: [MonacoNativeMessage] = [
+            .open(webContentGeneration: maximum, access: validAccess, language: "plaintext", snapshot: validSnapshot, viewState: validViewState),
+            .replace(webContentGeneration: maximum, access: validAccess, snapshot: validSnapshot, viewState: validViewState),
+            .renameModel(webContentGeneration: maximum, access: validAccess, oldURI: validAccess.uri, language: "plaintext", snapshot: validSnapshot, viewState: validViewState),
+            .selectModel(webContentGeneration: maximum, access: validAccess, viewState: validViewState),
+        ]
+        for message in validMessages {
+            XCTAssertNoThrow(try MonacoMessageCodec.javaScriptObject(for: message))
+        }
+        let invalidMessages: [MonacoNativeMessage] = [
+            .open(webContentGeneration: maximum + 1, access: validAccess, language: "plaintext", snapshot: validSnapshot, viewState: validViewState),
+            .replace(webContentGeneration: 1, access: validAccess, snapshot: validSnapshot, viewState: invalidViewState),
+            .renameModel(webContentGeneration: 1, access: validAccess, oldURI: validAccess.uri, language: "plaintext", snapshot: validSnapshot, viewState: invalidViewState),
+            .selectModel(webContentGeneration: 1, access: validAccess, viewState: invalidViewState),
+            .disposeModel(webContentGeneration: 1, access: MonacoDocumentAccess(
+                reference: validAccess.reference,
+                uri: validAccess.uri,
+                lastAcceptedClientSequence: maximum + 1,
+                editLeaseID: leaseID,
+                writable: true
+            )),
+        ]
+        for message in invalidMessages {
+            XCTAssertThrowsError(try MonacoMessageCodec.javaScriptObject(for: message)) {
+                XCTAssertEqual($0 as? MonacoBridgeError, .invalidSchema)
+            }
+        }
+        let unsafePosition = try TextPosition(
+            validatingLine: maximum + 1,
+            column: 2
+        )
+        var invalidCursor = validViewState
+        invalidCursor.cursor = unsafePosition
+        var invalidSelection = validViewState
+        invalidSelection.selections = [try TextRange(
+            validatingAnchor: unsafePosition,
+            active: unsafePosition
+        )]
+        var invalidFirstVisibleLine = validViewState
+        invalidFirstVisibleLine.firstVisibleLine = maximum + 1
+        var zeroFirstVisibleLine = validViewState
+        zeroFirstVisibleLine.firstVisibleLine = 0
+        var invalidInfiniteScroll = validViewState
+        invalidInfiniteScroll.horizontalScrollOffset = .infinity
+        var invalidNegativeScroll = validViewState
+        invalidNegativeScroll.horizontalScrollOffset = -1
+        for viewState in [
+            invalidCursor,
+            invalidSelection,
+            invalidFirstVisibleLine,
+            zeroFirstVisibleLine,
+            invalidInfiniteScroll,
+            invalidNegativeScroll,
+        ] {
+            XCTAssertThrowsError(try MonacoMessageCodec.javaScriptObject(for: .selectModel(
+                webContentGeneration: 1,
+                access: validAccess,
+                viewState: viewState
+            ))) {
+                XCTAssertEqual($0 as? MonacoBridgeError, .invalidSchema)
+            }
+        }
+
+        let recorder = ViewStateRecorder()
+        await recorder.store(
+            contextID: contextID,
+            tabID: tabID,
+            documentID: documentID,
+            value: invalidViewState
+        )
+        let clientID = ClientInstanceID()
+        let transport = try TestDocumentTransport.ready(
+            clientID: clientID,
+            documentID: documentID,
+            environmentID: environmentID,
+            path: RelativePath("bounds.txt")
+        )
+        let documentController = DocumentClientController(clientInstanceID: clientID, transport: transport)
+        _ = try await documentController.open(
+            in: environmentID,
+            at: RelativePath("bounds.txt"),
+            requestWriteAccess: true
+        )
+        let fixture = makeBridgeFixture(clientID: clientID, recorder: recorder)
+        try await fixture.resolver.retain(
+            contextID: contextID,
+            tabID: tabID,
+            documentID: documentID,
+            controller: documentController,
+            language: "plaintext"
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        do {
+            try await fixture.bridge.select(
+                contextID: contextID,
+                tabID: tabID,
+                documentID: documentID
+            )
+            XCTFail("unsafe view state reached WebKit dispatch")
+        } catch {
+            XCTAssertEqual(error as? MonacoBridgeError, .invalidSchema)
+        }
+        controller.tearDown()
+    }
+
+    func testRemoteAuthorityFileURLIsRejectedByHelperAndRealNavigationAction() async throws {
+        let fixture = makeBridgeFixture()
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        let runtimeLoaded = try await waitForRuntimeLoad(controller.webView)
+        guard runtimeLoaded else { return XCTFail("production runtime navigation did not finish") }
+        let index = runtimeBundleURL().appendingPathComponent("index.html")
+        let remote = try XCTUnwrap(URL(string: "file://remote.invalid\(index.path)"))
+        XCTAssertFalse(controller.allowsNavigation(
+            remote,
+            isMainFrame: true,
+            opensNewWindow: false,
+            isDownload: false
+        ))
+        _ = try await controller.webView.callAsyncJavaScript(
+            "location.href = target; return true",
+            arguments: ["target": remote.absoluteString],
+            in: nil,
+            contentWorld: .page
+        )
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(controller.webView.url?.host?.isEmpty ?? true)
+        XCTAssertEqual(controller.webView.url?.standardizedFileURL.path, index.standardizedFileURL.path)
+        controller.tearDown()
+    }
+
+    func testLiveRelocationOverlapResultDestinationPerReferenceViewStateAndPartialAbandon() async throws {
+        let clientID = ClientInstanceID()
+        let recorder = ViewStateRecorder()
+        let fixture = makeBridgeFixture(clientID: clientID, recorder: recorder)
+        let firstDocumentID = DocumentID(
+            UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
+        )
+        let secondDocumentID = DocumentID(
+            UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
+        )
+        let conversationContext = WorkspaceContextID.conversation(ConversationID())
+        let first = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            documentID: firstDocumentID,
+            path: "batch/a.txt",
+            writable: true,
+            contexts: [fixture.contextID, conversationContext]
+        )
+        let second = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            documentID: secondDocumentID,
+            path: "batch/b.txt",
+            writable: true,
+            contexts: [fixture.contextID]
+        )
+        await recorder.store(
+            contextID: fixture.contextID,
+            tabID: first.tabIDs[0],
+            documentID: first.documentID,
+            value: try makeViewState(line: 3)
+        )
+        await recorder.store(
+            contextID: conversationContext,
+            tabID: first.tabIDs[1],
+            documentID: first.documentID,
+            value: try makeViewState(line: 7)
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        let runtimeLoaded = try await waitForRuntimeLoad(controller.webView)
+        guard runtimeLoaded else { return XCTFail("production runtime navigation did not finish") }
+        try await Task.sleep(for: .milliseconds(200))
+        _ = try await controller.webView.evaluateJavaScript(
+            """
+            globalThis.cockpitReceivedNativeMessages = [];
+            globalThis.cockpitOriginalReceive = globalThis.cockpitMonacoReceive;
+            globalThis.cockpitMonacoReceive = message => {
+              globalThis.cockpitReceivedNativeMessages.push(message);
+              return globalThis.cockpitOriginalReceive(message);
+            };
+            true;
+            """
+        )
+
+        let source = try RelativePath("batch")
+        let operation = FileOperation.rename(source: source, newName: "renamed")
+        let firstToken = try await fixture.bridge.prepareRelocation(
+            workspaceContextID: fixture.contextID,
+            operation: operation
+        )
+        let flushesBeforeOverlap = await first.transport.metrics().flushCount
+        do {
+            _ = try await fixture.bridge.prepareRelocation(
+                workspaceContextID: fixture.contextID,
+                operation: operation
+            )
+            XCTFail("duplicate live operation created a second token")
+        } catch {
+            XCTAssertEqual(error as? MonacoBridgeError, .staleDocumentState)
+        }
+        do {
+            _ = try await fixture.bridge.prepareRelocation(
+                workspaceContextID: fixture.contextID,
+                operation: .rename(source: RelativePath("batch/a.txt"), newName: "other.txt")
+            )
+            XCTFail("overlapping live DocumentID created a second token")
+        } catch {
+            XCTAssertEqual(error as? MonacoBridgeError, .staleDocumentState)
+        }
+        let flushesAfterOverlap = await first.transport.metrics().flushCount
+        XCTAssertEqual(flushesAfterOverlap, flushesBeforeOverlap)
+        do {
+            _ = try await fixture.bridge.commitRelocation(
+                firstToken,
+                result: .relocated(
+                    from: RelativePath("wrong-source"),
+                    to: RelativePath("renamed")
+                )
+            )
+            XCTFail("mismatched relocated result committed")
+        } catch {
+            XCTAssertEqual(error as? MonacoBridgeError, .invalidSchema)
+        }
+        XCTAssertNoThrow(try fixture.bridge.cancelRelocation(firstToken))
+
+        let token = try await fixture.bridge.prepareRelocation(
+            workspaceContextID: fixture.contextID,
+            operation: operation
+        )
+        try await first.transport.setSnapshotPath(RelativePath("renamed/a.txt"))
+        try await second.transport.setSnapshotPath(RelativePath("wrong/b.txt"))
+        let partial = try await fixture.bridge.commitRelocation(
+            token,
+            result: .relocated(from: source, to: RelativePath("renamed"))
+        )
+        XCTAssertEqual(partial, .incomplete(pendingDocumentIDs: [second.documentID]))
+        try await Task.sleep(for: .milliseconds(200))
+        let migratedViewLines = try await controller.webView.callAsyncJavaScript(
+            """
+            return globalThis.cockpitReceivedNativeMessages
+              .filter(message => message.type === 'renameModel' && message.documentID === documentID)
+              .map(message => message.viewState.firstVisibleLine);
+            """,
+            arguments: ["documentID": first.documentID.description],
+            in: nil,
+            contentWorld: .page
+        ) as? [Int]
+        XCTAssertEqual(migratedViewLines, [3, 7])
+
+        let firstOldURI = try MonacoFileURI.make(
+            environmentID: first.environmentID,
+            path: RelativePath("batch/a.txt")
+        )
+        let firstDestinationURI = try MonacoFileURI.make(
+            environmentID: first.environmentID,
+            path: RelativePath("renamed/a.txt")
+        )
+        let secondOldURI = try MonacoFileURI.make(
+            environmentID: second.environmentID,
+            path: RelativePath("batch/b.txt")
+        )
+        let firstOldCount = try await javaScriptReferenceCount(firstOldURI, in: controller.webView)
+        let firstDestinationCount = try await javaScriptReferenceCount(
+            firstDestinationURI,
+            in: controller.webView
+        )
+        let secondOldCount = try await javaScriptReferenceCount(secondOldURI, in: controller.webView)
+        XCTAssertEqual(firstOldCount, 0)
+        XCTAssertEqual(firstDestinationCount, 2)
+        XCTAssertEqual(secondOldCount, 1)
+
+        let abandoned = try await fixture.bridge.abandonCommittedRelocation(token)
+        XCTAssertEqual(abandoned, .abandonedAllStale)
+        let firstAfterAbandon = try await javaScriptReferenceCount(
+            firstDestinationURI,
+            in: controller.webView
+        )
+        let secondAfterAbandon = try await javaScriptReferenceCount(secondOldURI, in: controller.webView)
+        XCTAssertEqual(firstAfterAbandon, 0)
+        XCTAssertEqual(secondAfterAbandon, 0)
+        let modelsAfterAbandon = try await javaScriptModelCount(in: controller.webView)
+        XCTAssertEqual(modelsAfterAbandon, 0)
+        controller.tearDown()
+    }
+
+    func testDecoderRejectsUnknownAndMissingKeysForEveryMonacoToNativeVariantAndUnsafeBounds() throws {
+        let contextID = WorkspaceContextID.project(ProjectID())
+        let tabID = TabID()
+        let documentID = DocumentID()
+        let environmentID = EnvironmentID()
+        let leaseID = EditLeaseID()
+        let viewState = try makeViewState(line: 1)
+        let variants: [[String: Any]] = [
+            ["type": "ready", "webContentGeneration": 1],
+            try editBody(
+                generation: 1,
+                contextID: contextID,
+                tabID: tabID,
+                documentID: documentID,
+                environmentID: environmentID,
+                leaseID: leaseID,
+                changes: [["offset": 0, "length": 0, "replacement": "x"]]
+            ),
+            try saveBody(
+                contextID: contextID,
+                tabID: tabID,
+                documentID: documentID,
+                environmentID: environmentID,
+                leaseID: leaseID,
+                writable: true
+            ),
+            try viewStateBody(
+                contextID: contextID,
+                tabID: tabID,
+                documentID: documentID,
+                environmentID: environmentID,
+                leaseID: leaseID,
+                value: viewState
+            ),
+        ]
+        for variant in variants {
+            var unknown = variant
+            unknown["unexpected"] = true
+            XCTAssertThrowsError(try MonacoMessageCodec.decode(unknown)) {
+                XCTAssertEqual($0 as? MonacoBridgeError, .invalidSchema)
+            }
+            for key in variant.keys {
+                var missing = variant
+                missing.removeValue(forKey: key)
+                XCTAssertThrowsError(try MonacoMessageCodec.decode(missing)) {
+                    XCTAssertEqual($0 as? MonacoBridgeError, .invalidSchema)
+                }
+            }
+        }
+        var unsafe = variants[1]
+        unsafe["baseVersion"] = Double(documentJavaScriptMaximum) + 1
+        XCTAssertThrowsError(try MonacoMessageCodec.decode(unsafe)) {
+            XCTAssertEqual($0 as? MonacoBridgeError, .invalidSchema)
+        }
     }
 }
 
 private enum MonacoTestScaffoldFailure: Error {
     case missingCSP
+}
+
+private enum UnrelatedInvalidSessionKind: CaseIterable {
+    case closed
+    case resynchronizing
+    case nonOwnerReady
+}
+
+@MainActor
+private func javaScriptReferenceCount(_ uri: String, in webView: WKWebView) async throws -> Int {
+    let result = try await webView.callAsyncJavaScript(
+        "return globalThis.cockpitEditorProtocol.referenceCount(uri)",
+        arguments: ["uri": uri],
+        in: nil,
+        contentWorld: .page
+    )
+    return try XCTUnwrap(result as? Int)
+}
+
+@MainActor
+private func javaScriptModelCount(in webView: WKWebView) async throws -> Int {
+    let result = try await webView.callAsyncJavaScript(
+        "return globalThis.cockpitEditorProtocol.modelCount()",
+        arguments: [:],
+        in: nil,
+        contentWorld: .page
+    )
+    return try XCTUnwrap(result as? Int)
+}
+
+@MainActor
+private func sendNativeMessage(
+    _ message: MonacoNativeMessage,
+    to webView: WKWebView
+) async throws -> [String: Any] {
+    let object = try MonacoMessageCodec.javaScriptObject(for: message)
+    let result = try await webView.callAsyncJavaScript(
+        "return globalThis.cockpitMonacoReceive(message)",
+        arguments: ["message": object],
+        in: nil,
+        contentWorld: .page
+    )
+    return try XCTUnwrap(result as? [String: Any])
+}
+
+private func makeOpenMessage(
+    contextID: WorkspaceContextID,
+    tabID: TabID,
+    documentID: DocumentID,
+    environmentID: EnvironmentID,
+    path: RelativePath,
+    text: String
+) throws -> MonacoNativeMessage {
+    let access = MonacoDocumentAccess(
+        reference: MonacoDocumentReference(
+            workspaceContextID: contextID,
+            tabID: tabID,
+            documentID: documentID
+        ),
+        uri: try MonacoFileURI.make(environmentID: environmentID, path: path),
+        lastAcceptedClientSequence: 0,
+        editLeaseID: nil,
+        writable: false
+    )
+    return .open(
+        webContentGeneration: 1,
+        access: access,
+        language: "plaintext",
+        snapshot: try makeSnapshot(
+            documentID: documentID,
+            environmentID: environmentID,
+            path: path,
+            text: text,
+            lease: nil
+        ),
+        viewState: nil
+    )
+}
+
+private func access(from message: MonacoNativeMessage) -> MonacoDocumentAccess {
+    guard case let .open(_, access, _, _, _) = message else {
+        preconditionFailure("expected open message")
+    }
+    return access
+}
+
+@MainActor
+private func attachUnrelatedInvalidSession(
+    _ kind: UnrelatedInvalidSessionKind,
+    fixture: BridgeFixture,
+    clientID: ClientInstanceID,
+    path: RelativePath
+) async throws {
+    let documentID = DocumentID()
+    let environmentID = EnvironmentID()
+    switch kind {
+    case .closed:
+        let transport = try TestDocumentTransport.ready(
+            clientID: clientID,
+            documentID: documentID,
+            environmentID: environmentID,
+            path: path
+        )
+        let controller = DocumentClientController(clientInstanceID: clientID, transport: transport)
+        try await fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: TabID(),
+            documentID: documentID,
+            controller: controller,
+            language: "plaintext"
+        )
+    case .resynchronizing:
+        let transport = try TestDocumentTransport.ready(
+            clientID: clientID,
+            documentID: documentID,
+            environmentID: environmentID,
+            path: path
+        )
+        let controller = DocumentClientController(clientInstanceID: clientID, transport: transport)
+        _ = try await controller.open(in: environmentID, at: path, requestWriteAccess: true)
+        try await fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: TabID(),
+            documentID: documentID,
+            controller: controller,
+            language: "plaintext"
+        )
+        await transport.setFlushError(.recoveryRequired)
+        _ = try? await controller.flush()
+    case .nonOwnerReady:
+        let transport = try TestDocumentTransport.ready(
+            clientID: ClientInstanceID(),
+            documentID: documentID,
+            environmentID: environmentID,
+            path: path
+        )
+        let controller = DocumentClientController(clientInstanceID: clientID, transport: transport)
+        _ = try await controller.open(in: environmentID, at: path, requestWriteAccess: true)
+        try await fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: TabID(),
+            documentID: documentID,
+            controller: controller,
+            language: "plaintext"
+        )
+    }
 }
 
 @MainActor
@@ -561,7 +1372,9 @@ private func waitForRuntimeLoad(_ webView: WKWebView) async throws -> Bool {
     let deadline = ContinuousClock.now + .seconds(10)
     while ContinuousClock.now < deadline {
         if webView.isLoading == false,
-           (try? await webView.evaluateJavaScript("document.readyState")) as? String == "complete" {
+           (try? await webView.evaluateJavaScript(
+               "document.readyState === 'complete' && typeof globalThis.cockpitMonacoReceive === 'function'"
+           )) as? Bool == true {
             return true
         }
         try await Task.sleep(for: .milliseconds(20))
@@ -824,7 +1637,7 @@ private func makeReadySession(path: String) async throws -> ReadySession {
     let controller = DocumentClientController(clientInstanceID: clientID, transport: transport)
     _ = try await controller.open(in: environmentID, at: RelativePath(path), requestWriteAccess: true)
     let fixture = makeBridgeFixture(clientID: clientID)
-    try fixture.resolver.retain(
+    try await fixture.resolver.retain(
         contextID: fixture.contextID, tabID: tabID, documentID: documentID,
         controller: controller, language: "plaintext"
     )
@@ -850,11 +1663,11 @@ private struct AttachedSession {
 private func attachSession(
     fixture: BridgeFixture,
     clientID: ClientInstanceID,
+    documentID: DocumentID = DocumentID(),
     path: String,
     writable: Bool,
     contexts: [WorkspaceContextID]
 ) async throws -> AttachedSession {
-    let documentID = DocumentID()
     let environmentID = EnvironmentID()
     let transport = writable
         ? try TestDocumentTransport.ready(
@@ -879,7 +1692,7 @@ private func attachSession(
     for context in contexts {
         let tabID = TabID()
         tabIDs.append(tabID)
-        try fixture.resolver.retain(
+        try await fixture.resolver.retain(
             contextID: context,
             tabID: tabID,
             documentID: documentID,

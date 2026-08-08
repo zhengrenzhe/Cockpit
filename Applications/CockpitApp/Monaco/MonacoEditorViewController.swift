@@ -26,25 +26,36 @@ final class WeakMonacoScriptMessageHandler: NSObject, WKScriptMessageHandlerWith
 @MainActor
 private final class MonacoJavaScriptMessageDispatcher {
     private weak var webView: WKWebView?
-    private var tail: Task<Void, Never>?
+    private var tail: Task<Void, any Error>?
     private var isActive = true
 
     init(webView: WKWebView) {
         self.webView = webView
     }
 
-    func enqueue(_ message: [String: Any]) {
-        guard isActive else { return }
+    func dispatch(_ message: [String: Any]) async throws {
+        guard isActive else { throw MonacoBridgeError.transportFailure }
         let previous = tail
-        tail = Task { @MainActor [weak self, weak webView] in
-            await previous?.value
-            guard let self, self.isActive, let webView else { return }
-            _ = try? await webView.callAsyncJavaScript(
+        let current = Task { @MainActor [weak self, weak webView] in
+            if let previous { _ = await previous.result }
+            guard let self, self.isActive, let webView else {
+                throw MonacoBridgeError.transportFailure
+            }
+            let reply = try await webView.callAsyncJavaScript(
                 "return globalThis.cockpitMonacoReceive(message)",
                 arguments: ["message": message],
                 in: nil,
                 contentWorld: .page
             )
+            try Self.validate(reply)
+        }
+        tail = current
+        do {
+            try await current.value
+        } catch let error as MonacoBridgeError {
+            throw error
+        } catch {
+            throw MonacoBridgeError.transportFailure
         }
     }
 
@@ -53,6 +64,37 @@ private final class MonacoJavaScriptMessageDispatcher {
         tail?.cancel()
         tail = nil
         webView = nil
+    }
+
+    private static func validate(_ value: Any?) throws {
+        guard let reply = value as? [String: Any],
+              let ok = reply["ok"] as? Bool
+        else { throw MonacoBridgeError.transportFailure }
+        if ok {
+            guard Set(reply.keys) == ["ok"] else {
+                throw MonacoBridgeError.transportFailure
+            }
+            return
+        }
+        guard Set(reply.keys) == ["ok", "error"],
+              let code = reply["error"] as? String,
+              let error = bridgeError(for: code)
+        else { throw MonacoBridgeError.transportFailure }
+        throw error
+    }
+
+    private static func bridgeError(for code: String) -> MonacoBridgeError? {
+        switch code {
+        case MonacoBridgeError.invalidSchema.wireCode: .invalidSchema
+        case MonacoBridgeError.staleGeneration.wireCode: .staleGeneration
+        case MonacoBridgeError.staleDocumentState.wireCode: .staleDocumentState
+        case MonacoBridgeError.unknownDocument.wireCode: .unknownDocument
+        case MonacoBridgeError.readOnly.wireCode: .readOnly
+        case MonacoBridgeError.resynchronizing.wireCode: .resynchronizing
+        case MonacoBridgeError.fileMissing.wireCode: .fileMissing
+        case MonacoBridgeError.transportFailure.wireCode: .transportFailure
+        default: nil
+        }
     }
 }
 
@@ -89,7 +131,8 @@ public final class MonacoEditorViewController: NSViewController, WKNavigationDel
         webView.uiDelegate = self
         bridge.setSink { [weak dispatcher] message in
             let object = try MonacoMessageCodec.javaScriptObject(for: message)
-            dispatcher?.enqueue(object)
+            guard let dispatcher else { throw MonacoBridgeError.transportFailure }
+            try await dispatcher.dispatch(object)
         }
     }
 
@@ -122,6 +165,11 @@ public final class MonacoEditorViewController: NSViewController, WKNavigationDel
         guard let url, url.isFileURL, isMainFrame, !opensNewWindow, !isDownload else {
             return false
         }
+        guard (url.host ?? "").isEmpty,
+              url.user?.isEmpty ?? true,
+              url.password?.isEmpty ?? true,
+              url.port == nil
+        else { return false }
         let root = runtimeBundleURL.resolvingSymlinksInPath().standardizedFileURL.path
         let target = url.resolvingSymlinksInPath().standardizedFileURL.path
         return target == root || target.hasPrefix(root + "/")

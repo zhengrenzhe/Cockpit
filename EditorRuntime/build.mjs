@@ -32,6 +32,8 @@ const staging = join(dist, `${stagingPrefix}${ownerToken}`);
 const expectedFiles = ['editor.css', 'editor.js', 'editor.js.map', 'index.html'];
 const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; img-src 'self'; font-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'";
 const contentSecurityPolicyMeta = `<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">`;
+const moduleScriptTag = '<script type="module" src="./editor.js"></script>';
+const classicScriptTag = '<script type="application/javascript" src="./editor.js"></script>';
 const stagingFileAllowlist = new Set([...expectedFiles, 'editor.css.map']);
 const canonicalRuntimeRoot = await realpath(runtimeRoot);
 const expectedCanonicalDist = join(canonicalRuntimeRoot, 'dist');
@@ -503,7 +505,11 @@ async function buildStagingBundle() {
   if (!headOpening || /http-equiv=["']Content-Security-Policy["']/i.test(sourceIndexHTML)) {
     throw new Error('runtime index must contain one CSP-free head element');
   }
-  const generatedIndexHTML = `${sourceIndexHTML.slice(0, headOpening.index + headOpening[0].length)}${contentSecurityPolicyMeta}${sourceIndexHTML.slice(headOpening.index + headOpening[0].length)}`;
+  if (sourceIndexHTML.split(moduleScriptTag).length !== 2) {
+    throw new Error('runtime index must contain one canonical module script tag');
+  }
+  const classicIndexHTML = sourceIndexHTML.replace(moduleScriptTag, classicScriptTag);
+  const generatedIndexHTML = `${classicIndexHTML.slice(0, headOpening.index + headOpening[0].length)}${contentSecurityPolicyMeta}${classicIndexHTML.slice(headOpening.index + headOpening[0].length)}`;
   await writeFile(join(staging, 'index.html'), generatedIndexHTML);
   const entryPoint = (
     process.env.NODE_ENV === 'test'
@@ -515,7 +521,7 @@ async function buildStagingBundle() {
     entryPoints: [entryPoint],
     outfile: join(staging, 'editor.js'),
     bundle: true,
-    format: 'esm',
+    format: 'iife',
     platform: 'browser',
     target: 'safari18',
     minify: true,
@@ -523,6 +529,21 @@ async function buildStagingBundle() {
     sourcesContent: false,
     legalComments: 'none',
     logLevel: 'info',
+    plugins: [{
+      name: 'classic-file-runtime',
+      setup(buildContext) {
+        buildContext.onLoad(
+          { filter: /(?:editorWorkerService|standaloneWebWorkerService)\.js$/ },
+          async ({ path }) => ({
+            contents: (await readFile(path, 'utf8')).replaceAll(
+              'import.meta.url',
+              'globalThis.location.href',
+            ),
+            loader: 'js',
+          }),
+        );
+      },
+    }],
   });
   await unlink(join(staging, 'editor.css.map'));
   const snapshot = await bundleSnapshot(staging);
