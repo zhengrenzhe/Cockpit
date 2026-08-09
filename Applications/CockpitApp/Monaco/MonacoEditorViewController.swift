@@ -194,13 +194,22 @@ public final class MonacoEditorViewController: NSViewController, WKNavigationDel
     }
 
     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        guard webView === self.webView,
-              bridge.webContentGeneration < documentJavaScriptMaximum,
-              (try? bridge.prepareForWebContentRestart(
-                generation: bridge.webContentGeneration + 1
-              )) != nil
-        else { return }
-        loadRuntime()
+        guard webView === self.webView else { return }
+        Task { @MainActor [weak self, weak webView] in
+            guard let self, let webView, webView === self.webView,
+                  !self.tornDown,
+                  self.bridge.webContentGeneration < documentJavaScriptMaximum
+            else { return }
+            do {
+                try await self.bridge.prepareForWebContentRestart(
+                    generation: self.bridge.webContentGeneration + 1
+                )
+            } catch {
+                return
+            }
+            guard webView === self.webView, !self.tornDown else { return }
+            self.loadRuntime()
+        }
     }
 
     public func webView(

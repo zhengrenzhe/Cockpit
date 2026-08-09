@@ -168,5 +168,6 @@ schemes:
       config: Debug
       commandLineArguments:
         -XCTDisableAggressiveSymbolication: true
+        YES: true
       targets:
         - CockpitAppTests

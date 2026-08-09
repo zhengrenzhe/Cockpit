@@ -174,11 +174,11 @@ public final class MonacoWindowSessionResolver {
             }
             guard !session.references.contains(reference) else { return }
             let revision = session.revision
+            if let authoritativeSnapshot { session.remember(authoritativeSnapshot) }
             try await retainLifecycle(session, reference)
             guard sessions[documentID] === session, session.revision == revision else {
                 throw MonacoBridgeError.staleDocumentState
             }
-            if let authoritativeSnapshot { session.remember(authoritativeSnapshot) }
             session.add(reference: reference)
             return
         }

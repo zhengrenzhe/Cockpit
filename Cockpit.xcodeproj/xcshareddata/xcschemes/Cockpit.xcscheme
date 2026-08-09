@@ -98,6 +98,10 @@
             argument = "-XCTDisableAggressiveSymbolication"
             isEnabled = "YES">
          </CommandLineArgument>
+         <CommandLineArgument
+            argument = "YES"
+            isEnabled = "YES">
+         </CommandLineArgument>
       </CommandLineArguments>
    </TestAction>
    <LaunchAction

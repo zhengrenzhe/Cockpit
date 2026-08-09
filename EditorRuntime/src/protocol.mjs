@@ -493,9 +493,6 @@ export function createEditorProtocol(monaco, editor, options = {}) {
       documentVersion: message.documentVersion,
       viewState: message.viewState,
     });
-    if (!isSameDocumentAttach || selectedReferenceKey === undefined) {
-      selectReference(key, message.viewState);
-    }
     return { ok: true };
   }
 

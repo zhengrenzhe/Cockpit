@@ -76,6 +76,13 @@ public final class MonacoBridge {
     private var restartPending = false
     private var restartSelection: MonacoDocumentReference?
     private var readyGeneration: UInt64?
+    private var pendingRestartGeneration: UInt64?
+    // Module-internal observation seam after authoritative rebuild state is loaded.
+    // The production nil path performs no callback and introduces no suspension.
+    var rebuildStateObserver: (@MainActor @Sendable (
+        DocumentID,
+        DocumentClientControllerState
+    ) async -> Void)?
 
     public init(
         resolver: MonacoWindowSessionResolver,
@@ -107,69 +114,73 @@ public final class MonacoBridge {
     public func handleMessageBody(_ body: Any) async -> MonacoNativeReply {
         do {
             let message = try MonacoMessageCodec.decode(body)
-            guard message.generation == webContentGeneration else {
-                throw MonacoBridgeError.staleGeneration
-            }
-            switch message {
-            case let .ready(generation):
-                try await resolver.withLifecycleGate {
+            return try await resolver.withLifecycleGate {
+                try self.requireCurrentGeneration(message.generation)
+                switch message {
+                case let .ready(generation):
                     try self.requireCurrentGeneration(generation)
                     if self.restartPending {
                         try await self.rebuildAfterWebContentRestart(generation: generation)
                     } else {
                         try await self.openInitialContentIfNeeded(generation: generation)
                     }
+                    return .success(nil)
+                case let .edit(generation, incomingAccess, baseVersion, changes):
+                    let (session, snapshot, access) = try await self.validatedAccess(incomingAccess)
+                    guard access.writable, access.editLeaseID != nil else {
+                        throw MonacoBridgeError.readOnly
+                    }
+                    guard baseVersion == snapshot.documentVersion else {
+                        throw MonacoBridgeError.staleDocumentState
+                    }
+                    let acknowledgement = try await session.controller.submit(changes)
+                    try self.requireCurrentGeneration(generation)
+                    let (_, refreshedAccess) = try await self.currentSnapshotAndAccess(
+                        reference: incomingAccess.reference,
+                        session: session
+                    )
+                    try self.requireCurrentGeneration(generation)
+                    return .success(.acknowledgement(
+                        webContentGeneration: generation,
+                        access: refreshedAccess,
+                        acknowledgement: acknowledgement
+                    ))
+                case let .save(generation, incomingAccess):
+                    let (session, snapshot, access) = try await self.validatedAccess(incomingAccess)
+                    guard access.writable else { throw MonacoBridgeError.readOnly }
+                    guard let fingerprint = snapshot.observedDiskFingerprint else {
+                        throw MonacoBridgeError.fileMissing
+                    }
+                    _ = try await session.controller.save(expectedFingerprint: fingerprint)
+                    try self.requireCurrentGeneration(generation)
+                    let (replacement, refreshedAccess) = try await self.currentSnapshotAndAccess(
+                        reference: incomingAccess.reference,
+                        session: session
+                    )
+                    try self.requireCurrentGeneration(generation)
+                    let viewState = await self.resolver.loadViewState(
+                        incomingAccess.reference.workspaceContextID,
+                        incomingAccess.reference.tabID,
+                        incomingAccess.reference.documentID
+                    )
+                    try self.requireCurrentGeneration(generation)
+                    return .success(.replace(
+                        webContentGeneration: generation,
+                        access: refreshedAccess,
+                        snapshot: replacement,
+                        viewState: viewState
+                    ))
+                case let .viewState(generation, incomingAccess, value):
+                    _ = try await self.validatedAccess(incomingAccess)
+                    try await self.resolver.storeViewState(
+                        incomingAccess.reference.workspaceContextID,
+                        incomingAccess.reference.tabID,
+                        incomingAccess.reference.documentID,
+                        value
+                    )
+                    try self.requireCurrentGeneration(generation)
+                    return .success(nil)
                 }
-                return .success(nil)
-            case let .edit(_, incomingAccess, baseVersion, changes):
-                let (session, snapshot, access) = try await validatedAccess(incomingAccess)
-                guard access.writable, access.editLeaseID != nil else {
-                    throw MonacoBridgeError.readOnly
-                }
-                guard baseVersion == snapshot.documentVersion else {
-                    throw MonacoBridgeError.staleDocumentState
-                }
-                let acknowledgement = try await session.controller.submit(changes)
-                let (_, refreshedAccess) = try await currentSnapshotAndAccess(
-                    reference: incomingAccess.reference,
-                    session: session
-                )
-                return .success(.acknowledgement(
-                    webContentGeneration: webContentGeneration,
-                    access: refreshedAccess,
-                    acknowledgement: acknowledgement
-                ))
-            case let .save(_, incomingAccess):
-                let (session, snapshot, access) = try await validatedAccess(incomingAccess)
-                guard access.writable else { throw MonacoBridgeError.readOnly }
-                guard let fingerprint = snapshot.observedDiskFingerprint else {
-                    throw MonacoBridgeError.fileMissing
-                }
-                _ = try await session.controller.save(expectedFingerprint: fingerprint)
-                let (replacement, refreshedAccess) = try await currentSnapshotAndAccess(
-                    reference: incomingAccess.reference,
-                    session: session
-                )
-                let viewState = await resolver.loadViewState(
-                    incomingAccess.reference.workspaceContextID,
-                    incomingAccess.reference.tabID,
-                    incomingAccess.reference.documentID
-                )
-                return .success(.replace(
-                    webContentGeneration: webContentGeneration,
-                    access: refreshedAccess,
-                    snapshot: replacement,
-                    viewState: viewState
-                ))
-            case let .viewState(_, incomingAccess, value):
-                _ = try await validatedAccess(incomingAccess)
-                try await resolver.storeViewState(
-                    incomingAccess.reference.workspaceContextID,
-                    incomingAccess.reference.tabID,
-                    incomingAccess.reference.documentID,
-                    value
-                )
-                return .success(nil)
             }
         } catch {
             return .failure(Self.bridgeError(error))
@@ -183,7 +194,7 @@ public final class MonacoBridge {
     ) async throws {
         let generation = webContentGeneration
         try await resolver.withLifecycleGate {
-            try self.requireCurrentGeneration(generation)
+            try self.requireUnreservedGeneration(generation)
             let reservation = try self.resolver.selectionReservation(
                 contextID: contextID,
                 tabID: tabID,
@@ -193,27 +204,44 @@ public final class MonacoBridge {
                 reference: reservation.reference,
                 session: reservation.session
             )
-            try self.requireCurrentGeneration(generation)
+            try self.requireUnreservedGeneration(generation)
             let viewState = await self.resolver.loadViewState(contextID, tabID, documentID)
-            try self.requireCurrentGeneration(generation)
+            try self.requireUnreservedGeneration(generation)
             try await self.sink(.selectModel(
                 webContentGeneration: generation,
                 access: access,
                 viewState: viewState
             ))
-            try self.requireCurrentGeneration(generation)
+            try self.requireUnreservedGeneration(generation)
             try self.resolver.commitSelection(reservation)
         }
     }
 
-    public func prepareForWebContentRestart(generation: UInt64) throws {
+    public func prepareForWebContentRestart(generation: UInt64) async throws {
         guard webContentGeneration < documentJavaScriptMaximum,
-              generation == webContentGeneration + 1
+              generation == webContentGeneration + 1,
+              pendingRestartGeneration == nil
         else { throw MonacoBridgeError.invalidSchema }
-        webContentGeneration = generation
-        restartPending = true
-        restartSelection = resolver.selectedReference
-        readyGeneration = nil
+        let selected = resolver.selectedReference
+        pendingRestartGeneration = generation
+        do {
+            try await resolver.withLifecycleGate {
+                guard self.pendingRestartGeneration == generation,
+                      self.webContentGeneration < documentJavaScriptMaximum,
+                      generation == self.webContentGeneration + 1
+                else { throw MonacoBridgeError.invalidSchema }
+                self.webContentGeneration = generation
+                self.restartPending = true
+                self.restartSelection = selected
+                self.readyGeneration = nil
+                self.pendingRestartGeneration = nil
+            }
+        } catch {
+            if pendingRestartGeneration == generation {
+                pendingRestartGeneration = nil
+            }
+            throw error
+        }
     }
 
     public func prepareRelocation(
@@ -525,13 +553,18 @@ public final class MonacoBridge {
     }
 
     private func rebuildAfterWebContentRestart(generation: UInt64) async throws {
-        try requireCurrentGeneration(generation)
+        try requireUnreservedGeneration(generation)
         let selected = restartSelection
         var rebuilt: Set<DocumentID> = []
         var firstFailure: MonacoBridgeError?
         for session in resolver.allSessionsSortedByDocumentID() {
             let requestWriteAccess: Bool
-            switch await session.controller.state {
+            let state = await session.controller.state
+            if let rebuildStateObserver {
+                await rebuildStateObserver(session.documentID, state)
+            }
+            try requireUnreservedGeneration(generation)
+            switch state {
             case let .ready(snapshot):
                 requestWriteAccess = snapshot.currentLease?.clientInstanceID == resolver.clientInstanceID
             case .readOnly:
@@ -542,21 +575,20 @@ public final class MonacoBridge {
                 if firstFailure == nil { firstFailure = .resynchronizing }
                 continue
             }
-            try requireCurrentGeneration(generation)
+            try requireUnreservedGeneration(generation)
             do {
                 _ = try await session.controller.resynchronize(
                     requestWriteAccess: requestWriteAccess
                 )
-                try requireCurrentGeneration(generation)
+                try requireUnreservedGeneration(generation)
                 blockedDocumentIDs.remove(session.documentID)
                 for reference in session.references {
                     try await open(reference, session: session, generation: generation)
+                    try requireUnreservedGeneration(generation)
                 }
                 rebuilt.insert(session.documentID)
             } catch {
-                guard generation == webContentGeneration else {
-                    throw MonacoBridgeError.staleGeneration
-                }
+                try requireUnreservedGeneration(generation)
                 let failure = Self.bridgeError(error)
                 blockedDocumentIDs.insert(session.documentID)
                 ownerErrorHandler(session.documentID, failure)
@@ -564,23 +596,36 @@ public final class MonacoBridge {
             }
         }
         if let selected, rebuilt.contains(selected.documentID),
-           let session = resolver.session(documentID: selected.documentID) {
-            let (_, access) = try await currentSnapshotAndAccess(reference: selected, session: session)
-            let viewState = await resolver.loadViewState(
-                selected.workspaceContextID,
-                selected.tabID,
-                selected.documentID
-            )
-            try requireCurrentGeneration(generation)
-            try await sink(.selectModel(
-                webContentGeneration: generation,
-                access: access,
-                viewState: viewState
-            ))
-            try requireCurrentGeneration(generation)
+           let session = resolver.session(documentID: selected.documentID),
+           session.references.contains(selected) {
+            do {
+                try requireUnreservedGeneration(generation)
+                let (_, access) = try await currentSnapshotAndAccess(
+                    reference: selected,
+                    session: session
+                )
+                try requireUnreservedGeneration(generation)
+                let viewState = await resolver.loadViewState(
+                    selected.workspaceContextID,
+                    selected.tabID,
+                    selected.documentID
+                )
+                try requireUnreservedGeneration(generation)
+                try await sink(.selectModel(
+                    webContentGeneration: generation,
+                    access: access,
+                    viewState: viewState
+                ))
+                try requireUnreservedGeneration(generation)
+            } catch {
+                try requireUnreservedGeneration(generation)
+                let failure = Self.bridgeError(error)
+                ownerErrorHandler(selected.documentID, failure)
+                if firstFailure == nil { firstFailure = failure }
+            }
         }
         if let firstFailure { throw firstFailure }
-        try requireCurrentGeneration(generation)
+        try requireUnreservedGeneration(generation)
         restartPending = false
         restartSelection = nil
         readyGeneration = generation
@@ -588,6 +633,13 @@ public final class MonacoBridge {
 
     private func requireCurrentGeneration(_ generation: UInt64) throws {
         guard generation == webContentGeneration else {
+            throw MonacoBridgeError.staleGeneration
+        }
+    }
+
+    private func requireUnreservedGeneration(_ generation: UInt64) throws {
+        try requireCurrentGeneration(generation)
+        guard pendingRestartGeneration == nil else {
             throw MonacoBridgeError.staleGeneration
         }
     }

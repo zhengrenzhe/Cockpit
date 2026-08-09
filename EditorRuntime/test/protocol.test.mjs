@@ -218,6 +218,38 @@ test('monaco post-ready attach preserves acknowledged live text and selected ref
   assert.deepEqual(harness.editor.restored.at(-1), viewState(8));
 });
 
+test('monaco post-ready open of another document does not select before exact selectModel', () => {
+  const harness = createHarness();
+  const secondDocumentID = '88888888-8888-4888-8888-888888888888';
+  const secondURI = 'cockpit-file://77777777-7777-4777-8777-777777777777/src/other.ts';
+  assert.deepEqual(harness.protocol.receiveNativeMessage(openMessage()), { ok: true });
+  assert.deepEqual(harness.protocol.receiveNativeMessage({
+    type: 'selectModel', ...documentFields(), viewState: viewState(2),
+  }), { ok: true });
+  assert.strictEqual(harness.editor.model, harness.models.get(uri));
+
+  assert.deepEqual(harness.protocol.receiveNativeMessage(openMessage({
+    tabID: secondTabID,
+    documentID: secondDocumentID,
+    uri: secondURI,
+    text: 'background document\n',
+    viewState: viewState(8),
+  })), { ok: true });
+
+  assert.equal(harness.protocol.modelCount(), 2);
+  assert.strictEqual(harness.editor.model, harness.models.get(uri));
+  assert.deepEqual(harness.protocol.receiveNativeMessage({
+    type: 'selectModel',
+    ...documentFields({
+      tabID: secondTabID,
+      documentID: secondDocumentID,
+      uri: secondURI,
+    }),
+    viewState: viewState(8),
+  }), { ok: true });
+  assert.strictEqual(harness.editor.model, harness.models.get(secondURI));
+});
+
 test('monaco programmatic open and replace writes are synchronously suppressed from edit callbacks', () => {
   const harness = createHarness();
   assert.deepEqual(harness.protocol.receiveNativeMessage(openMessage()), { ok: true });
