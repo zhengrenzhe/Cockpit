@@ -479,14 +479,23 @@ export function createEditorProtocol(monaco, editor, options = {}) {
     const key = referenceKey(message);
     const previous = references.get(key);
     if (previous && previous.uri !== message.uri) releaseReference(key);
-    const entry = managedModel(message.uri, message.text, message.language);
+    const existing = models.get(message.uri);
+    const isSameDocumentAttach = existing !== undefined
+      && [...existing.referenceKeys].some(
+        (referenceKeyValue) => references.get(referenceKeyValue)?.documentID === message.documentID,
+      );
+    const entry = isSameDocumentAttach
+      ? existing
+      : managedModel(message.uri, message.text, message.language);
     entry.referenceKeys.add(key);
     references.set(key, {
       ...accessFields(message),
       documentVersion: message.documentVersion,
       viewState: message.viewState,
     });
-    selectReference(key, message.viewState);
+    if (!isSameDocumentAttach || selectedReferenceKey === undefined) {
+      selectReference(key, message.viewState);
+    }
     return { ok: true };
   }
 

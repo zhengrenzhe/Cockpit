@@ -537,11 +537,11 @@ final class MonacoBridgeTests: XCTestCase {
         let readyReply = await fixture.bridge.handleMessageBody([
             "type": "ready", "webContentGeneration": 2,
         ])
-        XCTAssertEqual(readyReply, .failure(.transportFailure))
+        XCTAssertEqual(readyReply, .failure(.staleDocumentState))
         XCTAssertEqual(fixture.sink.openCount(documentID: first.documentID), 1)
         XCTAssertEqual(fixture.sink.openCount(documentID: second.documentID), 0)
         XCTAssertEqual(fixture.sink.lastSelected?.reference.tabID, first.tabIDs[0])
-        XCTAssertEqual(fixture.errors.values[second.documentID], .transportFailure)
+        XCTAssertEqual(fixture.errors.values[second.documentID], .staleDocumentState)
         let recoveredReply = await fixture.bridge.handleMessageBody([
             "type": "ready", "webContentGeneration": 2,
         ])
@@ -572,18 +572,16 @@ final class MonacoBridgeTests: XCTestCase {
             requestWriteAccess: true
         )
         let fixture = makeBridgeFixture(clientID: clientID)
-        for tabID in [firstTabID, secondTabID] {
-            try await fixture.resolver.retain(
-                contextID: fixture.contextID,
-                tabID: tabID,
-                documentID: documentID,
-                controller: documentController,
-                language: "plaintext"
-            )
-        }
+        try await fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: documentID,
+            controller: documentController,
+            language: "plaintext"
+        )
         try fixture.resolver.select(
             contextID: fixture.contextID,
-            tabID: secondTabID,
+            tabID: firstTabID,
             documentID: documentID
         )
         let controller = MonacoEditorViewController(
@@ -601,7 +599,48 @@ final class MonacoBridgeTests: XCTestCase {
             path: RelativePath("lifecycle.txt")
         )
         let initialReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
-        XCTAssertEqual(initialReferenceCount, 2)
+        XCTAssertEqual(initialReferenceCount, 1)
+        _ = try await controller.webView.callAsyncJavaScript(
+            "globalThis.cockpitEditorProtocol.openText(uri, text, 'plaintext'); return true",
+            arguments: ["uri": uri, "text": "acknowledged live edit\nsecond line\n"],
+            in: nil,
+            contentWorld: .page
+        )
+        let editAccepted = try await waitUntil {
+            await transport.metrics().applyCount == 1
+        }
+        XCTAssertTrue(editAccepted, "native edit acknowledgement did not complete")
+        try await fixture.resolver.storeViewState(
+            fixture.contextID,
+            secondTabID,
+            documentID,
+            try makeViewState(line: 2)
+        )
+        try await fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: documentID,
+            controller: documentController,
+            language: "plaintext"
+        )
+        let acknowledgedText = "acknowledged live edit\nsecond line\n"
+        _ = try await controller.webView.callAsyncJavaScript(
+            "globalThis.cockpitEditorProtocol.openText(uri, text, 'plaintext'); return true",
+            arguments: ["uri": uri, "text": "post-attach probe\n"],
+            in: nil,
+            contentWorld: .page
+        )
+        let postAttachEditAccepted = try await waitUntil {
+            await transport.metrics().applyCount == 2
+        }
+        XCTAssertTrue(postAttachEditAccepted)
+        let postAttachMetrics = await transport.metrics()
+        XCTAssertEqual(
+            postAttachMetrics.lastTransaction?.changes.first?.length,
+            UInt64(acknowledgedText.utf16.count)
+        )
+        let postAttachReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        XCTAssertEqual(postAttachReferenceCount, 2)
         try await fixture.bridge.select(
             contextID: fixture.contextID,
             tabID: secondTabID,
@@ -825,6 +864,7 @@ final class MonacoBridgeTests: XCTestCase {
             environmentID: environmentID,
             path: RelativePath("bounds.txt"),
             documentVersion: maximum,
+            lastAcceptedClientSequence: maximum,
             lease: try EditLease(
                 validatingID: leaseID,
                 documentID: documentID,
@@ -1130,6 +1170,612 @@ final class MonacoBridgeTests: XCTestCase {
         controller.tearDown()
     }
 
+    func testLifecycleGateSerializesTwoPostReadyRetainsForOneMissingSession() async throws {
+        let clientID = ClientInstanceID()
+        let documentID = DocumentID()
+        let environmentID = EnvironmentID()
+        let firstTabID = TabID()
+        let secondTabID = TabID()
+        let transport = try TestDocumentTransport.ready(
+            clientID: clientID,
+            documentID: documentID,
+            environmentID: environmentID,
+            path: RelativePath("double-retain.txt")
+        )
+        let documentController = DocumentClientController(clientInstanceID: clientID, transport: transport)
+        _ = try await documentController.open(
+            in: environmentID,
+            at: RelativePath("double-retain.txt"),
+            requestWriteAccess: true
+        )
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        guard try await waitForRuntimeLoad(controller.webView) else {
+            return XCTFail("production runtime navigation did not finish")
+        }
+        let pausingSink = PausingNativeSink(pauseOn: .open) { message in
+            try await dispatchExactSuccess(message, to: controller.webView)
+        }
+        fixture.bridge.setSink { try await pausingSink.send($0) }
+
+        async let first: Void = fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: documentID,
+            controller: documentController,
+            language: "plaintext"
+        )
+        await pausingSink.waitUntilPaused()
+        async let second: Void = fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: documentID,
+            controller: documentController,
+            language: "plaintext"
+        )
+        _ = try await waitUntil(timeout: .milliseconds(200)) {
+            pausingSink.messageCount >= 2
+        }
+        pausingSink.resume()
+        try await first
+        try await second
+
+        let session = try XCTUnwrap(fixture.resolver.session(documentID: documentID))
+        XCTAssertTrue(session.controller === documentController)
+        XCTAssertEqual(Set(session.references.map(\.tabID)), [firstTabID, secondTabID])
+        let uri = try MonacoFileURI.make(
+            environmentID: environmentID,
+            path: RelativePath("double-retain.txt")
+        )
+        let referenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        let modelCount = try await javaScriptModelCount(in: controller.webView)
+        XCTAssertEqual(referenceCount, 2)
+        XCTAssertEqual(modelCount, 1)
+        controller.tearDown()
+    }
+
+    func testLifecycleGateSerializesLastReleaseBeforeSameReferenceRetain() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let attached = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "release-retain.txt",
+            writable: true,
+            contexts: [fixture.contextID]
+        )
+        let tabID = attached.tabIDs[0]
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        guard try await waitForRuntimeLoad(controller.webView) else {
+            return XCTFail("production runtime navigation did not finish")
+        }
+        let pausingSink = PausingNativeSink(pauseOn: .dispose) { message in
+            try await dispatchExactSuccess(message, to: controller.webView)
+        }
+        fixture.bridge.setSink { try await pausingSink.send($0) }
+
+        async let release: Void = fixture.resolver.release(
+            contextID: fixture.contextID,
+            tabID: tabID,
+            documentID: attached.documentID
+        )
+        await pausingSink.waitUntilPaused()
+        async let retain: Void = fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: tabID,
+            documentID: attached.documentID,
+            controller: attached.controller,
+            language: "plaintext"
+        )
+        for _ in 0..<8 { await Task.yield() }
+        pausingSink.resume()
+        try await release
+        try await retain
+
+        let session = try XCTUnwrap(fixture.resolver.session(documentID: attached.documentID))
+        XCTAssertTrue(session.controller === attached.controller)
+        XCTAssertEqual(session.references.map(\.tabID), [tabID])
+        let uri = try MonacoFileURI.make(
+            environmentID: attached.environmentID,
+            path: RelativePath("release-retain.txt")
+        )
+        let referenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+        let modelCount = try await javaScriptModelCount(in: controller.webView)
+        XCTAssertEqual(referenceCount, 1)
+        XCTAssertEqual(modelCount, 1)
+        controller.tearDown()
+    }
+
+    func testLifecycleGateReconcilesRetainAndReleaseWhileInitialReadyIsPaused() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let attached = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "initial-ready-race.txt",
+            writable: true,
+            contexts: [fixture.contextID]
+        )
+        let firstTabID = attached.tabIDs[0]
+        let secondTabID = TabID()
+        try fixture.resolver.select(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: attached.documentID
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        try await loadRuntimeWithoutAutomaticReady(controller)
+        let pausingSink = PausingNativeSink(pauseOn: .open) { message in
+            try await dispatchExactSuccess(message, to: controller.webView)
+        }
+        fixture.bridge.setSink { try await pausingSink.send($0) }
+
+        async let ready = fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 1,
+        ])
+        await pausingSink.waitUntilPaused()
+        async let retain: Void = fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: attached.documentID,
+            controller: attached.controller,
+            language: "plaintext"
+        )
+        async let release: Void = fixture.resolver.release(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: attached.documentID
+        )
+        for _ in 0..<8 { await Task.yield() }
+        pausingSink.resume()
+        let readyReply = await ready
+        XCTAssertEqual(readyReply, .success(nil))
+        try await retain
+        try await release
+        try await fixture.bridge.select(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: attached.documentID
+        )
+        let session = try XCTUnwrap(fixture.resolver.session(documentID: attached.documentID))
+        XCTAssertEqual(session.references.map(\.tabID), [secondTabID])
+        controller.tearDown()
+    }
+
+    func testLifecycleGateReconcilesRetainAndReleaseWhileRestartIsPaused() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let attached = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "restart-race.txt",
+            writable: true,
+            contexts: [fixture.contextID]
+        )
+        let firstTabID = attached.tabIDs[0]
+        let secondTabID = TabID()
+        try fixture.resolver.select(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: attached.documentID
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        guard try await waitForRuntimeLoad(controller.webView) else {
+            return XCTFail("production runtime navigation did not finish")
+        }
+        let initialURI = try MonacoFileURI.make(
+            environmentID: attached.environmentID,
+            path: RelativePath("restart-race.txt")
+        )
+        let initialReadyCompleted = try await waitUntil {
+            (try? await javaScriptReferenceCount(initialURI, in: controller.webView)) == 1
+        }
+        XCTAssertTrue(initialReadyCompleted)
+        try fixture.bridge.prepareForWebContentRestart(generation: 2)
+        try await loadRuntimeWithoutAutomaticReady(controller)
+        let pausingSink = PausingNativeSink(pauseOn: .open) { message in
+            try await dispatchExactSuccess(message, to: controller.webView)
+        }
+        fixture.bridge.setSink { try await pausingSink.send($0) }
+
+        async let ready = fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 2,
+        ])
+        await pausingSink.waitUntilPaused()
+        async let retain: Void = fixture.resolver.retain(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: attached.documentID,
+            controller: attached.controller,
+            language: "plaintext"
+        )
+        async let release: Void = fixture.resolver.release(
+            contextID: fixture.contextID,
+            tabID: firstTabID,
+            documentID: attached.documentID
+        )
+        for _ in 0..<8 { await Task.yield() }
+        pausingSink.resume()
+        let readyReply = await ready
+        XCTAssertEqual(readyReply, .success(nil))
+        try await retain
+        try await release
+        try await fixture.bridge.select(
+            contextID: fixture.contextID,
+            tabID: secondTabID,
+            documentID: attached.documentID
+        )
+        let session = try XCTUnwrap(fixture.resolver.session(documentID: attached.documentID))
+        XCTAssertEqual(session.references.map(\.tabID), [secondTabID])
+        controller.tearDown()
+    }
+
+    func testSelectCommitsOnlyAfterKnownReplyOrRealWebKitSuccess() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let conversation = WorkspaceContextID.conversation(ConversationID())
+        let attached = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "select-ack.txt",
+            writable: true,
+            contexts: [fixture.contextID, conversation]
+        )
+        let first = MonacoDocumentReference(
+            workspaceContextID: fixture.contextID,
+            tabID: attached.tabIDs[0],
+            documentID: attached.documentID
+        )
+        let second = MonacoDocumentReference(
+            workspaceContextID: conversation,
+            tabID: attached.tabIDs[1],
+            documentID: attached.documentID
+        )
+        try fixture.resolver.select(
+            contextID: first.workspaceContextID,
+            tabID: first.tabID,
+            documentID: first.documentID
+        )
+        fixture.bridge.setSink { message in
+            if case let .selectModel(_, access, _) = message, access.reference == second {
+                throw MonacoBridgeError.unknownDocument
+            }
+        }
+        do {
+            try await fixture.bridge.select(
+                contextID: second.workspaceContextID,
+                tabID: second.tabID,
+                documentID: second.documentID
+            )
+            XCTFail("known JS rejection must fail selection")
+        } catch {
+            XCTAssertEqual(error as? MonacoBridgeError, .unknownDocument)
+        }
+        XCTAssertEqual(fixture.resolver.selectedReference, first)
+
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        do {
+            try await fixture.bridge.select(
+                contextID: second.workspaceContextID,
+                tabID: second.tabID,
+                documentID: second.documentID
+            )
+            XCTFail("unloaded real WKWebView must fail selection")
+        } catch {
+            XCTAssertEqual(error as? MonacoBridgeError, .transportFailure)
+        }
+        XCTAssertEqual(fixture.resolver.selectedReference, first)
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        guard try await waitForRuntimeLoad(controller.webView) else {
+            return XCTFail("production runtime navigation did not finish")
+        }
+        try await fixture.bridge.select(
+            contextID: second.workspaceContextID,
+            tabID: second.tabID,
+            documentID: second.documentID
+        )
+        XCTAssertEqual(fixture.resolver.selectedReference, second)
+        controller.tearDown()
+    }
+
+    func testRestartReservationPreventsPausedSelectionFromCommittingAfterOldGenerationAck() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let conversation = WorkspaceContextID.conversation(ConversationID())
+        let attached = try await attachSession(
+            fixture: fixture,
+            clientID: clientID,
+            path: "restart-select.txt",
+            writable: true,
+            contexts: [fixture.contextID, conversation]
+        )
+        let first = MonacoDocumentReference(
+            workspaceContextID: fixture.contextID,
+            tabID: attached.tabIDs[0],
+            documentID: attached.documentID
+        )
+        let second = MonacoDocumentReference(
+            workspaceContextID: conversation,
+            tabID: attached.tabIDs[1],
+            documentID: attached.documentID
+        )
+        try fixture.resolver.select(
+            contextID: first.workspaceContextID,
+            tabID: first.tabID,
+            documentID: first.documentID
+        )
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        guard try await waitForRuntimeLoad(controller.webView) else {
+            return XCTFail("generation 1 production runtime navigation did not finish")
+        }
+        let initialReadyCompleted = try await waitUntil {
+            (try? await javaScriptModelCount(in: controller.webView)) == 1
+        }
+        XCTAssertTrue(initialReadyCompleted)
+        let pausingSink = PausingNativeSink(pauseOn: .select) { message in
+            try await dispatchExactSuccess(message, to: controller.webView)
+        }
+        fixture.bridge.setSink { try await pausingSink.send($0) }
+
+        async let selecting: Void = fixture.bridge.select(
+            contextID: second.workspaceContextID,
+            tabID: second.tabID,
+            documentID: second.documentID
+        )
+        await pausingSink.waitUntilPaused()
+        var prepareError: MonacoBridgeError?
+        do {
+            try fixture.bridge.prepareForWebContentRestart(generation: 2)
+        } catch {
+            prepareError = error as? MonacoBridgeError
+        }
+        pausingSink.resume()
+        var selectionError: MonacoBridgeError?
+        do {
+            try await selecting
+        } catch {
+            selectionError = error as? MonacoBridgeError
+        }
+
+        XCTAssertNil(prepareError)
+        XCTAssertEqual(selectionError, .staleGeneration)
+        XCTAssertEqual(fixture.resolver.selectedReference, first)
+        controller.tearDown()
+    }
+
+    func testOutgoingMessageCoherenceRejectsEveryVariantBeforeDispatch() throws {
+        let documentID = DocumentID()
+        let environmentID = EnvironmentID()
+        let path = try RelativePath("coherence.txt")
+        let reference = MonacoDocumentReference(
+            workspaceContextID: .project(ProjectID()),
+            tabID: TabID(),
+            documentID: documentID
+        )
+        let lease = try EditLease(
+            validatingID: EditLeaseID(),
+            documentID: documentID,
+            clientInstanceID: ClientInstanceID()
+        )
+        let snapshot = try makeSnapshot(
+            documentID: documentID,
+            environmentID: environmentID,
+            path: path,
+            documentVersion: 1,
+            lastAcceptedClientSequence: 1,
+            lease: lease
+        )
+        let access = MonacoDocumentAccess(
+            reference: reference,
+            uri: try MonacoFileURI.make(environmentID: environmentID, path: path),
+            lastAcceptedClientSequence: 1,
+            editLeaseID: lease.id,
+            writable: true
+        )
+        let otherURI = try MonacoFileURI.make(
+            environmentID: environmentID,
+            path: RelativePath("other.txt")
+        )
+        let mismatchedURI = MonacoDocumentAccess(
+            reference: reference,
+            uri: otherURI,
+            lastAcceptedClientSequence: 1,
+            editLeaseID: lease.id,
+            writable: true
+        )
+        let mismatchedSequence = MonacoDocumentAccess(
+            reference: reference,
+            uri: access.uri,
+            lastAcceptedClientSequence: 0,
+            editLeaseID: lease.id,
+            writable: true
+        )
+        let mismatchedLease = MonacoDocumentAccess(
+            reference: reference,
+            uri: access.uri,
+            lastAcceptedClientSequence: 1,
+            editLeaseID: EditLeaseID(),
+            writable: true
+        )
+        let acknowledgement = try EditAcknowledgement(
+            validatingDocumentID: documentID,
+            clientSequence: 1,
+            documentVersion: 1
+        )
+        let invalidVariants: [MonacoNativeMessage] = [
+            .open(webContentGeneration: 1, access: mismatchedURI, language: "plaintext", snapshot: snapshot, viewState: nil),
+            .acknowledgement(webContentGeneration: 1, access: mismatchedSequence, acknowledgement: acknowledgement),
+            .replace(webContentGeneration: 1, access: mismatchedSequence, snapshot: snapshot, viewState: nil),
+            .setWritable(webContentGeneration: 1, access: MonacoDocumentAccess(
+                reference: reference,
+                uri: access.uri,
+                lastAcceptedClientSequence: 1,
+                editLeaseID: lease.id,
+                writable: false
+            )),
+            .renameModel(webContentGeneration: 1, access: mismatchedLease, oldURI: otherURI, language: "plaintext", snapshot: snapshot, viewState: nil),
+            .disposeModel(webContentGeneration: 1, access: MonacoDocumentAccess(
+                reference: reference,
+                uri: access.uri,
+                lastAcceptedClientSequence: documentJavaScriptMaximum + 1,
+                editLeaseID: lease.id,
+                writable: true
+            )),
+            .selectModel(webContentGeneration: 1, access: MonacoDocumentAccess(
+                reference: reference,
+                uri: "cockpit-file://invalid/path",
+                lastAcceptedClientSequence: 1,
+                editLeaseID: lease.id,
+                writable: true
+            ), viewState: nil),
+        ]
+        XCTAssertEqual(invalidVariants.count, 7)
+        for message in invalidVariants {
+            XCTAssertThrowsError(try MonacoMessageCodec.javaScriptObject(for: message)) {
+                XCTAssertEqual($0 as? MonacoBridgeError, .invalidSchema)
+            }
+        }
+    }
+
+    func testRealWKCrashPreservesEveryKnownErrorAttemptsAllSessionsAndRetries() async throws {
+        let clientID = ClientInstanceID()
+        let fixture = makeBridgeFixture(clientID: clientID)
+        let crashPaths = ["crash-a.txt", "crash-b.txt", "crash-c.txt"]
+        var sessions: [AttachedSession] = []
+        for path in crashPaths {
+            sessions.append(try await attachSession(
+                fixture: fixture,
+                clientID: clientID,
+                path: path,
+                writable: true,
+                contexts: [fixture.contextID]
+            ))
+        }
+        let controller = MonacoEditorViewController(
+            bridge: fixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        controller.loadViewIfNeeded()
+        controller.loadRuntime()
+        guard try await waitForRuntimeLoad(controller.webView) else {
+            return XCTFail("generation 1 production runtime navigation did not finish")
+        }
+        let initialModelsReady = try await waitUntil {
+            (try? await javaScriptModelCount(in: controller.webView)) == sessions.count
+        }
+        XCTAssertTrue(initialModelsReady)
+        try fixture.bridge.prepareForWebContentRestart(generation: 2)
+        try await loadRuntimeWithoutAutomaticReady(controller)
+        _ = try await controller.webView.callAsyncJavaScript(
+            """
+            globalThis.realCockpitMonacoReceive = globalThis.cockpitMonacoReceive;
+            globalThis.forcedCrashCode = null;
+            globalThis.throwCrashTransport = false;
+            globalThis.crashAttempts = [];
+            globalThis.cockpitMonacoReceive = message => {
+              if (message.type === 'open') {
+                globalThis.crashAttempts.push(message.documentID);
+                if (globalThis.throwCrashTransport) throw new Error('forced WebKit failure');
+                if (globalThis.forcedCrashCode !== null) {
+                  return { ok: false, error: globalThis.forcedCrashCode };
+                }
+              }
+              return globalThis.realCockpitMonacoReceive(message);
+            };
+            return true;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+        let knownErrors: [MonacoBridgeError] = [
+            .invalidSchema, .staleGeneration, .staleDocumentState, .unknownDocument,
+            .readOnly, .resynchronizing, .fileMissing, .transportFailure,
+        ]
+        let expectedDocumentIDs = Set(sessions.map { $0.documentID.description })
+        for knownError in knownErrors {
+            _ = try await controller.webView.callAsyncJavaScript(
+                "globalThis.forcedCrashCode = code; globalThis.throwCrashTransport = false; globalThis.crashAttempts = []; return true",
+                arguments: ["code": knownError.wireCode],
+                in: nil,
+                contentWorld: .page
+            )
+            let reply = await fixture.bridge.handleMessageBody([
+                "type": "ready", "webContentGeneration": 2,
+            ])
+            XCTAssertEqual(reply, .failure(knownError), "ready erased \(knownError)")
+            let attempts = try await controller.webView.callAsyncJavaScript(
+                "return globalThis.crashAttempts",
+                arguments: [:],
+                in: nil,
+                contentWorld: .page
+            ) as? [String]
+            XCTAssertEqual(Set(attempts ?? []), expectedDocumentIDs)
+            for session in sessions {
+                XCTAssertEqual(fixture.errors.values[session.documentID], knownError)
+            }
+        }
+        _ = try await controller.webView.callAsyncJavaScript(
+            "globalThis.forcedCrashCode = null; globalThis.throwCrashTransport = true; globalThis.crashAttempts = []; return true",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+        let transportFailureReply = await fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 2,
+        ])
+        XCTAssertEqual(transportFailureReply, .failure(.transportFailure))
+        _ = try await controller.webView.callAsyncJavaScript(
+            "globalThis.throwCrashTransport = false; globalThis.crashAttempts = []; return true",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+        let successReply = await fixture.bridge.handleMessageBody([
+            "type": "ready", "webContentGeneration": 2,
+        ])
+        XCTAssertEqual(successReply, .success(nil))
+        let rebuiltModelCount = try await javaScriptModelCount(in: controller.webView)
+        XCTAssertEqual(rebuiltModelCount, sessions.count)
+        for (session, path) in zip(sessions, crashPaths) {
+            let uri = try MonacoFileURI.make(
+                environmentID: session.environmentID,
+                path: RelativePath(path)
+            )
+            let rebuiltReferenceCount = try await javaScriptReferenceCount(uri, in: controller.webView)
+            XCTAssertEqual(rebuiltReferenceCount, 1)
+        }
+        controller.tearDown()
+    }
+
     func testDecoderRejectsUnknownAndMissingKeysForEveryMonacoToNativeVariantAndUnsafeBounds() throws {
         let contextID = WorkspaceContextID.project(ProjectID())
         let tabID = TabID()
@@ -1189,12 +1835,133 @@ final class MonacoBridgeTests: XCTestCase {
 
 private enum MonacoTestScaffoldFailure: Error {
     case missingCSP
+    case runtimeDidNotLoad
 }
 
 private enum UnrelatedInvalidSessionKind: CaseIterable {
     case closed
     case resynchronizing
     case nonOwnerReady
+}
+
+@MainActor
+private final class PausingNativeSink {
+    enum MessageKind {
+        case open
+        case dispose
+        case select
+
+        func matches(_ message: MonacoNativeMessage) -> Bool {
+            switch (self, message) {
+            case (.open, .open(_, _, _, _, _)), (.dispose, .disposeModel(_, _)): true
+            case (.select, .selectModel(_, _, _)): true
+            default: false
+            }
+        }
+    }
+
+    private let pauseOn: MessageKind
+    private let downstream: MonacoNativeMessageSink
+    private var didPause = false
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var messages: [MonacoNativeMessage] = []
+
+    init(pauseOn: MessageKind, downstream: @escaping MonacoNativeMessageSink) {
+        self.pauseOn = pauseOn
+        self.downstream = downstream
+    }
+
+    var messageCount: Int { messages.count }
+
+    func send(_ message: MonacoNativeMessage) async throws {
+        messages.append(message)
+        if !didPause, pauseOn.matches(message) {
+            didPause = true
+            await withCheckedContinuation { continuation in
+                pauseContinuation = continuation
+                let waiters = pauseWaiters
+                pauseWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+            }
+        }
+        try await downstream(message)
+    }
+
+    func waitUntilPaused() async {
+        if pauseContinuation != nil { return }
+        await withCheckedContinuation { pauseWaiters.append($0) }
+    }
+
+    func resume() {
+        let continuation = pauseContinuation
+        pauseContinuation = nil
+        continuation?.resume()
+    }
+}
+
+@MainActor
+private func dispatchExactSuccess(
+    _ message: MonacoNativeMessage,
+    to webView: WKWebView
+) async throws {
+    let reply = try await sendNativeMessage(message, to: webView)
+    guard Set(reply.keys) == ["ok"], reply["ok"] as? Bool == true else {
+        if Set(reply.keys) == ["ok", "error"],
+           reply["ok"] as? Bool == false,
+           let code = reply["error"] as? String,
+           let error = testBridgeError(code) {
+            throw error
+        }
+        throw MonacoBridgeError.transportFailure
+    }
+}
+
+private func testBridgeError(_ code: String) -> MonacoBridgeError? {
+    switch code {
+    case MonacoBridgeError.invalidSchema.wireCode: .invalidSchema
+    case MonacoBridgeError.staleGeneration.wireCode: .staleGeneration
+    case MonacoBridgeError.staleDocumentState.wireCode: .staleDocumentState
+    case MonacoBridgeError.unknownDocument.wireCode: .unknownDocument
+    case MonacoBridgeError.readOnly.wireCode: .readOnly
+    case MonacoBridgeError.resynchronizing.wireCode: .resynchronizing
+    case MonacoBridgeError.fileMissing.wireCode: .fileMissing
+    case MonacoBridgeError.transportFailure.wireCode: .transportFailure
+    default: nil
+    }
+}
+
+@MainActor
+private func loadRuntimeWithoutAutomaticReady(
+    _ controller: MonacoEditorViewController
+) async throws {
+    let userContentController = controller.webView.configuration.userContentController
+    userContentController.removeScriptMessageHandler(
+        forName: "cockpitMonaco",
+        contentWorld: .page
+    )
+    controller.loadRuntime()
+    guard try await waitForRuntimeLoad(controller.webView) else {
+        throw MonacoTestScaffoldFailure.runtimeDidNotLoad
+    }
+    userContentController.addScriptMessageHandler(
+        try XCTUnwrap(controller.forwarder),
+        contentWorld: .page,
+        name: "cockpitMonaco"
+    )
+}
+
+@MainActor
+private func waitUntil(
+    timeout: Duration = .seconds(2),
+    _ condition: @escaping @MainActor () async -> Bool
+) async throws -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    return await condition()
 }
 
 @MainActor
@@ -1721,6 +2488,7 @@ private func makeSnapshot(
     path: RelativePath,
     text: String = "authoritative\n",
     documentVersion: UInt64 = 0,
+    lastAcceptedClientSequence: UInt64 = 0,
     lease: EditLease?
 ) throws -> DocumentSnapshot {
     try DocumentSnapshot(
@@ -1730,7 +2498,7 @@ private func makeSnapshot(
         text: text,
         documentVersion: documentVersion,
         persistedVersion: 0,
-        lastAcceptedClientSequence: 0,
+        lastAcceptedClientSequence: lastAcceptedClientSequence,
         dirtyState: .clean,
         observedDiskFingerprint: DiskFingerprint(
             deviceID: 1,

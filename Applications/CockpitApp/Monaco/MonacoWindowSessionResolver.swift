@@ -22,11 +22,44 @@ typealias MonacoReferenceLifecycle = @MainActor @Sendable (
 ) async throws -> Void
 
 @MainActor
+final class MonacoLifecycleGate {
+    private var occupied = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isOccupied: Bool { occupied }
+
+    func perform<Value>(
+        _ operation: @MainActor () async throws -> Value
+    ) async rethrows -> Value {
+        await acquire()
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        if !occupied {
+            occupied = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    private func release() {
+        guard !waiters.isEmpty else {
+            occupied = false
+            return
+        }
+        waiters.removeFirst().resume()
+    }
+}
+
+@MainActor
 public final class MonacoWindowSession {
     public let documentID: DocumentID
     public let controller: DocumentClientController
     public private(set) var language: String
     public private(set) var references: [MonacoDocumentReference]
+    private(set) var revision: UInt64 = 0
     private(set) var lastAuthoritativeEnvironmentID: EnvironmentID?
     private(set) var lastAuthoritativePath: RelativePath?
 
@@ -49,10 +82,13 @@ public final class MonacoWindowSession {
         guard !references.contains(reference) else { return }
         references.append(reference)
         references.sort(by: Self.referenceLess)
+        revision &+= 1
     }
 
     func remove(reference: MonacoDocumentReference) {
+        let originalCount = references.count
         references.removeAll { $0 == reference }
+        if references.count != originalCount { revision &+= 1 }
     }
 
     func remember(_ snapshot: DocumentSnapshot) {
@@ -81,6 +117,7 @@ public final class MonacoWindowSessionResolver {
     private var selection: MonacoDocumentReference?
     private var retainLifecycle: MonacoReferenceLifecycle = { _, _ in }
     private var releaseLifecycle: MonacoReferenceLifecycle = { _, _ in }
+    private let lifecycleGate = MonacoLifecycleGate()
 
     public init(
         clientInstanceID: ClientInstanceID,
@@ -107,6 +144,24 @@ public final class MonacoWindowSessionResolver {
         controller: DocumentClientController,
         language: String
     ) async throws {
+        try await lifecycleGate.perform {
+            try await self.retainInsideLifecycleGate(
+                contextID: contextID,
+                tabID: tabID,
+                documentID: documentID,
+                controller: controller,
+                language: language
+            )
+        }
+    }
+
+    private func retainInsideLifecycleGate(
+        contextID: WorkspaceContextID,
+        tabID: TabID,
+        documentID: DocumentID,
+        controller: DocumentClientController,
+        language: String
+    ) async throws {
         let reference = MonacoDocumentReference(
             workspaceContextID: contextID,
             tabID: tabID,
@@ -118,8 +173,12 @@ public final class MonacoWindowSessionResolver {
                 throw MonacoBridgeError.staleDocumentState
             }
             guard !session.references.contains(reference) else { return }
-            if let authoritativeSnapshot { session.remember(authoritativeSnapshot) }
+            let revision = session.revision
             try await retainLifecycle(session, reference)
+            guard sessions[documentID] === session, session.revision == revision else {
+                throw MonacoBridgeError.staleDocumentState
+            }
+            if let authoritativeSnapshot { session.remember(authoritativeSnapshot) }
             session.add(reference: reference)
             return
         }
@@ -131,6 +190,7 @@ public final class MonacoWindowSessionResolver {
             authoritativeSnapshot: authoritativeSnapshot
         )
         try await retainLifecycle(session, reference)
+        guard sessions[documentID] == nil else { throw MonacoBridgeError.staleDocumentState }
         sessions[documentID] = session
     }
 
@@ -141,18 +201,30 @@ public final class MonacoWindowSessionResolver {
         tabID: TabID,
         documentID: DocumentID
     ) throws {
-        let reference = MonacoDocumentReference(
-            workspaceContextID: contextID,
+        guard !lifecycleGate.isOccupied else { throw MonacoBridgeError.resynchronizing }
+        let reservation = try selectionReservation(
+            contextID: contextID,
             tabID: tabID,
             documentID: documentID
         )
-        guard sessions[documentID]?.references.contains(reference) == true else {
-            throw MonacoBridgeError.unknownDocument
-        }
-        selection = reference
+        try commitSelection(reservation)
     }
 
     public func release(
+        contextID: WorkspaceContextID,
+        tabID: TabID,
+        documentID: DocumentID
+    ) async throws {
+        try await lifecycleGate.perform {
+            try await self.releaseInsideLifecycleGate(
+                contextID: contextID,
+                tabID: tabID,
+                documentID: documentID
+            )
+        }
+    }
+
+    private func releaseInsideLifecycleGate(
         contextID: WorkspaceContextID,
         tabID: TabID,
         documentID: DocumentID
@@ -165,7 +237,11 @@ public final class MonacoWindowSessionResolver {
         guard let session = sessions[documentID], session.references.contains(reference) else {
             throw MonacoBridgeError.unknownDocument
         }
+        let revision = session.revision
         try await releaseLifecycle(session, reference)
+        guard sessions[documentID] === session, session.revision == revision,
+              session.references.contains(reference)
+        else { throw MonacoBridgeError.staleDocumentState }
         session.remove(reference: reference)
         if selection == reference { selection = nil }
         if session.references.isEmpty { sessions.removeValue(forKey: documentID) }
@@ -176,6 +252,46 @@ public final class MonacoWindowSessionResolver {
     }
 
     var selectedReference: MonacoDocumentReference? { selection }
+
+    func withLifecycleGate<Value>(
+        _ operation: @MainActor () async throws -> Value
+    ) async rethrows -> Value {
+        try await lifecycleGate.perform(operation)
+    }
+
+    struct SelectionReservation {
+        let reference: MonacoDocumentReference
+        let session: MonacoWindowSession
+        let sessionRevision: UInt64
+    }
+
+    func selectionReservation(
+        contextID: WorkspaceContextID,
+        tabID: TabID,
+        documentID: DocumentID
+    ) throws -> SelectionReservation {
+        let reference = MonacoDocumentReference(
+            workspaceContextID: contextID,
+            tabID: tabID,
+            documentID: documentID
+        )
+        guard let session = sessions[documentID], session.references.contains(reference) else {
+            throw MonacoBridgeError.unknownDocument
+        }
+        return SelectionReservation(
+            reference: reference,
+            session: session,
+            sessionRevision: session.revision
+        )
+    }
+
+    func commitSelection(_ reservation: SelectionReservation) throws {
+        guard sessions[reservation.reference.documentID] === reservation.session,
+              reservation.session.revision == reservation.sessionRevision,
+              reservation.session.references.contains(reservation.reference)
+        else { throw MonacoBridgeError.staleDocumentState }
+        selection = reservation.reference
+    }
 
     private static func authoritativeSnapshot(
         from state: DocumentClientControllerState

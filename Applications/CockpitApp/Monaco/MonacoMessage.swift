@@ -409,11 +409,13 @@ public enum MonacoMessageCodec {
                   snapshot.documentID == tuple.reference.documentID,
                   snapshot.documentVersion <= maximumInteger
             else { throw MonacoBridgeError.invalidSchema }
+            try validate(snapshot: snapshot, access: tuple)
         case let .acknowledgement(value, tuple, acknowledgement):
             generation = value
             access = tuple
             viewState = nil
             guard acknowledgement.documentID == tuple.reference.documentID,
+                  acknowledgement.clientSequence == tuple.lastAcceptedClientSequence,
                   acknowledgement.clientSequence <= maximumInteger,
                   acknowledgement.documentVersion <= maximumInteger
             else { throw MonacoBridgeError.invalidSchema }
@@ -424,6 +426,7 @@ public enum MonacoMessageCodec {
             guard snapshot.documentID == tuple.reference.documentID,
                   snapshot.documentVersion <= maximumInteger
             else { throw MonacoBridgeError.invalidSchema }
+            try validate(snapshot: snapshot, access: tuple)
         case let .setWritable(value, tuple), let .disposeModel(value, tuple):
             generation = value
             access = tuple
@@ -436,6 +439,7 @@ public enum MonacoMessageCodec {
                   snapshot.documentID == tuple.reference.documentID,
                   snapshot.documentVersion <= maximumInteger
             else { throw MonacoBridgeError.invalidSchema }
+            try validate(snapshot: snapshot, access: tuple)
         case let .selectModel(value, tuple, state):
             generation = value
             access = tuple
@@ -447,6 +451,30 @@ public enum MonacoMessageCodec {
               access.writable == (access.editLeaseID != nil)
         else { throw MonacoBridgeError.invalidSchema }
         if let viewState { try validate(viewState) }
+    }
+
+    private static func validate(
+        snapshot: DocumentSnapshot,
+        access: MonacoDocumentAccess
+    ) throws {
+        let expectedURI: String
+        do {
+            expectedURI = try MonacoFileURI.make(
+                environmentID: snapshot.environmentID,
+                path: snapshot.relativePath
+            )
+        } catch {
+            throw MonacoBridgeError.invalidSchema
+        }
+        guard access.uri == expectedURI,
+              access.lastAcceptedClientSequence == snapshot.lastAcceptedClientSequence
+        else { throw MonacoBridgeError.invalidSchema }
+        if access.writable {
+            guard let lease = snapshot.currentLease,
+                  lease.id == access.editLeaseID,
+                  lease.documentID == snapshot.documentID
+            else { throw MonacoBridgeError.invalidSchema }
+        }
     }
 
     private static func validate(_ viewState: DocumentViewState) throws {

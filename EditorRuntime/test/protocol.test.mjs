@@ -190,6 +190,34 @@ test('monaco open reuses one URI model while retaining independent tab reference
   assert.equal(harness.models.size, 1);
 });
 
+test('monaco post-ready attach preserves acknowledged live text and selected reference', () => {
+  const harness = createHarness();
+  assert.deepEqual(
+    harness.protocol.receiveNativeMessage(openMessage({ viewState: viewState(2) })),
+    { ok: true },
+  );
+  harness.models.get(uri).setValue('acknowledged live edit\n');
+  const restoredBeforeAttach = harness.editor.restored.length;
+
+  assert.deepEqual(harness.protocol.receiveNativeMessage(openMessage({
+    tabID: secondTabID,
+    text: 'stale controller snapshot\n',
+    documentVersion: 1,
+    lastAcceptedClientSequence: 1,
+    viewState: viewState(8),
+  })), { ok: true });
+
+  assert.equal(harness.models.get(uri).text, 'acknowledged live edit\n');
+  assert.equal(harness.protocol.referenceCount(uri), 2);
+  assert.equal(harness.editor.restored.length, restoredBeforeAttach);
+  assert.deepEqual(harness.protocol.receiveNativeMessage({
+    type: 'selectModel',
+    ...documentFields({ tabID: secondTabID, lastAcceptedClientSequence: 1 }),
+    viewState: viewState(8),
+  }), { ok: true });
+  assert.deepEqual(harness.editor.restored.at(-1), viewState(8));
+});
+
 test('monaco programmatic open and replace writes are synchronously suppressed from edit callbacks', () => {
   const harness = createHarness();
   assert.deepEqual(harness.protocol.receiveNativeMessage(openMessage()), { ok: true });
