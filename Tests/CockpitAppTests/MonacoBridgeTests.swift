@@ -145,6 +145,139 @@ final class MonacoBridgeTests: XCTestCase {
         XCTAssertNil(weakWebView)
     }
 
+    func testQueuedContentTerminationTearDownCancelsRestartAndReleasesBeforePausedEffectResumes() async throws {
+        let releaseBarrier = AsyncBarrier()
+        let releaseRecorder = ViewStateRecorder()
+        let releaseContextID = WorkspaceContextID.project(ProjectID())
+        let releaseTabID = TabID()
+        let releaseDocumentID = DocumentID()
+        let releaseState = try makeViewState(line: 7)
+        var releaseFixture: BridgeFixture? = makeBridgeFixture(
+            recorder: releaseRecorder,
+            storeViewState: { contextID, tabID, documentID, value in
+                await releaseBarrier.pause()
+                await releaseRecorder.store(
+                    contextID: contextID,
+                    tabID: tabID,
+                    documentID: documentID,
+                    value: value
+                )
+            }
+        )
+        let releaseResolver = try XCTUnwrap(releaseFixture?.resolver)
+        var owner: TestWindowOwner? = TestWindowOwner(
+            bridge: try XCTUnwrap(releaseFixture?.bridge),
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        weak var weakOwner = owner
+        weak var weakController = owner?.controller
+        weak var weakBridge = owner?.bridge
+        weak var weakWebView = owner?.controller.webView
+        let admittedStore = Task { @MainActor [releaseResolver] in
+            try await releaseResolver.withLifecycleGate {
+                try await releaseResolver.storeViewState(
+                    releaseContextID,
+                    releaseTabID,
+                    releaseDocumentID,
+                    releaseState
+                )
+            }
+        }
+        await releaseBarrier.waitUntilPaused()
+
+        owner?.controller.webViewWebContentProcessDidTerminate(
+            try XCTUnwrap(owner?.controller.webView)
+        )
+        await Task.yield()
+        XCTAssertEqual(owner?.bridge.webContentGeneration, 1)
+        releaseFixture = nil
+        owner?.controller.tearDown()
+        owner?.controller.tearDown()
+        owner?.controller.webViewWebContentProcessDidTerminate(
+            try XCTUnwrap(owner?.controller.webView)
+        )
+        owner = nil
+
+        let releasedBeforeEffect = try await waitUntil {
+            weakOwner == nil
+                && weakController == nil
+                && weakBridge == nil
+                && weakWebView == nil
+        }
+        XCTAssertTrue(
+            releasedBeforeEffect,
+            "tearDown must remove the queued restart waiter without cancelling the admitted store"
+        )
+        await releaseBarrier.resume()
+        try await admittedStore.value
+        let storedReleaseState = await releaseRecorder.value(
+            contextID: releaseContextID,
+            tabID: releaseTabID,
+            documentID: releaseDocumentID
+        )
+        XCTAssertEqual(
+            storedReleaseState,
+            releaseState
+        )
+
+        let reservationBarrier = AsyncBarrier()
+        let reservationRecorder = ViewStateRecorder()
+        let reservationFixture = makeBridgeFixture(
+            recorder: reservationRecorder,
+            storeViewState: { contextID, tabID, documentID, value in
+                await reservationBarrier.pause()
+                await reservationRecorder.store(
+                    contextID: contextID,
+                    tabID: tabID,
+                    documentID: documentID,
+                    value: value
+                )
+            }
+        )
+        let reservationTabID = TabID()
+        let reservationDocumentID = DocumentID()
+        let reservationState = try makeViewState(line: 11)
+        let controller = MonacoEditorViewController(
+            bridge: reservationFixture.bridge,
+            runtimeBundleURL: runtimeBundleURL()
+        )
+        let reservationStore = Task { @MainActor in
+            try await reservationFixture.resolver.withLifecycleGate {
+                try await reservationFixture.resolver.storeViewState(
+                    reservationFixture.contextID,
+                    reservationTabID,
+                    reservationDocumentID,
+                    reservationState
+                )
+            }
+        }
+        await reservationBarrier.waitUntilPaused()
+
+        controller.webViewWebContentProcessDidTerminate(controller.webView)
+        await Task.yield()
+        XCTAssertEqual(reservationFixture.bridge.webContentGeneration, 1)
+        controller.tearDown()
+        controller.tearDown()
+        controller.webViewWebContentProcessDidTerminate(controller.webView)
+        await reservationBarrier.resume()
+        try await reservationStore.value
+        await reservationFixture.resolver.withLifecycleGate {}
+
+        XCTAssertEqual(reservationFixture.bridge.webContentGeneration, 1)
+        XCTAssertTrue(controller.webView.configuration.userContentController.userScripts.isEmpty)
+        let generationTwoAvailable = try await waitUntil {
+            do {
+                try await reservationFixture.bridge.prepareForWebContentRestart(generation: 2)
+                return true
+            } catch {
+                return false
+            }
+        }
+        XCTAssertTrue(generationTwoAvailable, "cancelled restart must clear its exact reservation")
+        XCTAssertEqual(reservationFixture.bridge.webContentGeneration, 2)
+        XCTAssertTrue(controller.webView.configuration.userContentController.userScripts.isEmpty)
+    }
+
     func testURIUsesUppercaseByteEncodingWithoutUnicodeNormalization() throws {
         let environmentID = EnvironmentID(UUID(uuidString: "77777777-7777-4777-8777-777777777777")!)
         let path = try RelativePath("目录/100% ready/e\u{301}.ts")
@@ -2922,13 +3055,16 @@ private final class TestWindowOwner {
     let bridge: MonacoBridge
     let controller: MonacoEditorViewController
 
-    init(runtimeBundleURL: URL) {
-        let fixture = makeBridgeFixture()
-        bridge = fixture.bridge
+    init(bridge: MonacoBridge, runtimeBundleURL: URL) {
+        self.bridge = bridge
         controller = MonacoEditorViewController(
             bridge: bridge,
             runtimeBundleURL: runtimeBundleURL
         )
+    }
+
+    convenience init(runtimeBundleURL: URL) {
+        self.init(bridge: makeBridgeFixture().bridge, runtimeBundleURL: runtimeBundleURL)
     }
 }
 

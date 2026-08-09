@@ -106,6 +106,8 @@ public final class MonacoEditorViewController: NSViewController, WKNavigationDel
     private(set) var forwarder: WeakMonacoScriptMessageHandler?
     private let dispatcher: MonacoJavaScriptMessageDispatcher
     private var tornDown = false
+    private var terminationTask: Task<Void, Never>?
+    private var terminationTaskID: UUID?
 
     public init(
         bridge: MonacoBridge,
@@ -178,6 +180,9 @@ public final class MonacoEditorViewController: NSViewController, WKNavigationDel
     public func tearDown() {
         guard !tornDown else { return }
         tornDown = true
+        terminationTask?.cancel()
+        terminationTask = nil
+        terminationTaskID = nil
         webView.configuration.userContentController.removeScriptMessageHandler(
             forName: "cockpitMonaco",
             contentWorld: .page
@@ -194,22 +199,39 @@ public final class MonacoEditorViewController: NSViewController, WKNavigationDel
     }
 
     public func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        guard webView === self.webView else { return }
-        Task { @MainActor [weak self, weak webView] in
-            guard let self, let webView, webView === self.webView,
-                  !self.tornDown,
-                  self.bridge.webContentGeneration < documentJavaScriptMaximum
-            else { return }
+        guard webView === self.webView,
+              !tornDown,
+              terminationTask == nil,
+              bridge.webContentGeneration < documentJavaScriptMaximum
+        else { return }
+        let bridge = bridge
+        let generation = bridge.webContentGeneration + 1
+        let taskID = UUID()
+        terminationTaskID = taskID
+        terminationTask = Task { @MainActor [weak self, weak webView, weak bridge] in
+            defer { self?.finishTerminationTask(taskID) }
+            guard let bridge else { return }
             do {
-                try await self.bridge.prepareForWebContentRestart(
-                    generation: self.bridge.webContentGeneration + 1
+                try await bridge.prepareForWebContentRestart(
+                    generation: generation
                 )
             } catch {
                 return
             }
-            guard webView === self.webView, !self.tornDown else { return }
+            guard !Task.isCancelled,
+                  let self,
+                  let webView,
+                  webView === self.webView,
+                  !self.tornDown
+            else { return }
             self.loadRuntime()
         }
+    }
+
+    private func finishTerminationTask(_ taskID: UUID) {
+        guard terminationTaskID == taskID else { return }
+        terminationTask = nil
+        terminationTaskID = nil
     }
 
     public func webView(

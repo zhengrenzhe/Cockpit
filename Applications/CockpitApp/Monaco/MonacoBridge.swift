@@ -225,7 +225,7 @@ public final class MonacoBridge {
         let selected = resolver.selectedReference
         pendingRestartGeneration = generation
         do {
-            try await resolver.withLifecycleGate {
+            try await resolver.withCancellableLifecycleGate {
                 guard self.pendingRestartGeneration == generation,
                       self.webContentGeneration < documentJavaScriptMaximum,
                       generation == self.webContentGeneration + 1

@@ -23,8 +23,32 @@ typealias MonacoReferenceLifecycle = @MainActor @Sendable (
 
 @MainActor
 final class MonacoLifecycleGate {
+    private enum Waiter {
+        case ordinary(CheckedContinuation<Void, Never>)
+        case cancellable(UUID, CheckedContinuation<Void, any Error>)
+
+        var cancellationID: UUID? {
+            guard case let .cancellable(id, _) = self else { return nil }
+            return id
+        }
+
+        func resume() {
+            switch self {
+            case let .ordinary(continuation):
+                continuation.resume()
+            case let .cancellable(_, continuation):
+                continuation.resume()
+            }
+        }
+
+        func cancel() {
+            guard case let .cancellable(_, continuation) = self else { return }
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
     private var occupied = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [Waiter] = []
 
     var isOccupied: Bool { occupied }
 
@@ -36,12 +60,53 @@ final class MonacoLifecycleGate {
         return try await operation()
     }
 
+    func performCancellable<Value>(
+        _ operation: @MainActor () async throws -> Value
+    ) async throws -> Value {
+        try await acquireCancellable()
+        defer { release() }
+        try Task.checkCancellation()
+        return try await operation()
+    }
+
     private func acquire() async {
         if !occupied {
             occupied = true
             return
         }
-        await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation { waiters.append(.ordinary($0)) }
+    }
+
+    private func acquireCancellable() async throws {
+        try Task.checkCancellation()
+        if !occupied {
+            occupied = true
+            return
+        }
+        let cancellationID = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters.append(.cancellable(cancellationID, continuation))
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelWaiter(cancellationID)
+            }
+        }
+    }
+
+    private func cancelWaiter(_ cancellationID: UUID) {
+        guard let index = waiters.firstIndex(where: {
+            $0.cancellationID == cancellationID
+        }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.cancel()
     }
 
     private func release() {
@@ -49,7 +114,8 @@ final class MonacoLifecycleGate {
             occupied = false
             return
         }
-        waiters.removeFirst().resume()
+        let waiter = waiters.removeFirst()
+        waiter.resume()
     }
 }
 
@@ -257,6 +323,12 @@ public final class MonacoWindowSessionResolver {
         _ operation: @MainActor () async throws -> Value
     ) async rethrows -> Value {
         try await lifecycleGate.perform(operation)
+    }
+
+    func withCancellableLifecycleGate<Value>(
+        _ operation: @MainActor () async throws -> Value
+    ) async throws -> Value {
+        try await lifecycleGate.performCancellable(operation)
     }
 
     struct SelectionReservation {
