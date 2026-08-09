@@ -672,13 +672,13 @@ Cockpit/
 | SwiftProtobuf | 1.38.1 | https://github.com/apple/swift-protobuf/releases/tag/1.38.1 |
 | Monaco Editor | 0.56.0 | https://github.com/microsoft/monaco-editor/releases/tag/v0.56.0 |
 | esbuild | 0.28.1 | https://github.com/evanw/esbuild/releases/tag/v0.28.1 |
-| Ghostty 上游基础版本 | v1.3.1 / `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` | https://github.com/ghostty-org/ghostty/releases/tag/v1.3.1 |
-| Ghostty 1.3.x 使用的 Zig | 0.15.2 | https://ghostty.org/docs/install/build |
+| Ghostty 上游基础版本 | 1.3.2-dev / `05221c11c9db0715666fc6e038915128fc6a563e` | https://github.com/ghostty-org/ghostty/commit/05221c11c9db0715666fc6e038915128fc6a563e |
+| Ghostty 使用的 Zig | 0.16.0 | Ghostty `build.zig.zon` 的 `minimum_zig_version` 与 Zig 官方 macOS arm64 archive |
 | Node | 26.7.0 | https://nodejs.org/dist/index.json |
 | pnpm | 11.20.0 | https://github.com/pnpm/pnpm/releases/tag/v11.20.0 |
 | XcodeGen | 2.46.0 | https://github.com/yonaskolb/XcodeGen/releases/tag/2.46.0 |
 
-Ghostty 官方构建文档明确绑定 Ghostty 1.3.x 与 Zig 0.15.2。因此，即使 Zig 0.16.0 已存在，Cockpit 仍固定使用 Zig 0.15.2。
+Task 11 执行时，本机 Xcode 26.6 / SDK 26.5 无法链接 Zig 0.15.2 的 native build runner；用户明确批准切换到 Ghostty 1.3.2-dev 精确提交 `05221c11…`。该提交的 `build.zig.zon` 同时声明版本 1.3.2-dev 与最低 Zig 0.16.0，因此 Cockpit 固定使用该提交和 Zig 0.16.0 官方 macOS arm64 archive，不跟随 `main` 漂移。
 
 Phase 0 开发标识：
 

@@ -6,19 +6,38 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXAggregateTarget section */
+		1E24EBF1589C10A496752A48 /* CockpitGhosttyArtifacts */ = {
+			isa = PBXAggregateTarget;
+			buildConfigurationList = 2155ED37D3EB1BE230F15CA0 /* Build configuration list for PBXAggregateTarget "CockpitGhosttyArtifacts" */;
+			buildPhases = (
+				95C93B11A58606A1CAF564DF /* Build Cockpit Ghostty Artifacts */,
+			);
+			dependencies = (
+			);
+			name = CockpitGhosttyArtifacts;
+			packageProductDependencies = (
+			);
+			productName = CockpitGhosttyArtifacts;
+		};
+/* End PBXAggregateTarget section */
+
 /* Begin PBXBuildFile section */
 		00F2CE09C916763801CA9F85 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 521FA9CA3D31F33E20B0CC22 /* main.swift */; };
 		072B27985D56CF0B48E847DE /* MonacoRuntime.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */; };
 		212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
 		351D3D324BAED80562181E32 /* CockpitWorkspace in Frameworks */ = {isa = PBXBuildFile; productRef = 6B63A056B655604A5CAB68B6 /* CockpitWorkspace */; };
+		3B5CBAA8FBFB3F631C2F4EA7 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8EA676EB67971DEACE962407 /* CoreGraphics.framework */; };
 		493D8CBE3E815C9A151FF0F3 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		5504EF2E91B30EAA53DE6A0E /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */; };
 		591C5D12CD00A336A5410F70 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 97443DD81BE67B657ED3816E /* CockpitPersistence */; };
+		5F406859AC1EF68C058E5F6D /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 967DA6F781A08A3775427A27 /* CoreText.framework */; };
 		60026EC79653E301CEE5491E /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9F4222C3217C5CD667A61F57 /* CockpitHostCore */; };
 		636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */; };
 		67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */; };
 		69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3A65312477EAD5232A52B0 /* main.swift */; };
 		6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */ = {isa = PBXBuildFile; productRef = 805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */; };
+		717C660DB30DD27E152966D1 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A9306517642B4E50E65EE7C /* Metal.framework */; };
 		739F84561841F69B335B8581 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		80169161B195865C65678342 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 75A939B292A29F0EA7497870 /* CockpitLocalTransport */; };
 		8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */; };
@@ -26,6 +45,7 @@
 		9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */ = {isa = PBXBuildFile; productRef = 5A754E919142603676936801 /* CockpitTerminalClient */; };
 		A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
 		A7DFA31121D9E31C872E4793 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 41F1F75F27D0D4B661D8228C /* CockpitPersistence */; };
+		B43C4F3BB2CABB70159B9558 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4B5AFD79708EC200DB637479 /* QuartzCore.framework */; };
 		B984303D116E24D3B243414B /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = D51DF015FEF9086662DEC115 /* CockpitTerminalCore */; };
 		BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 263DA7B80F345C7A4A093699 /* MonacoBridge.swift */; };
 		BD4D067AEA4D8DD58643509F /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D380A6D5A0B758FBC879A0 /* main.swift */; };
@@ -44,6 +64,13 @@
 			remoteGlobalIDString = C6AC280B43B6369148D0714A;
 			remoteInfo = CockpitHost;
 		};
+		63F38FEE3EF8759936BA7AF3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2D2748F318F36C27786CFB3C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1E24EBF1589C10A496752A48;
+			remoteInfo = CockpitGhosttyArtifacts;
+		};
 		842C31CEE7004F6A604E6086 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 2D2748F318F36C27786CFB3C /* Project object */;
@@ -57,6 +84,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 6F4E0A2E524FD8724D264DEC;
 			remoteInfo = Cockpit;
+		};
+		94C17907DDA2976CC29416D7 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 2D2748F318F36C27786CFB3C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1E24EBF1589C10A496752A48;
+			remoteInfo = CockpitGhosttyArtifacts;
 		};
 		EB2DEBC00943400C63CD749E /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -75,13 +109,17 @@
 		44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoMessage.swift; sourceTree = "<group>"; };
 		48D380A6D5A0B758FBC879A0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MonacoRuntime.bundle; path = EditorRuntime/dist/MonacoRuntime.bundle; sourceTree = SOURCE_ROOT; };
+		4B5AFD79708EC200DB637479 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoWindowSessionResolver.swift; sourceTree = "<group>"; };
 		521FA9CA3D31F33E20B0CC22 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		5A9306517642B4E50E65EE7C /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTestScaffoldTests.swift; sourceTree = "<group>"; };
 		70F73173468B21D2CA4D246A /* Cockpit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cockpit.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoEditorViewController.swift; sourceTree = "<group>"; };
 		8353F9ACCD56E1BF6CB456FC /* phase-1 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "phase-1"; path = .; sourceTree = SOURCE_ROOT; };
+		8EA676EB67971DEACE962407 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		957D0FDA811FE85865AA5EF4 /* CockpitAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CockpitAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		967DA6F781A08A3775427A27 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
 		A0BFB39C38A17E2083706555 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		C1FB833EEF9FB302DB53867C /* CockpitTerminalSupervisor */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitTerminalSupervisor; sourceTree = BUILT_PRODUCTS_DIR; };
 		C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceStatusViewModel.swift; sourceTree = "<group>"; };
@@ -128,6 +166,10 @@
 				A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */,
 				9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */,
 				739F84561841F69B335B8581 /* WebKit.framework in Frameworks */,
+				717C660DB30DD27E152966D1 /* Metal.framework in Frameworks */,
+				B43C4F3BB2CABB70159B9558 /* QuartzCore.framework in Frameworks */,
+				5F406859AC1EF68C058E5F6D /* CoreText.framework in Frameworks */,
+				3B5CBAA8FBFB3F631C2F4EA7 /* CoreGraphics.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -167,6 +209,10 @@
 		41C347DBB0B84DA34DB20958 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				8EA676EB67971DEACE962407 /* CoreGraphics.framework */,
+				967DA6F781A08A3775427A27 /* CoreText.framework */,
+				5A9306517642B4E50E65EE7C /* Metal.framework */,
+				4B5AFD79708EC200DB637479 /* QuartzCore.framework */,
 				C4FA2BE19C1AAE871BA1097F /* WebKit.framework */,
 			);
 			name = Frameworks;
@@ -269,6 +315,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				B9BE5D99D262B385C536FFE7 /* PBXTargetDependency */,
 			);
 			name = CockpitPTYKeeper;
 			packageProductDependencies = (
@@ -290,6 +337,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				B62375BB327935AA5FEAA18D /* PBXTargetDependency */,
 				37D489506B32FD268CD763BD /* PBXTargetDependency */,
 				1A6AED248B6BAF65AE58B92D /* PBXTargetDependency */,
 				931DAF49251E968FB5E67212 /* PBXTargetDependency */,
@@ -380,6 +428,9 @@
 					01A05A8A2A71E7DC1ED4F685 = {
 						ProvisioningStyle = Manual;
 					};
+					1E24EBF1589C10A496752A48 = {
+						ProvisioningStyle = Manual;
+					};
 					6F4E0A2E524FD8724D264DEC = {
 						ProvisioningStyle = Manual;
 					};
@@ -416,6 +467,7 @@
 				01A05A8A2A71E7DC1ED4F685 /* CockpitPTYKeeper */,
 				6F4E0A2E524FD8724D264DEC /* Cockpit */,
 				917AF96F70F7A0C34D6087E6 /* CockpitAppTests */,
+				1E24EBF1589C10A496752A48 /* CockpitGhosttyArtifacts */,
 			);
 		};
 /* End PBXProject section */
@@ -460,6 +512,37 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "set -euo pipefail\ntest -n \"$WRAPPER_NAME\"\ntest \"$CONTENTS_FOLDER_PATH\" = \"$WRAPPER_NAME/Contents\"\ncase \"$TARGET_BUILD_DIR\" in\n  /*) ;;\n  *) exit 1 ;;\nesac\ntarget_build_dir=$(/bin/realpath \"$TARGET_BUILD_DIR\")\ntest \"$target_build_dir\" != \"/\"\ncontents=$(/bin/realpath \"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH\")\ntest \"$contents\" = \"$target_build_dir/$WRAPPER_NAME/Contents\"\nresources=\"$contents/Resources\"\nagents=\"$contents/Library/LaunchAgents\"\ntest ! -L \"$resources\"\ntest ! -L \"$contents/Library\"\ntest ! -L \"$agents\"\n/bin/mkdir -p \"$resources\" \"$agents\"\nresources=$(/bin/realpath \"$resources\")\nagents=$(/bin/realpath \"$agents\")\ntest \"$resources\" = \"$contents/Resources\"\ntest \"$agents\" = \"$contents/Library/LaunchAgents\"\n/usr/bin/find \"$agents\" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} +\n/bin/cp \"$BUILT_PRODUCTS_DIR/CockpitHost\" \"$resources/CockpitHost\"\n/bin/cp \"$BUILT_PRODUCTS_DIR/CockpitTerminalSupervisor\" \"$resources/CockpitTerminalSupervisor\"\n/bin/cp \"$BUILT_PRODUCTS_DIR/CockpitPTYKeeper\" \"$resources/CockpitPTYKeeper\"\n/bin/cp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist\" \"$agents/\"\n/bin/cp \"$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist\" \"$agents/\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost \"$resources/CockpitHost\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor \"$resources/CockpitTerminalSupervisor\"\n/usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper \"$resources/CockpitPTYKeeper\"\n";
+		};
+		95C93B11A58606A1CAF564DF /* Build Cockpit Ghostty Artifacts */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/ThirdParty/ghostty/.git",
+				"$(SRCROOT)/ThirdParty/ghostty/build.zig.zon",
+				"$(SRCROOT)/Patches/ghostty/series",
+				"$(SRCROOT)/Patches/ghostty/0001-cockpit-external-vt-renderer.patch",
+				"$(SRCROOT)/Native/CockpitGhosttyBridge/include/cockpit_ghostty.h",
+				"$(SRCROOT)/Native/CockpitGhosttyBridge/include/module.modulemap",
+				"$(SRCROOT)/Config/Toolchains/ghostty.env",
+				"$(SRCROOT)/Tools/build-ghostty-bridge.zsh",
+			);
+			name = "Build Cockpit Ghostty Artifacts";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Ghostty/include/CockpitGhostty/cockpit_ghostty.h",
+				"$(DERIVED_FILE_DIR)/Ghostty/include/CockpitGhostty/module.modulemap",
+				"$(DERIVED_FILE_DIR)/Ghostty/lib/libCockpitGhosttyVT.a",
+				"$(DERIVED_FILE_DIR)/Ghostty/CockpitGhosttyRenderer.xcframework",
+				"$(DERIVED_FILE_DIR)/Ghostty/manifest.json",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/zsh;
+			shellScript = "set -euo pipefail\ntest \"$COCKPIT_GHOSTTY_ARTIFACTS_DIR\" = \"$DERIVED_FILE_DIR/Ghostty\"\n\"$SRCROOT/Tools/build-ghostty-bridge.zsh\" \\\n  --configuration \"$CONFIGURATION\" \\\n  --output \"$DERIVED_FILE_DIR/Ghostty\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -528,6 +611,16 @@
 			target = 01A05A8A2A71E7DC1ED4F685 /* CockpitPTYKeeper */;
 			targetProxy = 842C31CEE7004F6A604E6086 /* PBXContainerItemProxy */;
 		};
+		B62375BB327935AA5FEAA18D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1E24EBF1589C10A496752A48 /* CockpitGhosttyArtifacts */;
+			targetProxy = 63F38FEE3EF8759936BA7AF3 /* PBXContainerItemProxy */;
+		};
+		B9BE5D99D262B385C536FFE7 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1E24EBF1589C10A496752A48 /* CockpitGhosttyArtifacts */;
+			targetProxy = 94C17907DDA2976CC29416D7 /* PBXContainerItemProxy */;
+		};
 		BC864A4E5CF0AD4074B997BE /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 6F4E0A2E524FD8724D264DEC /* Cockpit */;
@@ -587,6 +680,7 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COCKPIT_GHOSTTY_ARTIFACTS_DIR = "$(PROJECT_TEMP_DIR)/$(CONFIGURATION)/CockpitGhosttyArtifacts.build/DerivedSources/Ghostty";
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
@@ -639,37 +733,60 @@
 			};
 			name = Debug;
 		};
+		A8A28EA89C7878F67DDDFF80 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+			};
+			name = Debug;
+		};
 		A9205D3733D0AC78C023D53D /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib";
 				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitPTYKeeper";
+				OTHER_LDFLAGS = "$(inherited) \"$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib/libCockpitGhosttyVT.a\"";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitPTYKeeper;
 				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
+			};
+			name = Release;
+		};
+		B0148BB3E232FE9A32111608 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
 			};
 			name = Release;
 		};
 		B59712E133A0ED40F700879D /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				COMBINE_HIDPI_IMAGES = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib";
 				OTHER_CODE_SIGN_FLAGS = "--identifier dev.cockpit.CockpitPTYKeeper";
+				OTHER_LDFLAGS = "$(inherited) \"$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib/libCockpitGhosttyVT.a\"";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitPTYKeeper;
 				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
 			};
 			name = Debug;
 		};
 		B6EE1B65701E6DC8FD0B6650 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -679,9 +796,13 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64";
 				LM_FORCE_LINK_GENERATION = YES;
+				OTHER_LDFLAGS = "$(inherited) \"$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64/libCockpitGhosttyRenderer.a\" -lc++";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
 				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
 			};
 			name = Debug;
 		};
@@ -702,6 +823,7 @@
 		C31BAC33F5C8184D20B7F0F0 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COMBINE_HIDPI_IMAGES = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -711,9 +833,13 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				LIBRARY_SEARCH_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64";
 				LM_FORCE_LINK_GENERATION = YES;
+				OTHER_LDFLAGS = "$(inherited) \"$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64/libCockpitGhosttyRenderer.a\" -lc++";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
 				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
 			};
 			name = Release;
 		};
@@ -765,6 +891,7 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COCKPIT_GHOSTTY_ARTIFACTS_DIR = "$(PROJECT_TEMP_DIR)/$(CONFIGURATION)/CockpitGhosttyArtifacts.build/DerivedSources/Ghostty";
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -815,6 +942,15 @@
 			buildConfigurations = (
 				291E0744EC70F0974FF30459 /* Debug */,
 				42C39DD907E604C24FA7C004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		2155ED37D3EB1BE230F15CA0 /* Build configuration list for PBXAggregateTarget "CockpitGhosttyArtifacts" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A8A28EA89C7878F67DDDFF80 /* Debug */,
+				B0148BB3E232FE9A32111608 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

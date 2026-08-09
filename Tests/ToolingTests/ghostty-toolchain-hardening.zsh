@@ -5,8 +5,8 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 repo_root=${0:P:h:h:h}
 source_bootstrap="$repo_root/Tools/bootstrap-zig.zsh"
 source_manifest="$repo_root/Config/Toolchains/ghostty.env"
-project_archive="$repo_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz"
-installed_zig="$repo_root/.tools/zig/0.15.2/zig"
+project_archive="$repo_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz"
+installed_zig="$repo_root/.tools/zig/0.16.0/zig"
 suite_root=$(/usr/bin/mktemp -d /tmp/cockpit-zig-hardening.XXXXXX)
 global_temp_baseline="$suite_root/global-temp-baseline"
 
@@ -28,7 +28,7 @@ trap cleanup EXIT HUP INT TERM
 [[ -f "$source_manifest" && ! -L "$source_manifest" ]] || fail "missing physical Ghostty manifest"
 [[ -f "$project_archive" && ! -L "$project_archive" ]] || fail "missing physical project Zig archive"
 [[ -x "$installed_zig" && ! -L "$installed_zig" ]] || fail "missing physical existing Zig installation"
-[[ "$("$installed_zig" version)" == "0.15.2" ]] || fail "existing Zig version mismatch"
+[[ "$("$installed_zig" version)" == "0.16.0" ]] || fail "existing Zig version mismatch"
 /usr/bin/codesign --verify --strict "$installed_zig" >/dev/null || fail "existing Zig code signature is invalid"
 /usr/bin/find -P /private/tmp -maxdepth 1 -name 'cockpit-zig.*' -print | /usr/bin/sort > "$global_temp_baseline"
 
@@ -44,13 +44,13 @@ prepare_root() {
   /bin/cp "$source_bootstrap" "$root/Tools/bootstrap-zig.zsh"
   /bin/cp "$source_manifest" "$root/Config/Toolchains/ghostty.env"
   /bin/chmod 700 "$root/Tools/bootstrap-zig.zsh"
-  /bin/ln "$project_archive" "$root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz"
+  /bin/ln "$project_archive" "$root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz"
 }
 
 assert_valid_install() {
-  local root="$1" zig="$1/.tools/zig/0.15.2/zig"
+  local root="$1" zig="$1/.tools/zig/0.16.0/zig"
   [[ -x "$zig" && ! -L "$zig" ]] || fail "missing physical Zig compiler in $root"
-  [[ "$("$zig" version)" == "0.15.2" ]] || fail "Zig version mismatch in $root"
+  [[ "$("$zig" version)" == "0.16.0" ]] || fail "Zig version mismatch in $root"
   /usr/bin/codesign --verify --strict "$zig" >/dev/null || fail "Zig code signature is invalid in $root"
 }
 
@@ -66,7 +66,7 @@ run_expect_failure() {
   local started finished rc
   started=$(/bin/date +%s)
   set +e
-  "$root/Tools/bootstrap-zig.zsh" --archive "$root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$stdout_file" 2> "$stderr_file"
+  "$root/Tools/bootstrap-zig.zsh" --archive "$root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$stdout_file" 2> "$stderr_file"
   rc=$?
   set -e
   finished=$(/bin/date +%s)
@@ -99,7 +99,7 @@ set +e
 COCKPIT_ZIG_BOOTSTRAP_TESTING=1 \
 COCKPIT_ZIG_BOOTSTRAP_TEST_MAX_LOCK_WAITS=0 \
 COCKPIT_ZIG_BOOTSTRAP_TEST_EVENT_LOG="$counter_log" \
-  "$path_root/Tools/bootstrap-zig.zsh" --archive "$path_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/counter.stdout" 2> "$suite_root/counter.stderr"
+  "$path_root/Tools/bootstrap-zig.zsh" --archive "$path_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/counter.stdout" 2> "$suite_root/counter.stderr"
 counter_rc=$?
 set -e
 [[ "$counter_rc" == "0" ]] || fail "test lock-wait counter bootstrap exited $counter_rc: $(< "$suite_root/counter.stderr")"
@@ -120,7 +120,7 @@ COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_STAGING_PUBLISHED=1 \
 COCKPIT_ZIG_BOOTSTRAP_TEST_CRASH_LOCK_ACQUIRED=1 \
 COCKPIT_ZIG_BOOTSTRAP_TEST_MAX_LOCK_WAITS=0 \
 COCKPIT_ZIG_BOOTSTRAP_TEST_EVENT_LOG="$production_ignored_events" \
-  "$production_root/Tools/bootstrap-zig.zsh" --archive "$production_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/production-hooks.stdout"
+  "$production_root/Tools/bootstrap-zig.zsh" --archive "$production_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/production-hooks.stdout"
 production_rc=$?
 set -e
 [[ "$production_rc" == "0" ]] || fail "production hook isolation bootstrap exited $production_rc"
@@ -177,7 +177,7 @@ for hook_name in "${crash_hooks[@]}"; do
   prepare_root "$case_root"
   expected_owner="$case_root/expected-owner"
   set +e
-  "$crash_wrapper" "$expected_owner" "$case_root/Tools/bootstrap-zig.zsh" "$case_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" "$hook_name" > "$case_root/crash.stdout" 2> "$case_root/crash.stderr" &
+  "$crash_wrapper" "$expected_owner" "$case_root/Tools/bootstrap-zig.zsh" "$case_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" "$hook_name" > "$case_root/crash.stdout" 2> "$case_root/crash.stderr" &
   crash_pid=$!
   wait "$crash_pid"
   crash_rc=$?
@@ -198,7 +198,7 @@ for hook_name in "${crash_hooks[@]}"; do
   COCKPIT_ZIG_BOOTSTRAP_TESTING=1 \
   COCKPIT_ZIG_BOOTSTRAP_TEST_MAX_LOCK_WAITS=0 \
   COCKPIT_ZIG_BOOTSTRAP_TEST_EVENT_LOG="$recovery_events" \
-    "$case_root/Tools/bootstrap-zig.zsh" --archive "$case_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$case_root/recovery.stdout" 2> "$case_root/recovery.stderr"
+    "$case_root/Tools/bootstrap-zig.zsh" --archive "$case_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$case_root/recovery.stdout" 2> "$case_root/recovery.stderr"
   [[ -f "$recovery_events" && "$(< "$recovery_events")" == "lock-wait-count=0" ]] || fail "$hook_name entered the lock-wait path"
   assert_valid_install "$case_root"
   assert_no_bootstrap_residue "$case_root"
@@ -210,11 +210,11 @@ done
 print -- "hardening stage: legacy, dead, and active residue"
 residue_root="$suite_root/residue-root"
 prepare_root "$residue_root"
-"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/residue-install.stdout"
+"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/residue-install.stdout"
 zig_parent="$residue_root/.tools/zig"
 /usr/bin/touch "$zig_parent/.bootstrap-owner.legacy-empty" "$zig_parent/.bootstrap-lock" "$zig_parent/.preparing.owner.legacy-empty"
 /bin/mkdir "$zig_parent/.staging.legacy-empty" "$zig_parent/.preparing.staging.legacy-empty" "$zig_parent/.preparing.temp.legacy-empty"
-"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/legacy-recovery.stdout"
+"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/legacy-recovery.stdout"
 assert_no_bootstrap_residue "$residue_root"
 
 dead_metadata="$suite_root/dead-owner"
@@ -229,7 +229,7 @@ dead_token=$(print -rn -- 'Thu Jan  1 00:00:00 1970' | /usr/bin/shasum -a 256 | 
 dead_temp="$zig_parent/.preparing.temp.999999999.${dead_token}.DEAD"
 /bin/mkdir "$dead_temp"
 /usr/bin/printf 'dead temp payload\n' > "$dead_temp/sentinel"
-"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/dead-recovery.stdout"
+"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/dead-recovery.stdout"
 assert_no_bootstrap_residue "$residue_root"
 
 # Complete active owner/lock/staging/preparing records, plus active empty
@@ -251,9 +251,9 @@ active_temp="$zig_parent/.preparing.temp.$$.${active_token}.ACTIVE"
 /usr/bin/touch "$active_empty_owner"
 /bin/mkdir "$active_empty_staging" "$active_temp"
 /usr/bin/printf 'active temp payload\n' > "$active_temp/sentinel"
-"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/active-a.stdout" 2> "$suite_root/active-a.stderr" &
+"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/active-a.stdout" 2> "$suite_root/active-a.stderr" &
 active_a=$!
-"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/active-b.stdout" 2> "$suite_root/active-b.stderr" &
+"$residue_root/Tools/bootstrap-zig.zsh" --archive "$residue_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/active-b.stdout" 2> "$suite_root/active-b.stderr" &
 active_b=$!
 set +e
 wait "$active_a"; active_a_rc=$?
@@ -351,13 +351,13 @@ for malformed_case in "${malformed_cases[@]}"; do
 done
 
 # Two fresh bootstraps race through extraction and publication. Both succeed,
-# their shared result is signed Zig 0.15.2, and all ownership state is gone.
+# their shared result is signed Zig 0.16.0, and all ownership state is gone.
 print -- "hardening stage: fresh concurrent bootstrap"
 concurrent_root="$suite_root/concurrent-root"
 prepare_root "$concurrent_root"
-"$concurrent_root/Tools/bootstrap-zig.zsh" --archive "$concurrent_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/concurrent-a.stdout" 2> "$suite_root/concurrent-a.stderr" &
+"$concurrent_root/Tools/bootstrap-zig.zsh" --archive "$concurrent_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/concurrent-a.stdout" 2> "$suite_root/concurrent-a.stderr" &
 concurrent_a=$!
-"$concurrent_root/Tools/bootstrap-zig.zsh" --archive "$concurrent_root/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz" > "$suite_root/concurrent-b.stdout" 2> "$suite_root/concurrent-b.stderr" &
+"$concurrent_root/Tools/bootstrap-zig.zsh" --archive "$concurrent_root/.tools/archives/zig-aarch64-macos-0.16.0.tar.xz" > "$suite_root/concurrent-b.stdout" 2> "$suite_root/concurrent-b.stderr" &
 concurrent_b=$!
 set +e
 wait "$concurrent_a"; concurrent_a_rc=$?

@@ -12,12 +12,40 @@ packages:
 settings:
   base:
     PRODUCT_NAME: $(TARGET_NAME)
+    COCKPIT_GHOSTTY_ARTIFACTS_DIR: $(PROJECT_TEMP_DIR)/$(CONFIGURATION)/CockpitGhosttyArtifacts.build/DerivedSources/Ghostty
   configs:
     Debug:
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
 configFiles:
   Debug: Config/Build/Base.xcconfig
   Release: Config/Build/Base.xcconfig
+aggregateTargets:
+  CockpitGhosttyArtifacts:
+    buildScripts:
+      - name: Build Cockpit Ghostty Artifacts
+        shell: /bin/zsh
+        basedOnDependencyAnalysis: true
+        inputFiles:
+          - $(SRCROOT)/ThirdParty/ghostty/.git
+          - $(SRCROOT)/ThirdParty/ghostty/build.zig.zon
+          - $(SRCROOT)/Patches/ghostty/series
+          - $(SRCROOT)/Patches/ghostty/0001-cockpit-external-vt-renderer.patch
+          - $(SRCROOT)/Native/CockpitGhosttyBridge/include/cockpit_ghostty.h
+          - $(SRCROOT)/Native/CockpitGhosttyBridge/include/module.modulemap
+          - $(SRCROOT)/Config/Toolchains/ghostty.env
+          - $(SRCROOT)/Tools/build-ghostty-bridge.zsh
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/Ghostty/include/CockpitGhostty/cockpit_ghostty.h
+          - $(DERIVED_FILE_DIR)/Ghostty/include/CockpitGhostty/module.modulemap
+          - $(DERIVED_FILE_DIR)/Ghostty/lib/libCockpitGhosttyVT.a
+          - $(DERIVED_FILE_DIR)/Ghostty/CockpitGhosttyRenderer.xcframework
+          - $(DERIVED_FILE_DIR)/Ghostty/manifest.json
+        script: |
+          set -euo pipefail
+          test "$COCKPIT_GHOSTTY_ARTIFACTS_DIR" = "$DERIVED_FILE_DIR/Ghostty"
+          "$SRCROOT/Tools/build-ghostty-bridge.zsh" \
+            --configuration "$CONFIGURATION" \
+            --output "$DERIVED_FILE_DIR/Ghostty"
 targets:
   CockpitHost:
     type: tool
@@ -59,7 +87,13 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.cockpit.CockpitPTYKeeper
         OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitPTYKeeper
+        ARCHS: arm64
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) COCKPIT_GHOSTTY_LINKED
+        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include
+        LIBRARY_SEARCH_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib
+        OTHER_LDFLAGS: $(inherited) "$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib/libCockpitGhosttyVT.a"
     dependencies:
+      - target: CockpitGhosttyArtifacts
       - package: CockpitKit
         product: CockpitTerminalCore
   Cockpit:
@@ -77,7 +111,13 @@ targets:
         LM_FORCE_LINK_GENERATION: YES
         INFOPLIST_KEY_CFBundleDisplayName: Cockpit
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        ARCHS: arm64
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) COCKPIT_GHOSTTY_LINKED
+        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include
+        LIBRARY_SEARCH_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64
+        OTHER_LDFLAGS: $(inherited) "$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64/libCockpitGhosttyRenderer.a" -lc++
     dependencies:
+      - target: CockpitGhosttyArtifacts
       - package: CockpitKit
         product: CockpitClientCore
       - package: CockpitKit
@@ -89,6 +129,10 @@ targets:
       - package: CockpitKit
         product: CockpitTerminalClient
       - sdk: WebKit.framework
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreText.framework
+      - sdk: CoreGraphics.framework
       - target: CockpitHost
         embed: false
       - target: CockpitTerminalSupervisor

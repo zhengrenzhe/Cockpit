@@ -1,0 +1,2069 @@
+diff --git a/build.zig b/build.zig
+index acf19ac91fb219b65ea08ea46b854bcf1893a759..fceb541a04ade71a553b12f871fd1327cbc01084 100644
+--- a/build.zig
++++ b/build.zig
+@@ -175,0 +176,5 @@ pub fn build(b: *std.Build) !void {
++    // Cockpit's embedding boundary is additive and does not use Surface,
++    // because Surface owns its PTY. These artifacts consume libghostty-vt
++    // state from an externally owned PTY instead.
++    try @import("src/cockpit/build.zig").add(b, &config, &mod);
++
+diff --git a/src/cockpit/build.zig b/src/cockpit/build.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2adb5d61e770173f2cbfe2da660da129c52442d
+--- /dev/null
++++ b/src/cockpit/build.zig
+@@ -0,0 +1,102 @@
++const std = @import("std");
++const CombineArchivesStep = @import("../build/CombineArchivesStep.zig");
++const Config = @import("../build/Config.zig");
++const GhosttyZig = @import("../build/GhosttyZig.zig");
++const LibsystemOverrideStep = @import("../build/LibsystemOverrideStep.zig");
++
++pub fn add(b: *std.Build, config: *const Config, ghostty: *const GhosttyZig) !void {
++    const vt_module = b.createModule(.{
++        .root_source_file = b.path("src/cockpit/vt.zig"),
++        .target = config.target,
++        .optimize = config.optimize,
++        .link_libc = true,
++    });
++    vt_module.addImport("ghostty-vt", ghostty.vt_c);
++    const vt = b.addLibrary(.{
++        .name = "CockpitGhosttyVT",
++        .linkage = .static,
++        .root_module = vt_module,
++    });
++    vt.use_llvm = true;
++    vt.bundle_compiler_rt = true;
++    vt.bundle_ubsan_rt = true;
++    vt.root_module.pic = true;
++    var vt_sources: std.ArrayList(std.Build.LazyPath) = .empty;
++    try vt_sources.append(b.allocator, vt.getEmittedBin());
++    try vt_sources.appendSlice(b.allocator, ghostty.simd_libs.items);
++    const vt_combined = CombineArchivesStep.create(
++        b,
++        config.target,
++        "CockpitGhosttyVT",
++        vt_sources.items,
++    );
++    vt_combined.step.dependOn(&vt.step);
++    const vt_override = LibsystemOverrideStep.create(
++        b,
++        config.target,
++        vt_combined.output,
++        "libCockpitGhosttyVT.a",
++    );
++    const vt_install = b.addInstallFileWithDir(
++        vt_override.output,
++        .lib,
++        "libCockpitGhosttyVT.a",
++    );
++    const vt_step = b.step("cockpit-ghostty-vt", "Build the Cockpit Ghostty VT bridge");
++    vt_step.dependOn(&vt_install.step);
++
++    const vt_tests = b.addTest(.{
++        .root_module = vt_module,
++        .filters = &.{"cockpit bridge"},
++    });
++    vt_tests.use_llvm = true;
++    const run_vt_tests = b.addRunArtifact(vt_tests);
++    const vt_test_step = b.step("cockpit-ghostty-tests", "Run Cockpit Ghostty bridge tests");
++    vt_test_step.dependOn(&run_vt_tests.step);
++
++    const renderer_module = b.createModule(.{
++        .root_source_file = b.path("src/cockpit/renderer.zig"),
++        .target = config.target,
++        .optimize = config.optimize,
++        .link_libc = true,
++    });
++    const renderer = b.addLibrary(.{
++        .name = "CockpitGhosttyRenderer",
++        .linkage = .static,
++        .root_module = renderer_module,
++    });
++    renderer.use_llvm = true;
++    renderer.bundle_compiler_rt = true;
++    renderer.bundle_ubsan_rt = true;
++    renderer.root_module.pic = true;
++    renderer.root_module.addIncludePath(b.path("src/cockpit/include"));
++    renderer.root_module.addCSourceFile(.{
++        .file = b.path("src/cockpit/renderer.m"),
++        .flags = &.{ "-fobjc-arc", "-fmodules" },
++    });
++    renderer.root_module.linkFramework("AppKit", .{});
++    renderer.root_module.linkFramework("Foundation", .{});
++    renderer.root_module.linkFramework("Metal", .{});
++    renderer.root_module.linkFramework("QuartzCore", .{});
++    try @import("apple_sdk").addPaths(b, renderer);
++    const renderer_combined = CombineArchivesStep.create(
++        b,
++        config.target,
++        "CockpitGhosttyRenderer",
++        &.{renderer.getEmittedBin()},
++    );
++    renderer_combined.step.dependOn(&renderer.step);
++    const renderer_override = LibsystemOverrideStep.create(
++        b,
++        config.target,
++        renderer_combined.output,
++        "libCockpitGhosttyRenderer.a",
++    );
++    const renderer_install = b.addInstallFileWithDir(
++        renderer_override.output,
++        .lib,
++        "libCockpitGhosttyRenderer.a",
++    );
++    const renderer_step = b.step("cockpit-ghostty-renderer", "Build the Cockpit Ghostty Metal renderer bridge");
++    renderer_step.dependOn(&renderer_install.step);
++}
+diff --git a/src/cockpit/renderer.m b/src/cockpit/renderer.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9faf8c1b014
+--- /dev/null
++++ b/src/cockpit/renderer.m
+@@ -0,0 +1,911 @@
++#import <AppKit/AppKit.h>
++#import <Metal/Metal.h>
++#import <QuartzCore/CAMetalLayer.h>
++#import <CockpitGhostty/cockpit_ghostty.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum {
++  CKGF_HEADER_LENGTH = 36,
++  CKGF_MAXIMUM_LENGTH = 16 * 1024 * 1024,
++};
++
++typedef struct {
++  uint8_t red;
++  uint8_t green;
++  uint8_t blue;
++} cockpit_rgb_t;
++
++typedef struct {
++  uint32_t row;
++  uint32_t column;
++  uint8_t width;
++  uint8_t foreground_kind;
++  uint8_t background_kind;
++  uint8_t flags;
++  uint8_t underline;
++  uint32_t foreground;
++  uint32_t background;
++  char *text;
++  uint32_t text_length;
++} cockpit_render_cell_t;
++
++typedef struct {
++  uint8_t kind;
++  uint8_t flags;
++  uint64_t base_sequence;
++  uint64_t output_sequence;
++  uint32_t rows;
++  uint32_t columns;
++  const uint8_t *sections[8];
++  size_t section_lengths[8];
++  uint32_t palette_count;
++  uint32_t row_count;
++  uint32_t cell_count;
++  uint32_t grapheme_count;
++  uint32_t style_count;
++} cockpit_frame_t;
++
++struct cockpit_ghostty_renderer {
++  __strong NSView *view;
++  __strong CAMetalLayer *layer;
++  __strong CALayer *original_layer;
++  __strong id<MTLDevice> device;
++  __strong id<MTLCommandQueue> command_queue;
++  __strong id<MTLTexture> upload_texture;
++  __strong id<MTLTexture> offscreen_texture;
++  cockpit_render_cell_t *cells;
++  size_t cell_count;
++  cockpit_rgb_t palette[256];
++  uint32_t rows;
++  uint32_t columns;
++  uint32_t cursor_row;
++  uint32_t cursor_column;
++  uint8_t cursor_shape;
++  bool cursor_visible;
++  bool cursor_blinking;
++  uint64_t sequence;
++  uint32_t pixels_w;
++  uint32_t pixels_h;
++  double scale;
++  bool has_viewport;
++  bool visible;
++  bool original_wants_layer;
++};
++
++static void initialize_palette(cockpit_rgb_t *palette);
++
++static uint16_t read_u16(const uint8_t *bytes) {
++  return ((uint16_t)bytes[0] << 8) | bytes[1];
++}
++
++static uint32_t read_u32(const uint8_t *bytes) {
++  return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
++         ((uint32_t)bytes[2] << 8) | bytes[3];
++}
++
++static uint64_t read_u64(const uint8_t *bytes) {
++  return ((uint64_t)read_u32(bytes) << 32) | read_u32(bytes + 4);
++}
++
++static bool zero3(const uint8_t *bytes) {
++  return bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0;
++}
++
++static bool validate_palette(cockpit_frame_t *frame, const uint8_t *payload,
++                             size_t length) {
++  if (length < 4) return false;
++  uint32_t count = read_u32(payload);
++  if (count > 256 || length != 4 + (size_t)count * 6) return false;
++  uint16_t previous = 0;
++  for (uint32_t i = 0; i < count; ++i) {
++    const uint8_t *entry = payload + 4 + (size_t)i * 6;
++    uint16_t index = read_u16(entry);
++    if (index > 255 || entry[5] != 0 || (i > 0 && index <= previous))
++      return false;
++    previous = index;
++  }
++  frame->palette_count = count;
++  return true;
++}
++
++static bool validate_cursor(const uint8_t *payload, size_t length,
++                            uint32_t rows, uint32_t columns) {
++  return length == 12 && read_u32(payload) < rows &&
++         read_u32(payload + 4) < columns && payload[8] >= 1 &&
++         payload[8] <= 3 && payload[9] <= 1 && payload[10] <= 1 &&
++         payload[11] == 0;
++}
++
++static bool validate_rows(cockpit_frame_t *frame, const uint8_t *payload,
++                          size_t length) {
++  if (length < 4) return false;
++  uint32_t count = read_u32(payload);
++  if (count > frame->rows || length != 4 + (size_t)count * 16)
++    return false;
++  uint32_t previous = 0;
++  for (uint32_t i = 0; i < count; ++i) {
++    const uint8_t *entry = payload + 4 + (size_t)i * 16;
++    uint32_t row = read_u32(entry);
++    if (row >= frame->rows || (entry[4] & ~0x03) != 0 ||
++        (entry[4] & 0x01) == 0 || !zero3(entry + 5) ||
++        (i > 0 && row <= previous))
++      return false;
++    previous = row;
++  }
++  frame->row_count = count;
++  return true;
++}
++
++static bool validate_cells(cockpit_frame_t *frame, const uint8_t *payload,
++                           size_t length) {
++  if (length < 4) return false;
++  uint32_t count = read_u32(payload);
++  if (count > CKGF_MAXIMUM_LENGTH / 20 ||
++      length != 4 + (size_t)count * 20)
++    return false;
++  uint32_t previous_row = 0;
++  uint32_t previous_column = 0;
++  for (uint32_t i = 0; i < count; ++i) {
++    const uint8_t *entry = payload + 4 + (size_t)i * 20;
++    uint32_t row = read_u32(entry);
++    uint32_t column = read_u32(entry + 4);
++    if (row >= frame->rows || column >= frame->columns || entry[8] > 2 ||
++        entry[9] != 0 || read_u16(entry + 10) != 0 ||
++        (i > 0 && (row < previous_row ||
++                   (row == previous_row && column <= previous_column))))
++      return false;
++    previous_row = row;
++    previous_column = column;
++  }
++  frame->cell_count = count;
++  return true;
++}
++
++static bool validate_graphemes(cockpit_frame_t *frame,
++                               const uint8_t *payload, size_t length) {
++  if (length < 4) return false;
++  uint32_t count = read_u32(payload);
++  size_t offset = 4;
++  for (uint32_t i = 0; i < count; ++i) {
++    if (length - offset < 8) return false;
++    uint32_t index = read_u32(payload + offset);
++    uint32_t byte_length = read_u32(payload + offset + 4);
++    offset += 8;
++    if (index != i + 1 || byte_length == 0 || byte_length > length - offset)
++      return false;
++    CFStringRef value = CFStringCreateWithBytes(
++        kCFAllocatorDefault, payload + offset, byte_length,
++        kCFStringEncodingUTF8, false);
++    if (value == NULL) return false;
++    CFRelease(value);
++    offset += byte_length;
++  }
++  frame->grapheme_count = count;
++  return offset == length;
++}
++
++static bool validate_styles(cockpit_frame_t *frame, const uint8_t *payload,
++                            size_t length) {
++  if (length < 4) return false;
++  uint32_t count = read_u32(payload);
++  if (length != 4 + (size_t)count * 16) return false;
++  for (uint32_t i = 0; i < count; ++i) {
++    const uint8_t *entry = payload + 4 + (size_t)i * 16;
++    uint8_t foreground_kind = entry[4];
++    uint8_t background_kind = entry[5];
++    if (read_u32(entry) != i + 1 || foreground_kind > 2 ||
++        background_kind > 2 || entry[7] > 5)
++      return false;
++    uint32_t foreground = read_u32(entry + 8);
++    uint32_t background = read_u32(entry + 12);
++    if ((foreground_kind == 0 && foreground != 0) ||
++        (foreground_kind == 1 && foreground > 255) ||
++        (foreground_kind == 2 && foreground > 0xFFFFFF) ||
++        (background_kind == 0 && background != 0) ||
++        (background_kind == 1 && background > 255) ||
++        (background_kind == 2 && background > 0xFFFFFF))
++      return false;
++  }
++  frame->style_count = count;
++  return true;
++}
++
++static bool validate_scrollback(const uint8_t *payload, size_t length) {
++  if (length < 16) return false;
++  uint64_t requested = read_u64(payload);
++  uint32_t count = read_u32(payload + 8);
++  if (read_u32(payload + 12) != 0) return false;
++  size_t offset = 16;
++  uint64_t previous = 0;
++  for (uint32_t i = 0; i < count; ++i) {
++    if (length - offset < 16) return false;
++    uint64_t index = read_u64(payload + offset);
++    if (index < requested || (i > 0 && index <= previous) ||
++        payload[offset + 8] > 1 || !zero3(payload + offset + 9))
++      return false;
++    previous = index;
++    uint32_t byte_length = read_u32(payload + offset + 12);
++    offset += 16;
++    if (byte_length > length - offset) return false;
++    CFStringRef value = CFStringCreateWithBytes(
++        kCFAllocatorDefault, payload + offset, byte_length,
++        kCFStringEncodingUTF8, false);
++    if (value == NULL && byte_length != 0) return false;
++    if (value != NULL) CFRelease(value);
++    offset += byte_length;
++  }
++  return offset == length;
++}
++
++static bool validate_cross_references(const cockpit_frame_t *frame) {
++  const uint8_t *rows = frame->sections[3];
++  const uint8_t *cells = frame->sections[4];
++  uint32_t consumed_cells = 0;
++  for (uint32_t i = 0; i < frame->row_count; ++i) {
++    const uint8_t *row_entry = rows + 4 + (size_t)i * 16;
++    uint32_t row = read_u32(row_entry);
++    uint32_t first = read_u32(row_entry + 8);
++    uint32_t count = read_u32(row_entry + 12);
++    if (first != consumed_cells || first > frame->cell_count ||
++        count > frame->cell_count - first)
++      return false;
++    for (uint32_t cell_index = first; cell_index < first + count;
++         ++cell_index) {
++      const uint8_t *cell = cells + 4 + (size_t)cell_index * 20;
++      if (read_u32(cell) != row) return false;
++    }
++    consumed_cells += count;
++  }
++  if (consumed_cells != frame->cell_count) return false;
++  for (uint32_t i = 0; i < frame->cell_count; ++i) {
++    const uint8_t *cell = cells + 4 + (size_t)i * 20;
++    if (read_u32(cell + 12) > frame->grapheme_count ||
++        read_u32(cell + 16) > frame->style_count)
++      return false;
++  }
++  if (frame->kind == 1) {
++    if (frame->row_count != frame->rows) return false;
++    for (uint32_t i = 0; i < frame->row_count; ++i) {
++      if (read_u32(rows + 4 + (size_t)i * 16) != i) return false;
++    }
++  }
++  return true;
++}
++
++static bool validate_frame(const uint8_t *bytes, size_t length,
++                           cockpit_frame_t *frame) {
++  memset(frame, 0, sizeof(*frame));
++  if (bytes == NULL || length < CKGF_HEADER_LENGTH ||
++      length > CKGF_MAXIMUM_LENGTH || memcmp(bytes, "CKGF", 4) != 0 ||
++      read_u16(bytes + 4) != 1)
++    return false;
++  frame->kind = bytes[6];
++  frame->flags = bytes[7];
++  frame->base_sequence = read_u64(bytes + 8);
++  frame->output_sequence = read_u64(bytes + 16);
++  frame->rows = read_u32(bytes + 24);
++  frame->columns = read_u32(bytes + 28);
++  uint32_t section_count = read_u32(bytes + 32);
++  if (frame->kind < 1 || frame->kind > 3 || (frame->flags & ~0x01) != 0 ||
++      frame->rows == 0 || frame->columns == 0 ||
++      frame->output_sequence == 0 || section_count > 7)
++    return false;
++  if ((frame->kind == 1 &&
++       (frame->flags != 1 || frame->base_sequence != 0)) ||
++      (frame->kind != 1 && frame->flags != 0) ||
++      (frame->kind == 2 &&
++       frame->base_sequence >= frame->output_sequence))
++    return false;
++
++  bool seen[8] = {false};
++  size_t offset = CKGF_HEADER_LENGTH;
++  for (uint32_t i = 0; i < section_count; ++i) {
++    if (length - offset < 8) return false;
++    uint8_t type = bytes[offset];
++    uint32_t payload_length = read_u32(bytes + offset + 4);
++    if (type < 1 || type > 7 || seen[type] ||
++        !zero3(bytes + offset + 1))
++      return false;
++    seen[type] = true;
++    offset += 8;
++    if (payload_length > length - offset) return false;
++    const uint8_t *payload = bytes + offset;
++    frame->sections[type] = payload;
++    frame->section_lengths[type] = payload_length;
++    bool valid = false;
++    switch (type) {
++      case 1:
++        valid = validate_palette(frame, payload, payload_length);
++        break;
++      case 2:
++        valid = validate_cursor(payload, payload_length, frame->rows,
++                                frame->columns);
++        break;
++      case 3:
++        valid = validate_rows(frame, payload, payload_length);
++        break;
++      case 4:
++        valid = validate_cells(frame, payload, payload_length);
++        break;
++      case 5:
++        valid = validate_graphemes(frame, payload, payload_length);
++        break;
++      case 6:
++        valid = validate_styles(frame, payload, payload_length);
++        break;
++      case 7:
++        valid = validate_scrollback(payload, payload_length);
++        break;
++    }
++    if (!valid) return false;
++    offset += payload_length;
++  }
++  if (offset != length) return false;
++  if (frame->kind == 1) {
++    if (frame->palette_count != 256 ||
++        !(seen[1] && seen[2] && seen[3] && seen[4] && seen[5] &&
++          seen[6]) || seen[7])
++      return false;
++  } else if (frame->kind == 2) {
++    if (seen[1] || !(seen[2] && seen[3] && seen[4] && seen[5] &&
++                     seen[6]) || seen[7])
++      return false;
++  } else if (section_count != 1 || !seen[7]) {
++    return false;
++  }
++  return frame->kind == 3 || validate_cross_references(frame);
++}
++
++static const uint8_t *grapheme_at(const cockpit_frame_t *frame,
++                                  uint32_t wanted, uint32_t *length) {
++  if (wanted == 0) {
++    *length = 0;
++    return NULL;
++  }
++  const uint8_t *payload = frame->sections[5];
++  size_t offset = 4;
++  for (uint32_t index = 1; index <= frame->grapheme_count; ++index) {
++    uint32_t byte_length = read_u32(payload + offset + 4);
++    offset += 8;
++    if (index == wanted) {
++      *length = byte_length;
++      return payload + offset;
++    }
++    offset += byte_length;
++  }
++  return NULL;
++}
++
++static void style_at(const cockpit_frame_t *frame, uint32_t wanted,
++                     cockpit_render_cell_t *cell) {
++  if (wanted == 0) return;
++  const uint8_t *entry = frame->sections[6] + 4 +
++                         (size_t)(wanted - 1) * 16;
++  cell->foreground_kind = entry[4];
++  cell->background_kind = entry[5];
++  cell->flags = entry[6];
++  cell->underline = entry[7];
++  cell->foreground = read_u32(entry + 8);
++  cell->background = read_u32(entry + 12);
++}
++
++static void free_cells(cockpit_render_cell_t *cells, size_t count) {
++  if (cells == NULL) return;
++  for (size_t i = 0; i < count; ++i) free(cells[i].text);
++  free(cells);
++}
++
++static bool build_frame_cells(const cockpit_frame_t *frame,
++                              cockpit_render_cell_t **result) {
++  *result = NULL;
++  if (frame->cell_count == 0) return true;
++  cockpit_render_cell_t *cells = calloc(frame->cell_count, sizeof(*cells));
++  if (cells == NULL) return false;
++  const uint8_t *payload = frame->sections[4];
++  for (uint32_t i = 0; i < frame->cell_count; ++i) {
++    const uint8_t *entry = payload + 4 + (size_t)i * 20;
++    cockpit_render_cell_t *cell = &cells[i];
++    cell->row = read_u32(entry);
++    cell->column = read_u32(entry + 4);
++    cell->width = entry[8];
++    uint32_t grapheme = read_u32(entry + 12);
++    uint32_t style = read_u32(entry + 16);
++    const uint8_t *text = grapheme_at(frame, grapheme, &cell->text_length);
++    if (cell->text_length > 0) {
++      cell->text = malloc((size_t)cell->text_length + 1);
++      if (cell->text == NULL) {
++        free_cells(cells, frame->cell_count);
++        return false;
++      }
++      memcpy(cell->text, text, cell->text_length);
++      cell->text[cell->text_length] = 0;
++    }
++    style_at(frame, style, cell);
++  }
++  *result = cells;
++  return true;
++}
++
++static bool dirty_row(const cockpit_frame_t *frame, uint32_t row) {
++  const uint8_t *rows = frame->sections[3];
++  uint32_t low = 0;
++  uint32_t high = frame->row_count;
++  while (low < high) {
++    uint32_t middle = low + (high - low) / 2;
++    uint32_t candidate = read_u32(rows + 4 + (size_t)middle * 16);
++    if (candidate < row)
++      low = middle + 1;
++    else
++      high = middle;
++  }
++  return low < frame->row_count &&
++         read_u32(rows + 4 + (size_t)low * 16) == row;
++}
++
++static int compare_cells(const void *left_pointer, const void *right_pointer) {
++  const cockpit_render_cell_t *left = left_pointer;
++  const cockpit_render_cell_t *right = right_pointer;
++  if (left->row != right->row) return left->row < right->row ? -1 : 1;
++  if (left->column != right->column)
++    return left->column < right->column ? -1 : 1;
++  return 0;
++}
++
++static bool apply_snapshot(cockpit_ghostty_renderer_t *renderer,
++                           const cockpit_frame_t *frame) {
++  cockpit_render_cell_t *cells = NULL;
++  if (!build_frame_cells(frame, &cells)) return false;
++  free_cells(renderer->cells, renderer->cell_count);
++  renderer->cells = cells;
++  renderer->cell_count = frame->cell_count;
++  renderer->rows = frame->rows;
++  renderer->columns = frame->columns;
++  initialize_palette(renderer->palette);
++  const uint8_t *palette = frame->sections[1];
++  for (uint32_t i = 0; i < frame->palette_count; ++i) {
++    const uint8_t *entry = palette + 4 + (size_t)i * 6;
++    uint16_t index = read_u16(entry);
++    renderer->palette[index] =
++        (cockpit_rgb_t){entry[2], entry[3], entry[4]};
++  }
++  const uint8_t *cursor = frame->sections[2];
++  renderer->cursor_row = read_u32(cursor);
++  renderer->cursor_column = read_u32(cursor + 4);
++  renderer->cursor_shape = cursor[8];
++  renderer->cursor_visible = cursor[9] != 0;
++  renderer->cursor_blinking = cursor[10] != 0;
++  renderer->sequence = frame->output_sequence;
++  renderer->has_viewport = true;
++  return true;
++}
++
++static bool apply_delta(cockpit_ghostty_renderer_t *renderer,
++                        const cockpit_frame_t *frame) {
++  cockpit_render_cell_t *delta_cells = NULL;
++  if (!build_frame_cells(frame, &delta_cells)) return false;
++  size_t retained = 0;
++  for (size_t i = 0; i < renderer->cell_count; ++i) {
++    if (!dirty_row(frame, renderer->cells[i].row)) ++retained;
++  }
++  if (retained > SIZE_MAX - frame->cell_count) {
++    free_cells(delta_cells, frame->cell_count);
++    return false;
++  }
++  size_t combined_count = retained + frame->cell_count;
++  cockpit_render_cell_t *combined =
++      combined_count == 0 ? NULL : calloc(combined_count, sizeof(*combined));
++  if (combined_count > 0 && combined == NULL) {
++    free_cells(delta_cells, frame->cell_count);
++    return false;
++  }
++  size_t output = 0;
++  for (size_t i = 0; i < renderer->cell_count; ++i) {
++    if (dirty_row(frame, renderer->cells[i].row)) {
++      free(renderer->cells[i].text);
++    } else {
++      combined[output++] = renderer->cells[i];
++    }
++  }
++  for (uint32_t i = 0; i < frame->cell_count; ++i)
++    combined[output++] = delta_cells[i];
++  free(delta_cells);
++  free(renderer->cells);
++  renderer->cells = combined;
++  renderer->cell_count = combined_count;
++  if (combined_count > 1)
++    qsort(combined, combined_count, sizeof(*combined), compare_cells);
++  const uint8_t *cursor = frame->sections[2];
++  renderer->cursor_row = read_u32(cursor);
++  renderer->cursor_column = read_u32(cursor + 4);
++  renderer->cursor_shape = cursor[8];
++  renderer->cursor_visible = cursor[9] != 0;
++  renderer->cursor_blinking = cursor[10] != 0;
++  renderer->sequence = frame->output_sequence;
++  return true;
++}
++
++static bool clone_render_state(const cockpit_ghostty_renderer_t *source,
++                               cockpit_ghostty_renderer_t *destination) {
++  destination->view = source->view;
++  destination->layer = source->layer;
++  destination->device = source->device;
++  destination->command_queue = source->command_queue;
++  // A failed staged draw must not overwrite textures owned by the committed
++  // renderer. Fresh textures are published only by commit_render_state.
++  destination->upload_texture = nil;
++  destination->offscreen_texture = nil;
++  memcpy(destination->palette, source->palette, sizeof(source->palette));
++  destination->rows = source->rows;
++  destination->columns = source->columns;
++  destination->cursor_row = source->cursor_row;
++  destination->cursor_column = source->cursor_column;
++  destination->cursor_shape = source->cursor_shape;
++  destination->cursor_visible = source->cursor_visible;
++  destination->cursor_blinking = source->cursor_blinking;
++  destination->sequence = source->sequence;
++  destination->pixels_w = source->pixels_w;
++  destination->pixels_h = source->pixels_h;
++  destination->scale = source->scale;
++  destination->has_viewport = source->has_viewport;
++  destination->visible = source->visible;
++
++  if (source->cell_count == 0) return true;
++  destination->cells = calloc(source->cell_count, sizeof(*destination->cells));
++  if (destination->cells == NULL) return false;
++  destination->cell_count = source->cell_count;
++  for (size_t index = 0; index < source->cell_count; ++index) {
++    destination->cells[index] = source->cells[index];
++    destination->cells[index].text = NULL;
++    if (source->cells[index].text_length == 0) continue;
++    destination->cells[index].text =
++        malloc(source->cells[index].text_length);
++    if (destination->cells[index].text == NULL) {
++      free_cells(destination->cells, destination->cell_count);
++      destination->cells = NULL;
++      destination->cell_count = 0;
++      return false;
++    }
++    memcpy(destination->cells[index].text, source->cells[index].text,
++           source->cells[index].text_length);
++  }
++  return true;
++}
++
++static void commit_render_state(cockpit_ghostty_renderer_t *destination,
++                                cockpit_ghostty_renderer_t *source) {
++  free_cells(destination->cells, destination->cell_count);
++  destination->cells = source->cells;
++  destination->cell_count = source->cell_count;
++  source->cells = NULL;
++  source->cell_count = 0;
++  memcpy(destination->palette, source->palette, sizeof(source->palette));
++  destination->rows = source->rows;
++  destination->columns = source->columns;
++  destination->cursor_row = source->cursor_row;
++  destination->cursor_column = source->cursor_column;
++  destination->cursor_shape = source->cursor_shape;
++  destination->cursor_visible = source->cursor_visible;
++  destination->cursor_blinking = source->cursor_blinking;
++  destination->sequence = source->sequence;
++  destination->upload_texture = source->upload_texture;
++  destination->offscreen_texture = source->offscreen_texture;
++  destination->has_viewport = source->has_viewport;
++}
++
++static void initialize_palette(cockpit_rgb_t *palette) {
++  static const cockpit_rgb_t ansi[16] = {
++      {0, 0, 0},       {205, 49, 49},   {13, 188, 121}, {229, 229, 16},
++      {36, 114, 200},  {188, 63, 188},  {17, 168, 205}, {229, 229, 229},
++      {102, 102, 102}, {241, 76, 76},   {35, 209, 139}, {245, 245, 67},
++      {59, 142, 234},  {214, 112, 214}, {41, 184, 219}, {255, 255, 255},
++  };
++  memcpy(palette, ansi, sizeof(ansi));
++  static const uint8_t cube[] = {0, 95, 135, 175, 215, 255};
++  for (uint32_t index = 16; index < 232; ++index) {
++    uint32_t value = index - 16;
++    palette[index] = (cockpit_rgb_t){cube[value / 36],
++                                     cube[(value / 6) % 6], cube[value % 6]};
++  }
++  for (uint32_t index = 232; index < 256; ++index) {
++    uint8_t value = (uint8_t)(8 + (index - 232) * 10);
++    palette[index] = (cockpit_rgb_t){value, value, value};
++  }
++}
++
++static cockpit_rgb_t color_for(cockpit_ghostty_renderer_t *renderer,
++                               uint8_t kind, uint32_t value,
++                               cockpit_rgb_t fallback) {
++  if (kind == 1) return renderer->palette[value];
++  if (kind == 2)
++    return (cockpit_rgb_t){(uint8_t)(value >> 16), (uint8_t)(value >> 8),
++                           (uint8_t)value};
++  return fallback;
++}
++
++static NSColor *ns_color(cockpit_rgb_t value, CGFloat alpha) {
++  return [NSColor colorWithSRGBRed:(CGFloat)value.red / 255.0
++                             green:(CGFloat)value.green / 255.0
++                              blue:(CGFloat)value.blue / 255.0
++                             alpha:alpha];
++}
++
++static bool texture_dimensions_match(id<MTLTexture> texture, NSUInteger width,
++                                     NSUInteger height) {
++  return texture != nil && texture.width == width && texture.height == height;
++}
++
++static bool ensure_textures(cockpit_ghostty_renderer_t *renderer,
++                            NSUInteger width, NSUInteger height) {
++  if (texture_dimensions_match(renderer->upload_texture, width, height) &&
++      texture_dimensions_match(renderer->offscreen_texture, width, height))
++    return true;
++  MTLTextureDescriptor *upload = [MTLTextureDescriptor
++      texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++                                   width:width
++                                  height:height
++                               mipmapped:NO];
++  upload.storageMode = MTLStorageModeShared;
++  upload.usage = MTLTextureUsageShaderRead;
++  MTLTextureDescriptor *offscreen = [upload copy];
++  offscreen.storageMode = MTLStorageModePrivate;
++  offscreen.usage = MTLTextureUsageShaderRead;
++  renderer->upload_texture = [renderer->device newTextureWithDescriptor:upload];
++  renderer->offscreen_texture =
++      [renderer->device newTextureWithDescriptor:offscreen];
++  return renderer->upload_texture != nil && renderer->offscreen_texture != nil;
++}
++
++static bool render_viewport(cockpit_ghostty_renderer_t *renderer) {
++  if (!renderer->has_viewport || renderer->rows == 0 ||
++      renderer->columns == 0)
++    return false;
++  NSUInteger width = renderer->pixels_w;
++  NSUInteger height = renderer->pixels_h;
++  if (width == 0 || height == 0) {
++    NSRect bounds = renderer->view.bounds;
++    width = (NSUInteger)llround(bounds.size.width * renderer->scale);
++    height = (NSUInteger)llround(bounds.size.height * renderer->scale);
++  }
++  if (width == 0 || height == 0 || width > SIZE_MAX / height ||
++      width * height > SIZE_MAX / 4 || !ensure_textures(renderer, width, height))
++    return false;
++
++  size_t bytes_per_row = width * 4;
++  uint8_t *bitmap = calloc(height, bytes_per_row);
++  if (bitmap == NULL) return false;
++  unsigned char *planes[5] = {bitmap, NULL, NULL, NULL, NULL};
++  NSBitmapImageRep *image = [[NSBitmapImageRep alloc]
++      initWithBitmapDataPlanes:planes
++                    pixelsWide:(NSInteger)width
++                    pixelsHigh:(NSInteger)height
++                 bitsPerSample:8
++               samplesPerPixel:4
++                      hasAlpha:YES
++                      isPlanar:NO
++                colorSpaceName:NSDeviceRGBColorSpace
++                   bitmapFormat:NSBitmapFormatAlphaFirst |
++                                NSBitmapFormatThirtyTwoBitLittleEndian
++                    bytesPerRow:(NSInteger)bytes_per_row
++                   bitsPerPixel:32];
++  if (image == nil) {
++    free(bitmap);
++    return false;
++  }
++  NSGraphicsContext *context =
++      [NSGraphicsContext graphicsContextWithBitmapImageRep:image];
++  if (context == nil) {
++    free(bitmap);
++    return false;
++  }
++  [NSGraphicsContext saveGraphicsState];
++  [NSGraphicsContext setCurrentContext:context];
++  [ns_color((cockpit_rgb_t){0, 0, 0}, 1.0) setFill];
++  NSRectFill(NSMakeRect(0, 0, width, height));
++
++  CGFloat cell_width = (CGFloat)width / renderer->columns;
++  CGFloat cell_height = (CGFloat)height / renderer->rows;
++  CGFloat font_size = fmax(1.0, cell_height * 0.72);
++  cockpit_rgb_t default_foreground = {229, 229, 229};
++  cockpit_rgb_t default_background = {0, 0, 0};
++  for (size_t i = 0; i < renderer->cell_count; ++i) {
++    cockpit_render_cell_t *cell = &renderer->cells[i];
++    cockpit_rgb_t foreground = color_for(renderer, cell->foreground_kind,
++                                         cell->foreground,
++                                         default_foreground);
++    cockpit_rgb_t background = color_for(renderer, cell->background_kind,
++                                         cell->background,
++                                         default_background);
++    if ((cell->flags & (1u << 4)) != 0) {
++      cockpit_rgb_t swap = foreground;
++      foreground = background;
++      background = swap;
++    }
++    CGFloat x = cell->column * cell_width;
++    CGFloat y = height - (cell->row + 1) * cell_height;
++    CGFloat rendered_width = fmax(cell_width, cell->width * cell_width);
++    if (cell->background_kind != 0 || (cell->flags & (1u << 4)) != 0) {
++      [ns_color(background, 1.0) setFill];
++      NSRectFill(NSMakeRect(x, y, rendered_width, cell_height));
++    }
++    if (cell->text_length == 0 || (cell->flags & (1u << 5)) != 0) continue;
++    NSString *text = [[NSString alloc] initWithBytes:cell->text
++                                             length:cell->text_length
++                                           encoding:NSUTF8StringEncoding];
++    if (text == nil) continue;
++    NSFontWeight weight = (cell->flags & 1u) != 0 ? NSFontWeightBold
++                                                  : NSFontWeightRegular;
++    NSFont *font = [NSFont monospacedSystemFontOfSize:font_size weight:weight];
++    if ((cell->flags & (1u << 1)) != 0)
++      font = [[NSFontManager sharedFontManager] convertFont:font
++                                                toHaveTrait:NSItalicFontMask];
++    CGFloat alpha = (cell->flags & (1u << 2)) != 0 ? 0.5 : 1.0;
++    NSMutableDictionary<NSAttributedStringKey, id> *attributes =
++        [@{NSFontAttributeName : font,
++           NSForegroundColorAttributeName : ns_color(foreground, alpha)}
++            mutableCopy];
++    if (cell->underline != 0)
++      attributes[NSUnderlineStyleAttributeName] =
++          @(cell->underline == 2 ? NSUnderlineStyleDouble
++                                 : NSUnderlineStyleSingle);
++    if ((cell->flags & (1u << 6)) != 0)
++      attributes[NSStrikethroughStyleAttributeName] = @(NSUnderlineStyleSingle);
++    [text drawInRect:NSMakeRect(x, y, rendered_width, cell_height)
++      withAttributes:attributes];
++    if ((cell->flags & (1u << 7)) != 0) {
++      [ns_color(foreground, alpha) setFill];
++      NSRectFill(NSMakeRect(x, y + cell_height - 1, rendered_width, 1));
++    }
++  }
++
++  if (renderer->cursor_visible) {
++    CGFloat x = renderer->cursor_column * cell_width;
++    CGFloat y = height - (renderer->cursor_row + 1) * cell_height;
++    [ns_color((cockpit_rgb_t){255, 255, 255}, 0.55) setFill];
++    if (renderer->cursor_shape == 1)
++      NSRectFill(NSMakeRect(x, y, cell_width, cell_height));
++    else if (renderer->cursor_shape == 2)
++      NSRectFill(NSMakeRect(x, y, fmax(1, cell_width * 0.12), cell_height));
++    else
++      NSRectFill(NSMakeRect(x, y, cell_width, fmax(1, cell_height * 0.12)));
++  }
++  [context flushGraphics];
++  [NSGraphicsContext restoreGraphicsState];
++
++  MTLRegion region = MTLRegionMake2D(0, 0, width, height);
++  [renderer->upload_texture replaceRegion:region
++                              mipmapLevel:0
++                                withBytes:bitmap
++                              bytesPerRow:bytes_per_row];
++  free(bitmap);
++
++  id<MTLCommandBuffer> command_buffer =
++      [renderer->command_queue commandBuffer];
++  id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
++  if (command_buffer == nil || encoder == nil) return false;
++  MTLSize size = MTLSizeMake(width, height, 1);
++  MTLOrigin origin = MTLOriginMake(0, 0, 0);
++  [encoder copyFromTexture:renderer->upload_texture
++               sourceSlice:0
++               sourceLevel:0
++              sourceOrigin:origin
++                sourceSize:size
++                 toTexture:renderer->offscreen_texture
++          destinationSlice:0
++          destinationLevel:0
++         destinationOrigin:origin];
++  id<CAMetalDrawable> drawable = [renderer->layer nextDrawable];
++  if (drawable != nil && drawable.texture.width == width &&
++      drawable.texture.height == height) {
++    [encoder copyFromTexture:renderer->offscreen_texture
++                 sourceSlice:0
++                 sourceLevel:0
++                sourceOrigin:origin
++                  sourceSize:size
++                   toTexture:drawable.texture
++            destinationSlice:0
++            destinationLevel:0
++           destinationOrigin:origin];
++  }
++  [encoder endEncoding];
++  if (drawable != nil) [command_buffer presentDrawable:drawable];
++  [command_buffer commit];
++  [command_buffer waitUntilCompleted];
++  if (command_buffer.status == MTLCommandBufferStatusError) return false;
++  [renderer->view setNeedsDisplay:YES];
++  return true;
++}
++
++cockpit_ghostty_renderer_t *cockpit_ghostty_renderer_create(void *ns_view,
++                                                             double scale) {
++  if (ns_view == NULL || !isfinite(scale) || scale <= 0) return NULL;
++  NSView *view = (__bridge NSView *)ns_view;
++  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++  if (device == nil) return NULL;
++  id<MTLCommandQueue> command_queue = [device newCommandQueue];
++  if (command_queue == nil) return NULL;
++  cockpit_ghostty_renderer_t *renderer = calloc(1, sizeof(*renderer));
++  if (renderer == NULL) return NULL;
++  CAMetalLayer *layer = [CAMetalLayer layer];
++  layer.device = device;
++  layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++  layer.framebufferOnly = NO;
++  layer.contentsScale = scale;
++  layer.frame = view.bounds;
++  layer.drawableSize = CGSizeMake(view.bounds.size.width * scale,
++                                  view.bounds.size.height * scale);
++  renderer->view = view;
++  renderer->layer = layer;
++  renderer->original_layer = view.layer;
++  renderer->original_wants_layer = view.wantsLayer;
++  renderer->device = device;
++  renderer->command_queue = command_queue;
++  renderer->scale = scale;
++  renderer->visible = true;
++  initialize_palette(renderer->palette);
++  view.layer = layer;
++  view.wantsLayer = YES;
++  return renderer;
++}
++
++void cockpit_ghostty_renderer_destroy(cockpit_ghostty_renderer_t *renderer) {
++  if (renderer == NULL) return;
++  if (renderer->view.layer == renderer->layer) {
++    renderer->view.layer = renderer->original_layer;
++    renderer->view.wantsLayer = renderer->original_wants_layer;
++  }
++  free_cells(renderer->cells, renderer->cell_count);
++  renderer->cells = NULL;
++  renderer->upload_texture = nil;
++  renderer->offscreen_texture = nil;
++  renderer->command_queue = nil;
++  renderer->device = nil;
++  renderer->original_layer = nil;
++  renderer->layer = nil;
++  renderer->view = nil;
++  free(renderer);
++}
++
++int cockpit_ghostty_renderer_apply(cockpit_ghostty_renderer_t *renderer,
++                                    const uint8_t *bytes, size_t length) {
++  cockpit_frame_t frame;
++  if (renderer == NULL || !validate_frame(bytes, length, &frame)) return -1;
++  if (!renderer->visible) return 0;
++  if (frame.kind == 3) return 1;
++  if (frame.kind == 2 &&
++      (!renderer->has_viewport || frame.rows != renderer->rows ||
++       frame.columns != renderer->columns ||
++       frame.base_sequence != renderer->sequence))
++    return -1;
++  cockpit_ghostty_renderer_t staged = {0};
++  if (!clone_render_state(renderer, &staged)) return -1;
++  bool applied = frame.kind == 1 ? apply_snapshot(&staged, &frame)
++                                 : apply_delta(&staged, &frame);
++  if (!applied || !render_viewport(&staged)) {
++    free_cells(staged.cells, staged.cell_count);
++    return -1;
++  }
++  commit_render_state(renderer, &staged);
++  return 1;
++}
++
++void cockpit_ghostty_renderer_resize(cockpit_ghostty_renderer_t *renderer,
++                                     uint32_t pixels_w, uint32_t pixels_h,
++                                     double scale) {
++  if (renderer == NULL || !isfinite(scale) || scale <= 0) return;
++  renderer->pixels_w = pixels_w;
++  renderer->pixels_h = pixels_h;
++  renderer->scale = scale;
++  renderer->layer.contentsScale = scale;
++  renderer->layer.drawableSize = CGSizeMake(pixels_w, pixels_h);
++  renderer->upload_texture = nil;
++  renderer->offscreen_texture = nil;
++}
++
++void cockpit_ghostty_renderer_set_visible(cockpit_ghostty_renderer_t *renderer,
++                                          bool visible) {
++  if (renderer == NULL) return;
++  renderer->visible = visible;
++  renderer->layer.hidden = !visible;
++}
+diff --git a/src/cockpit/renderer.zig b/src/cockpit/renderer.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4ad13122dc3326cd143f2182b66616b094a6d1c
+--- /dev/null
++++ b/src/cockpit/renderer.zig
+@@ -0,0 +1,4 @@
++//! Root module for the Objective-C Metal renderer bridge.
++comptime {
++    _ = @import("std");
++}
+diff --git a/src/cockpit/vt.zig b/src/cockpit/vt.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..013da7e3c238a0d890179b1be92c2041b90bfc1b
+--- /dev/null
++++ b/src/cockpit/vt.zig
+@@ -0,0 +1,1018 @@
++const std = @import("std");
++const ghostty = @import("ghostty-vt");
++
++const alloc = std.heap.c_allocator;
++const maximum_frame_length: usize = 16 * 1024 * 1024;
++
++const Bytes = extern struct {
++    bytes: ?[*]const u8,
++    length: usize,
++};
++
++const KeyEvent = extern struct {
++    logical_key: u32,
++    physical_key: u32,
++    modifiers: u32,
++    action: u8,
++    reserved: [3]u8,
++};
++
++const MouseEvent = extern struct {
++    cell_x: i32,
++    cell_y: i32,
++    buttons: u32,
++    wheel_x: i32,
++    wheel_y: i32,
++    modifiers: u32,
++    action: u8,
++    reserved: [3]u8,
++};
++
++const HistoryIdentity = struct {
++    node: usize,
++    serial: u64,
++    row: u32,
++};
++
++const HistoryRow = struct {
++    identity: HistoryIdentity,
++    absolute_index: u64,
++    text: []u8,
++    wrapped: bool,
++};
++
++const HistoryCache = struct {
++    rows: std.ArrayList(HistoryRow) = .empty,
++    screen_generation: usize = 0,
++    page_serial_epoch: u64 = 0,
++};
++
++const HistoryAnchor = struct {
++    pin: *ghostty.Pin,
++    absolute_index: u64,
++};
++
++const HistoryRelocations = std.AutoHashMap(HistoryIdentity, u64);
++
++const Bridge = struct {
++    io: std.Io.Threaded,
++    terminal: ghostty.Terminal,
++    stream: ghostty.TerminalStream,
++    render_state: ghostty.RenderState,
++    columns: u32,
++    rows: u32,
++    sequence: u64,
++    primary_history: HistoryCache,
++    alternate_history: HistoryCache,
++    next_history_index: u64,
++    previous_buttons: u32,
++    wheel_x_remainder: i64,
++    wheel_y_remainder: i64,
++};
++
++const Buffer = struct {
++    bytes: std.ArrayList(u8) = .empty,
++
++    fn deinit(self: *Buffer) void {
++        self.bytes.deinit(alloc);
++    }
++
++    fn append(self: *Buffer, data: []const u8) !void {
++        try self.bytes.appendSlice(alloc, data);
++    }
++
++    fn byte(self: *Buffer, value: u8) !void {
++        try self.bytes.append(alloc, value);
++    }
++
++    fn int(self: *Buffer, comptime T: type, value: T) !void {
++        var encoded: [@sizeOf(T)]u8 = undefined;
++        std.mem.writeInt(T, &encoded, value, .big);
++        try self.append(&encoded);
++    }
++
++    fn take(self: *Buffer) ![]u8 {
++        return self.bytes.toOwnedSlice(alloc);
++    }
++};
++
++const Section = struct {
++    kind: u8,
++    payload: Buffer,
++
++    fn deinit(self: *Section) void {
++        self.payload.deinit();
++    }
++};
++
++const CellRef = struct {
++    row: u32,
++    column: u32,
++    width: u8,
++    grapheme: u32,
++    style: u32,
++};
++
++fn empty(out: ?*Bytes) void {
++    if (out) |value| value.* = .{ .bytes = null, .length = 0 };
++}
++
++fn returnBytes(out: *Bytes, owned: []u8) c_int {
++    if (owned.len == 0) {
++        alloc.free(owned);
++        out.* = .{ .bytes = null, .length = 0 };
++        return 0;
++    }
++    if (owned.len > maximum_frame_length) {
++        alloc.free(owned);
++        return -1;
++    }
++    out.* = .{ .bytes = owned.ptr, .length = owned.len };
++    return 0;
++}
++
++fn validDimensions(columns: u32, rows: u32) bool {
++    return columns > 0 and rows > 0 and
++        columns <= std.math.maxInt(ghostty.size.CellCountInt) and
++        rows <= std.math.maxInt(ghostty.size.CellCountInt);
++}
++
++export fn cockpit_ghostty_vt_create(columns: u32, rows: u32, scrollback_limit: u64) ?*Bridge {
++    if (!validDimensions(columns, rows) or scrollback_limit > std.math.maxInt(usize)) return null;
++    const bridge = alloc.create(Bridge) catch return null;
++    bridge.io = .init_single_threaded;
++    bridge.terminal = ghostty.Terminal.init(bridge.io.io(), alloc, .{
++        .cols = @intCast(columns),
++        .rows = @intCast(rows),
++        .max_scrollback_lines = @intCast(scrollback_limit),
++    }) catch {
++        bridge.io.deinit();
++        alloc.destroy(bridge);
++        return null;
++    };
++    bridge.stream = bridge.terminal.vtStream();
++    bridge.render_state = .empty;
++    bridge.columns = columns;
++    bridge.rows = rows;
++    bridge.sequence = 0;
++    bridge.primary_history = .{
++        .screen_generation = bridge.terminal.screens.generation(.primary),
++        .page_serial_epoch = bridge.terminal.screens.active.pages.page_serial_epoch,
++    };
++    bridge.alternate_history = .{
++        .screen_generation = bridge.terminal.screens.generation(.alternate),
++    };
++    bridge.next_history_index = 0;
++    bridge.previous_buttons = 0;
++    bridge.wheel_x_remainder = 0;
++    bridge.wheel_y_remainder = 0;
++    return bridge;
++}
++
++export fn cockpit_ghostty_vt_destroy(bridge: ?*Bridge) void {
++    const value = bridge orelse return;
++    freeHistory(&value.primary_history.rows);
++    freeHistory(&value.alternate_history.rows);
++    value.stream.deinit();
++    value.render_state.deinit(alloc);
++    value.terminal.deinit(alloc);
++    value.io.deinit();
++    alloc.destroy(value);
++}
++
++export fn cockpit_ghostty_vt_reset_input_state(bridge: ?*Bridge) void {
++    const value = bridge orelse return;
++    value.previous_buttons = 0;
++    value.wheel_x_remainder = 0;
++    value.wheel_y_remainder = 0;
++}
++
++export fn cockpit_ghostty_vt_feed(bridge: ?*Bridge, data: ?[*]const u8, length: usize) c_int {
++    const value = bridge orelse return -1;
++    if (length > 0 and data == null) return -1;
++    value.stream.nextSlice(if (data) |ptr| ptr[0..length] else "");
++    return 0;
++}
++
++export fn cockpit_ghostty_vt_resize(bridge: ?*Bridge, columns: u32, rows: u32) c_int {
++    const value = bridge orelse return -1;
++    if (!validDimensions(columns, rows)) return -1;
++    const primary_before = value.terminal.screens.get(.primary).?;
++    synchronizeHistoryForScreen(
++        value,
++        primary_before,
++        &value.primary_history,
++        value.terminal.screens.generation(.primary),
++        null,
++    ) catch return -1;
++    var anchors = captureHistoryAnchors(primary_before, &value.primary_history) catch return -1;
++    defer releaseHistoryAnchors(primary_before, &anchors);
++    value.terminal.resize(alloc, .{
++        .cols = @intCast(columns),
++        .rows = @intCast(rows),
++    }) catch return -1;
++    value.columns = columns;
++    value.rows = rows;
++    var relocations = historyRelocations(anchors.items) catch return -1;
++    defer relocations.deinit();
++    const primary_after = value.terminal.screens.get(.primary).?;
++    synchronizeHistoryForScreen(
++        value,
++        primary_after,
++        &value.primary_history,
++        value.terminal.screens.generation(.primary),
++        &relocations,
++    ) catch return -1;
++    return 0;
++}
++
++fn appendSection(frame: *Buffer, section: *const Section) !void {
++    try frame.byte(section.kind);
++    try frame.append(&.{ 0, 0, 0 });
++    try frame.int(u32, @intCast(section.payload.bytes.items.len));
++    try frame.append(section.payload.bytes.items);
++}
++
++fn appendHeader(frame: *Buffer, kind: u8, flags: u8, base: u64, output: u64, rows: u32, columns: u32, section_count: u32) !void {
++    try frame.append("CKGF");
++    try frame.int(u16, 1);
++    try frame.byte(kind);
++    try frame.byte(flags);
++    try frame.int(u64, base);
++    try frame.int(u64, output);
++    try frame.int(u32, rows);
++    try frame.int(u32, columns);
++    try frame.int(u32, section_count);
++}
++
++fn styleIndex(styles: *std.ArrayList(ghostty.Style), style: ghostty.Style) !u32 {
++    if (style.default()) return 0;
++    for (styles.items, 0..) |existing, index| {
++        if (existing.eql(style)) return @intCast(index + 1);
++    }
++    try styles.append(alloc, style);
++    return @intCast(styles.items.len);
++}
++
++fn appendCodepoint(buffer: *Buffer, codepoint: u21) !void {
++    var encoded: [4]u8 = undefined;
++    const length = try std.unicode.utf8Encode(codepoint, &encoded);
++    try buffer.append(encoded[0..length]);
++}
++
++fn colorWire(color: ghostty.Style.Color) struct { u8, u32 } {
++    return switch (color) {
++        .none => .{ 0, 0 },
++        .palette => |index| .{ 1, index },
++        .rgb => |rgb| .{ 2, (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | rgb.b },
++    };
++}
++
++fn serializeViewport(bridge: *Bridge, snapshot: bool) ![]u8 {
++    try bridge.render_state.update(alloc, &bridge.terminal);
++    if (!snapshot and bridge.render_state.dirty == .full) return error.SnapshotRequired;
++    const rows_data = bridge.render_state.row_data.slice();
++    const row_raw = rows_data.items(.raw);
++    const row_cells = rows_data.items(.cells);
++    const row_dirty = rows_data.items(.dirty);
++
++    var selected: std.ArrayList(usize) = .empty;
++    defer selected.deinit(alloc);
++    for (0..bridge.render_state.rows) |row| {
++        if (snapshot or row_dirty[row]) try selected.append(alloc, row);
++    }
++
++    var styles: std.ArrayList(ghostty.Style) = .empty;
++    defer styles.deinit(alloc);
++    var cells: std.ArrayList(CellRef) = .empty;
++    defer cells.deinit(alloc);
++    var graphemes: std.ArrayList(Buffer) = .empty;
++    defer {
++        for (graphemes.items) |*value| value.deinit();
++        graphemes.deinit(alloc);
++    }
++
++    var row_section = Section{ .kind = 3, .payload = .{} };
++    defer row_section.deinit();
++    try row_section.payload.int(u32, @intCast(selected.items.len));
++    for (selected.items) |row| {
++        const first_cell: u32 = @intCast(cells.items.len);
++        const raw_slice = row_cells[row].slice();
++        const raw = raw_slice.items(.raw);
++        const cell_styles = raw_slice.items(.style);
++        const cell_graphemes = raw_slice.items(.grapheme);
++        for (raw, 0..) |cell, column| {
++            if (cell.isEmpty()) continue;
++            var grapheme_index: u32 = 0;
++            if (cell.hasText()) {
++                var grapheme: Buffer = .{};
++                errdefer grapheme.deinit();
++                try appendCodepoint(&grapheme, cell.codepoint());
++                if (cell.content_tag == .codepoint_grapheme) {
++                    for (cell_graphemes[column]) |codepoint| try appendCodepoint(&grapheme, codepoint);
++                }
++                try graphemes.append(alloc, grapheme);
++                grapheme_index = @intCast(graphemes.items.len);
++            }
++            const style = switch (cell.content_tag) {
++                .bg_color_palette => ghostty.Style{ .bg_color = .{ .palette = cell.content.color_palette.data } },
++                .bg_color_rgb => ghostty.Style{ .bg_color = .{ .rgb = .{
++                    .r = cell.content.color_rgb.r,
++                    .g = cell.content.color_rgb.g,
++                    .b = cell.content.color_rgb.b,
++                } } },
++                else => if (cell.style_id == 0) ghostty.Style{} else cell_styles[column],
++            };
++            const style_index = try styleIndex(&styles, style);
++            const width: u8 = switch (cell.wide) {
++                .spacer_head, .spacer_tail => 0,
++                .narrow => 1,
++                .wide => 2,
++            };
++            try cells.append(alloc, .{
++                .row = @intCast(row),
++                .column = @intCast(column),
++                .width = width,
++                .grapheme = grapheme_index,
++                .style = style_index,
++            });
++        }
++        const flags: u8 = 1 | if (row_raw[row].wrap) @as(u8, 2) else 0;
++        try row_section.payload.int(u32, @intCast(row));
++        try row_section.payload.byte(flags);
++        try row_section.payload.append(&.{ 0, 0, 0 });
++        try row_section.payload.int(u32, first_cell);
++        try row_section.payload.int(u32, @intCast(cells.items.len - first_cell));
++    }
++
++    var palette_section = Section{ .kind = 1, .payload = .{} };
++    defer palette_section.deinit();
++    try palette_section.payload.int(u32, 256);
++    for (bridge.render_state.colors.palette, 0..) |rgb, index| {
++        try palette_section.payload.int(u16, @intCast(index));
++        try palette_section.payload.append(&.{ rgb.r, rgb.g, rgb.b, 0 });
++    }
++
++    var cursor_section = Section{ .kind = 2, .payload = .{} };
++    defer cursor_section.deinit();
++    const cursor = bridge.render_state.cursor;
++    var cursor_position: ghostty.RenderState.Cursor.Viewport = cursor.viewport orelse .{ .x = 0, .y = 0, .wide_tail = false };
++    if (cursor_position.wide_tail and cursor_position.x > 0) cursor_position.x -= 1;
++    try cursor_section.payload.int(u32, cursor_position.y);
++    try cursor_section.payload.int(u32, cursor_position.x);
++    try cursor_section.payload.byte(switch (cursor.visual_style) {
++        .block => 1,
++        .bar => 2,
++        .underline => 3,
++        .block_hollow => 1,
++    });
++    try cursor_section.payload.byte(@intFromBool(cursor.visible and cursor.viewport != null));
++    try cursor_section.payload.byte(@intFromBool(cursor.blinking));
++    try cursor_section.payload.byte(0);
++
++    var cell_section = Section{ .kind = 4, .payload = .{} };
++    defer cell_section.deinit();
++    try cell_section.payload.int(u32, @intCast(cells.items.len));
++    for (cells.items) |cell| {
++        try cell_section.payload.int(u32, cell.row);
++        try cell_section.payload.int(u32, cell.column);
++        try cell_section.payload.byte(cell.width);
++        try cell_section.payload.byte(0);
++        try cell_section.payload.int(u16, 0);
++        try cell_section.payload.int(u32, cell.grapheme);
++        try cell_section.payload.int(u32, cell.style);
++    }
++
++    var grapheme_section = Section{ .kind = 5, .payload = .{} };
++    defer grapheme_section.deinit();
++    try grapheme_section.payload.int(u32, @intCast(graphemes.items.len));
++    for (graphemes.items, 0..) |grapheme, index| {
++        try grapheme_section.payload.int(u32, @intCast(index + 1));
++        try grapheme_section.payload.int(u32, @intCast(grapheme.bytes.items.len));
++        try grapheme_section.payload.append(grapheme.bytes.items);
++    }
++
++    var style_section = Section{ .kind = 6, .payload = .{} };
++    defer style_section.deinit();
++    try style_section.payload.int(u32, @intCast(styles.items.len));
++    for (styles.items, 0..) |style, index| {
++        const foreground = colorWire(style.fg_color);
++        const background = colorWire(style.bg_color);
++        const flags: u8 = @intFromBool(style.flags.bold) |
++            (@as(u8, @intFromBool(style.flags.italic)) << 1) |
++            (@as(u8, @intFromBool(style.flags.faint)) << 2) |
++            (@as(u8, @intFromBool(style.flags.blink)) << 3) |
++            (@as(u8, @intFromBool(style.flags.inverse)) << 4) |
++            (@as(u8, @intFromBool(style.flags.invisible)) << 5) |
++            (@as(u8, @intFromBool(style.flags.strikethrough)) << 6) |
++            (@as(u8, @intFromBool(style.flags.overline)) << 7);
++        try style_section.payload.int(u32, @intCast(index + 1));
++        try style_section.payload.byte(foreground[0]);
++        try style_section.payload.byte(background[0]);
++        try style_section.payload.byte(flags);
++        try style_section.payload.byte(@intFromEnum(style.flags.underline));
++        try style_section.payload.int(u32, foreground[1]);
++        try style_section.payload.int(u32, background[1]);
++    }
++
++    const output_sequence = std.math.add(u64, bridge.sequence, 1) catch return error.SequenceOverflow;
++    var frame: Buffer = .{};
++    errdefer frame.deinit();
++    try appendHeader(&frame, if (snapshot) 1 else 2, if (snapshot) 1 else 0, if (snapshot) 0 else bridge.sequence, output_sequence, bridge.rows, bridge.columns, if (snapshot) 6 else 5);
++    if (snapshot) try appendSection(&frame, &palette_section);
++    try appendSection(&frame, &cursor_section);
++    try appendSection(&frame, &row_section);
++    try appendSection(&frame, &cell_section);
++    try appendSection(&frame, &grapheme_section);
++    try appendSection(&frame, &style_section);
++    if (frame.bytes.items.len > maximum_frame_length) return error.FrameTooLarge;
++    bridge.sequence = output_sequence;
++    bridge.render_state.dirty = .false;
++    @memset(bridge.render_state.row_data.items(.dirty), false);
++    return frame.take();
++}
++
++export fn cockpit_ghostty_vt_snapshot(bridge: ?*Bridge, out: ?*Bytes) c_int {
++    empty(out);
++    const value = bridge orelse return -1;
++    const output = out orelse return -1;
++    const bytes = serializeViewport(value, true) catch return -1;
++    return returnBytes(output, bytes);
++}
++
++export fn cockpit_ghostty_vt_delta(bridge: ?*Bridge, base_sequence: u64, out: ?*Bytes) c_int {
++    empty(out);
++    const value = bridge orelse return -1;
++    const output = out orelse return -1;
++    if (base_sequence != value.sequence or base_sequence == 0) return -1;
++    const bytes = serializeViewport(value, false) catch return -1;
++    return returnBytes(output, bytes);
++}
++
++fn freeHistory(rows: *std.ArrayList(HistoryRow)) void {
++    for (rows.items) |row| alloc.free(row.text);
++    rows.deinit(alloc);
++    rows.* = .empty;
++}
++
++fn historyRowText(screen: *const ghostty.Screen, pin: ghostty.Pin) ![]u8 {
++    var writer: std.Io.Writer.Allocating = .init(alloc);
++    defer writer.deinit();
++    var start = pin;
++    start.x = 0;
++    var end = pin;
++    end.x = @intCast(pin.cells(.all).len - 1);
++    try screen.dumpString(&writer.writer, .{
++        .tl = start,
++        .br = end,
++        .unwrap = false,
++    });
++    const rendered = std.mem.trimEnd(u8, writer.writer.buffered(), "\r\n");
++    return alloc.dupe(u8, rendered);
++}
++
++fn takeHistoryIndex(bridge: *Bridge) !u64 {
++    const result = bridge.next_history_index;
++    bridge.next_history_index = try std.math.add(u64, result, 1);
++    return result;
++}
++
++fn historyIdentity(pin: ghostty.Pin) HistoryIdentity {
++    return .{
++        .node = @intFromPtr(pin.node),
++        .serial = pin.node.serial,
++        .row = @intCast(pin.y),
++    };
++}
++
++fn historyContentEqual(left: HistoryRow, right: HistoryRow) bool {
++    return left.wrapped == right.wrapped and std.mem.eql(u8, left.text, right.text);
++}
++
++fn historyIdentityOverlap(old: []const HistoryRow, updated: []const HistoryRow) !usize {
++    var old_indices = std.AutoHashMap(HistoryIdentity, usize).init(alloc);
++    defer old_indices.deinit();
++    for (old, 0..) |row, index| try old_indices.put(row.identity, index);
++
++    var best: usize = 0;
++    for (updated, 0..) |row, updated_index| {
++        const old_index = old_indices.get(row.identity) orelse continue;
++        if (old_index < updated_index) continue;
++        const old_start = old_index - updated_index;
++        const overlap = old.len - old_start;
++        if (overlap <= best or overlap > updated.len) continue;
++        for (0..overlap) |offset| {
++            if (!historyContentEqual(old[old_start + offset], updated[offset])) break;
++        } else {
++            best = overlap;
++        }
++    }
++    return best;
++}
++
++fn captureHistoryAnchors(screen: *ghostty.Screen, cache: *const HistoryCache) !std.ArrayList(HistoryAnchor) {
++    var result: std.ArrayList(HistoryAnchor) = .empty;
++    errdefer releaseHistoryAnchors(screen, &result);
++    if (screen.pages.getBottomRight(.history) == null) return result;
++    var iterator = screen.pages.rowIterator(.right_down, .{ .history = .{} }, null);
++    var index: usize = 0;
++    while (iterator.next()) |pin| : (index += 1) {
++        if (index >= cache.rows.items.len or
++            !std.meta.eql(historyIdentity(pin), cache.rows.items[index].identity))
++            return error.HistoryChanged;
++        var row_pin = pin;
++        row_pin.x = 0;
++        const tracked = try screen.pages.trackPin(row_pin);
++        result.append(alloc, .{
++            .pin = tracked,
++            .absolute_index = cache.rows.items[index].absolute_index,
++        }) catch |err| {
++            screen.pages.untrackPin(tracked);
++            return err;
++        };
++    }
++    if (index != cache.rows.items.len) return error.HistoryChanged;
++    return result;
++}
++
++fn releaseHistoryAnchors(screen: *ghostty.Screen, anchors: *std.ArrayList(HistoryAnchor)) void {
++    for (anchors.items) |anchor| screen.pages.untrackPin(anchor.pin);
++    anchors.deinit(alloc);
++    anchors.* = .empty;
++}
++
++fn historyRelocations(anchors: []const HistoryAnchor) !HistoryRelocations {
++    var result = HistoryRelocations.init(alloc);
++    errdefer result.deinit();
++    for (anchors) |anchor| {
++        if (anchor.pin.garbage) continue;
++        const identity = historyIdentity(anchor.pin.*);
++        const entry = try result.getOrPut(identity);
++        if (!entry.found_existing or anchor.absolute_index < entry.value_ptr.*) {
++            entry.value_ptr.* = anchor.absolute_index;
++        }
++    }
++    return result;
++}
++
++fn synchronizeHistoryForScreen(
++    bridge: *Bridge,
++    screen: *ghostty.Screen,
++    cache: *HistoryCache,
++    screen_generation: usize,
++    relocations: ?*const HistoryRelocations,
++) !void {
++    const history_epoch = screen.pages.page_serial_epoch;
++    var updated: std.ArrayList(HistoryRow) = .empty;
++    errdefer freeHistory(&updated);
++    if (screen.pages.getBottomRight(.history) != null) {
++        var iterator = screen.pages.rowIterator(.right_down, .{ .history = .{} }, null);
++        while (iterator.next()) |pin| {
++            const identity = historyIdentity(pin);
++            const text = try historyRowText(screen, pin);
++            updated.append(alloc, .{
++                .identity = identity,
++                .absolute_index = 0,
++                .text = text,
++                .wrapped = pin.rowAndCell().row.wrap,
++            }) catch |err| {
++                alloc.free(text);
++                return err;
++            };
++        }
++    }
++
++    if (relocations) |mapped| {
++        var retain = true;
++        var previous: ?u64 = null;
++        for (updated.items) |*row| {
++            const relocated = if (retain) mapped.get(row.identity) else null;
++            if (relocated) |absolute_index| {
++                if (previous == null or absolute_index > previous.?) {
++                    row.absolute_index = absolute_index;
++                    previous = absolute_index;
++                    continue;
++                }
++            }
++            retain = false;
++            row.absolute_index = try takeHistoryIndex(bridge);
++        }
++    } else {
++        const overlap = if (cache.screen_generation == screen_generation and
++            cache.page_serial_epoch == history_epoch)
++            try historyIdentityOverlap(cache.rows.items, updated.items)
++        else
++            0;
++        const old_start = cache.rows.items.len - overlap;
++        for (updated.items, 0..) |*row, index| {
++            if (index < overlap) {
++                row.absolute_index = cache.rows.items[old_start + index].absolute_index;
++            } else {
++                row.absolute_index = try takeHistoryIndex(bridge);
++            }
++        }
++    }
++
++    freeHistory(&cache.rows);
++    cache.rows = updated;
++    cache.screen_generation = screen_generation;
++    cache.page_serial_epoch = history_epoch;
++}
++
++export fn cockpit_ghostty_vt_scrollback(bridge: ?*Bridge, start: u64, count: u32, out: ?*Bytes) c_int {
++    empty(out);
++    const value = bridge orelse return -1;
++    const output = out orelse return -1;
++    const active_key = value.terminal.screens.active_key;
++    const cache = if (active_key == .primary)
++        &value.primary_history
++    else
++        &value.alternate_history;
++    synchronizeHistoryForScreen(
++        value,
++        value.terminal.screens.active,
++        cache,
++        value.terminal.screens.generation(active_key),
++        null,
++    ) catch return -1;
++    var first: usize = 0;
++    while (first < cache.rows.items.len and cache.rows.items[first].absolute_index < start) : (first += 1) {}
++    const returned: usize = @min(@as(usize, count), cache.rows.items.len - first);
++    var section = Section{ .kind = 7, .payload = .{} };
++    defer section.deinit();
++    section.payload.int(u64, start) catch return -1;
++    section.payload.int(u32, @intCast(returned)) catch return -1;
++    section.payload.int(u32, 0) catch return -1;
++    for (cache.rows.items[first .. first + returned]) |row| {
++        section.payload.int(u64, row.absolute_index) catch return -1;
++        section.payload.byte(@intFromBool(row.wrapped)) catch return -1;
++        section.payload.append(&.{ 0, 0, 0 }) catch return -1;
++        section.payload.int(u32, @intCast(row.text.len)) catch return -1;
++        section.payload.append(row.text) catch return -1;
++    }
++    const output_sequence = if (value.sequence == 0) @as(u64, 1) else value.sequence;
++    var frame: Buffer = .{};
++    errdefer frame.deinit();
++    appendHeader(&frame, 3, 0, value.sequence, output_sequence, value.rows, value.columns, 1) catch return -1;
++    appendSection(&frame, &section) catch return -1;
++    if (frame.bytes.items.len > maximum_frame_length) return -1;
++    const owned = frame.take() catch return -1;
++    return returnBytes(output, owned);
++}
++
++fn modifiers(value: u32) ?ghostty.input.KeyMods {
++    if ((value & ~@as(u32, 0x3FF)) != 0) return null;
++    return .{
++        .shift = (value & (1 << 0)) != 0,
++        .ctrl = (value & (1 << 1)) != 0,
++        .alt = (value & (1 << 2)) != 0,
++        .super = (value & (1 << 3)) != 0,
++        .caps_lock = (value & (1 << 4)) != 0,
++        .num_lock = (value & (1 << 5)) != 0,
++        .sides = .{
++            .shift = if ((value & (1 << 6)) != 0) .right else .left,
++            .ctrl = if ((value & (1 << 7)) != 0) .right else .left,
++            .alt = if ((value & (1 << 8)) != 0) .right else .left,
++            .super = if ((value & (1 << 9)) != 0) .right else .left,
++        },
++    };
++}
++
++fn physicalKey(usage: u32) ghostty.input.Key {
++    const letters = [_]ghostty.input.Key{ .key_a, .key_b, .key_c, .key_d, .key_e, .key_f, .key_g, .key_h, .key_i, .key_j, .key_k, .key_l, .key_m, .key_n, .key_o, .key_p, .key_q, .key_r, .key_s, .key_t, .key_u, .key_v, .key_w, .key_x, .key_y, .key_z };
++    const digits = [_]ghostty.input.Key{ .digit_1, .digit_2, .digit_3, .digit_4, .digit_5, .digit_6, .digit_7, .digit_8, .digit_9, .digit_0 };
++    const f1_to_f12 = [_]ghostty.input.Key{ .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 };
++    const numpad_digits = [_]ghostty.input.Key{ .numpad_1, .numpad_2, .numpad_3, .numpad_4, .numpad_5, .numpad_6, .numpad_7, .numpad_8, .numpad_9, .numpad_0 };
++    const f13_to_f24 = [_]ghostty.input.Key{ .f13, .f14, .f15, .f16, .f17, .f18, .f19, .f20, .f21, .f22, .f23, .f24 };
++    if (usage >= 0x04 and usage <= 0x1D) return letters[usage - 0x04];
++    if (usage >= 0x1E and usage <= 0x27) return digits[usage - 0x1E];
++    if (usage >= 0x3A and usage <= 0x45) return f1_to_f12[usage - 0x3A];
++    if (usage >= 0x59 and usage <= 0x62) return numpad_digits[usage - 0x59];
++    if (usage >= 0x68 and usage <= 0x73) return f13_to_f24[usage - 0x68];
++    return switch (usage) {
++        0 => .unidentified,
++        0x28 => .enter,
++        0x29 => .escape,
++        0x2A => .backspace,
++        0x2B => .tab,
++        0x2C => .space,
++        0x2D => .minus,
++        0x2E => .equal,
++        0x2F => .bracket_left,
++        0x30 => .bracket_right,
++        0x31 => .backslash,
++        0x33 => .semicolon,
++        0x34 => .quote,
++        0x35 => .backquote,
++        0x36 => .comma,
++        0x37 => .period,
++        0x38 => .slash,
++        0x39 => .caps_lock,
++        0x46 => .print_screen,
++        0x47 => .scroll_lock,
++        0x48 => .pause,
++        0x49 => .insert,
++        0x4A => .home,
++        0x4B => .page_up,
++        0x4C => .delete,
++        0x4D => .end,
++        0x4E => .page_down,
++        0x4F => .arrow_right,
++        0x50 => .arrow_left,
++        0x51 => .arrow_down,
++        0x52 => .arrow_up,
++        0x53 => .num_lock,
++        0x54 => .numpad_divide,
++        0x55 => .numpad_multiply,
++        0x56 => .numpad_subtract,
++        0x57 => .numpad_add,
++        0x58 => .numpad_enter,
++        0x63 => .numpad_decimal,
++        0x64 => .intl_backslash,
++        0x65 => .context_menu,
++        0x66 => .power,
++        0x67 => .numpad_equal,
++        0x75 => .help,
++        0x7B => .cut,
++        0x7C => .copy,
++        0x7D => .paste,
++        0x7F => .audio_volume_mute,
++        0x80 => .audio_volume_up,
++        0x81 => .audio_volume_down,
++        0x85 => .numpad_comma,
++        0x87 => .intl_ro,
++        0x88 => .kana_mode,
++        0x89 => .intl_yen,
++        0x8A => .convert,
++        0x8B => .non_convert,
++        0xB6 => .numpad_paren_left,
++        0xB7 => .numpad_paren_right,
++        0xBB => .numpad_backspace,
++        0xD0 => .numpad_memory_store,
++        0xD1 => .numpad_memory_recall,
++        0xD2 => .numpad_memory_clear,
++        0xD3 => .numpad_memory_add,
++        0xD4 => .numpad_memory_subtract,
++        0xD8 => .numpad_clear,
++        0xD9 => .numpad_clear_entry,
++        0xE0 => .control_left,
++        0xE1 => .shift_left,
++        0xE2 => .alt_left,
++        0xE3 => .meta_left,
++        0xE4 => .control_right,
++        0xE5 => .shift_right,
++        0xE6 => .alt_right,
++        0xE7 => .meta_right,
++        else => .unidentified,
++    };
++}
++
++fn writerBytes(writer: *std.Io.Writer.Allocating, out: *Bytes) c_int {
++    const written = writer.writer.buffered();
++    if (written.len == 0) {
++        out.* = .{ .bytes = null, .length = 0 };
++        return 0;
++    }
++    const owned = alloc.dupe(u8, written) catch return -1;
++    return returnBytes(out, owned);
++}
++
++export fn cockpit_ghostty_vt_encode_key(bridge: ?*Bridge, event: ?*const KeyEvent, out: ?*Bytes) c_int {
++    empty(out);
++    const value = bridge orelse return -1;
++    const input = event orelse return -1;
++    const output = out orelse return -1;
++    if (!std.mem.allEqual(u8, &input.reserved, 0) or
++        input.logical_key > 0x10FFFF or (input.logical_key >= 0xD800 and input.logical_key <= 0xDFFF) or
++        (input.logical_key == 0 and input.physical_key == 0)) return -1;
++    const mods = modifiers(input.modifiers) orelse return -1;
++    const action: ghostty.input.KeyAction = switch (input.action) {
++        1 => .press,
++        2 => .repeat,
++        3 => .release,
++        else => return -1,
++    };
++    const key = physicalKey(input.physical_key);
++    if (key == .unidentified and input.logical_key == 0) return -1;
++    var writer: std.Io.Writer.Allocating = .init(alloc);
++    defer writer.deinit();
++    ghostty.input.encodeKey(&writer.writer, .{
++        .action = action,
++        .key = key,
++        .mods = mods,
++        .utf8 = "",
++        .unshifted_codepoint = @intCast(input.logical_key),
++    }, .fromTerminal(&value.terminal)) catch return -1;
++    return writerBytes(&writer, output);
++}
++
++export fn cockpit_ghostty_vt_encode_paste(bridge: ?*Bridge, data: ?[*]const u8, length: usize, out: ?*Bytes) c_int {
++    empty(out);
++    const value = bridge orelse return -1;
++    const output = out orelse return -1;
++    if (length > 0 and data == null) return -1;
++    const input = if (data) |ptr| ptr[0..length] else "";
++    const copy = alloc.dupe(u8, input) catch return -1;
++    defer alloc.free(copy);
++    const encoded = ghostty.input.encodePaste(copy, .fromTerminal(&value.terminal));
++    var buffer: Buffer = .{};
++    defer buffer.deinit();
++    for (encoded) |part| buffer.append(part) catch return -1;
++    const owned = buffer.take() catch return -1;
++    return returnBytes(output, owned);
++}
++
++const MouseAction = enum { press, release, motion };
++
++fn mouseButtonCode(index: u5) ?u8 {
++    return switch (index) {
++        0 => 0,
++        1 => 2,
++        2 => 1,
++        3...6 => @as(u8, 64) + @as(u8, @intCast(index - 3)),
++        7...10 => @as(u8, 128) + @as(u8, @intCast(index - 7)),
++        else => null,
++    };
++}
++
++fn firstMouseButton(buttons: u32) ?u8 {
++    if (buttons == 0) return null;
++    return mouseButtonCode(@intCast(@ctz(buttons)));
++}
++
++fn mouseOutsideViewport(bridge: *const Bridge, input: *const MouseEvent) bool {
++    return input.cell_x < 0 or input.cell_y < 0 or
++        input.cell_x >= bridge.columns or input.cell_y >= bridge.rows;
++}
++
++fn mouseModeSendsMotion(bridge: *const Bridge) bool {
++    return bridge.terminal.flags.mouse_event == .button or
++        bridge.terminal.flags.mouse_event == .any;
++}
++
++fn writeMouseCode(writer: *std.Io.Writer, bridge: *Bridge, input: *const MouseEvent, action: MouseAction, base_code: u8) !bool {
++    var code = base_code;
++    if (bridge.terminal.flags.mouse_event == .x10 and (action != .press or code > 2)) return false;
++    if (bridge.terminal.flags.mouse_event == .normal and action == .motion) return false;
++    if (bridge.terminal.flags.mouse_event == .button and action == .motion and input.buttons == 0) return false;
++    if (bridge.terminal.flags.mouse_event != .x10) {
++        if ((input.modifiers & 1) != 0) code +|= 4;
++        if ((input.modifiers & 4) != 0) code +|= 8;
++        if ((input.modifiers & 2) != 0) code +|= 16;
++    }
++    if (action == .motion) code +|= 32;
++    const cell_x: i32 = std.math.clamp(input.cell_x, 0, @as(i32, @intCast(bridge.columns - 1)));
++    const cell_y: i32 = std.math.clamp(input.cell_y, 0, @as(i32, @intCast(bridge.rows - 1)));
++    switch (bridge.terminal.flags.mouse_format) {
++        .x10 => {
++            if (cell_x > 222 or cell_y > 222) return false;
++            try writer.writeAll(&.{ 0x1B, '[', 'M', 32 + code, @intCast(33 + cell_x), @intCast(33 + cell_y) });
++        },
++        .utf8 => {
++            try writer.writeAll(&.{ 0x1B, '[', 'M', 32 + code });
++            try writer.printUnicodeCodepoint(@intCast(33 + cell_x));
++            try writer.printUnicodeCodepoint(@intCast(33 + cell_y));
++        },
++        .sgr => try writer.print("\x1B[<{d};{d};{d}{c}", .{ code, cell_x + 1, cell_y + 1, if (action == .release) @as(u8, 'm') else 'M' }),
++        .urxvt => try writer.print("\x1B[{d};{d};{d}M", .{ 32 + code, cell_x + 1, cell_y + 1 }),
++        .sgr_pixels => return error.PixelCoordinatesUnavailable,
++    }
++    return true;
++}
++
++export fn cockpit_ghostty_vt_encode_mouse(bridge: ?*Bridge, event: ?*const MouseEvent, out: ?*Bytes) c_int {
++    empty(out);
++    const value = bridge orelse return -1;
++    const input = event orelse return -1;
++    const output = out orelse return -1;
++    if (!std.mem.allEqual(u8, &input.reserved, 0) or (input.buttons & ~@as(u32, 0x7FF)) != 0 or
++        input.action < 1 or input.action > 4 or
++        modifiers(input.modifiers) == null) return -1;
++    if (input.action == 4) {
++        if (input.wheel_x == 0 and input.wheel_y == 0) return -1;
++    } else if (input.wheel_x != 0 or input.wheel_y != 0) return -1;
++    if (value.terminal.flags.mouse_format == .sgr_pixels) return -1;
++    const action: MouseAction = switch (input.action) {
++        1, 4 => .press,
++        2 => .release,
++        3 => .motion,
++        else => unreachable,
++    };
++    var writer: std.Io.Writer.Allocating = .init(alloc);
++    defer writer.deinit();
++    if (input.action == 4) {
++        if (value.terminal.flags.mouse_event == .none) return 0;
++        if (value.terminal.flags.mouse_event == .x10) return 0;
++        if (mouseOutsideViewport(value, input)) return 0;
++        const total_x = value.wheel_x_remainder + @as(i64, input.wheel_x);
++        const total_y = value.wheel_y_remainder + @as(i64, input.wheel_y);
++        const steps_x = @divTrunc(total_x, 65536);
++        const steps_y = @divTrunc(total_y, 65536);
++        var count: u64 = @intCast(@abs(steps_y));
++        while (count > 0) : (count -= 1) {
++            const code: u8 = if (steps_y > 0) 64 else 65;
++            _ = writeMouseCode(&writer.writer, value, input, .press, code) catch return -1;
++        }
++        count = @intCast(@abs(steps_x));
++        while (count > 0) : (count -= 1) {
++            const code: u8 = if (steps_x < 0) 66 else 67;
++            _ = writeMouseCode(&writer.writer, value, input, .press, code) catch return -1;
++        }
++        const result = writerBytes(&writer, output);
++        if (result == 0) {
++            value.wheel_x_remainder = @rem(total_x, 65536);
++            value.wheel_y_remainder = @rem(total_y, 65536);
++        }
++        return result;
++    }
++    const code: u8 = switch (action) {
++        .press, .release => changed: {
++            const changed_buttons = value.previous_buttons ^ input.buttons;
++            if (@popCount(changed_buttons) != 1) return -1;
++            const changed_mask = changed_buttons & (0 -% changed_buttons);
++            if ((action == .press) != ((input.buttons & changed_mask) != 0)) return -1;
++            break :changed mouseButtonCode(@intCast(@ctz(changed_mask))) orelse return -1;
++        },
++        .motion => motion: {
++            if (input.buttons != value.previous_buttons) return -1;
++            break :motion firstMouseButton(input.buttons) orelse 3;
++        },
++    };
++    if (action != .release and mouseOutsideViewport(value, input) and
++        (!mouseModeSendsMotion(value) or input.buttons == 0))
++    {
++        if (action != .motion) value.previous_buttons = input.buttons;
++        return 0;
++    }
++    if (value.terminal.flags.mouse_event == .none) {
++        if (action != .motion) value.previous_buttons = input.buttons;
++        return 0;
++    }
++    if (!(writeMouseCode(&writer.writer, value, input, action, code) catch return -1)) {
++        if (action != .motion) value.previous_buttons = input.buttons;
++        return 0;
++    }
++    const result = writerBytes(&writer, output);
++    if (result == 0 and action != .motion) value.previous_buttons = input.buttons;
++    return result;
++}
++
++export fn cockpit_ghostty_bytes_free(bytes: Bytes) void {
++    if (bytes.bytes) |pointer| {
++        if (bytes.length > 0) alloc.free(@constCast(pointer[0..bytes.length]));
++    }
++}
++
++fn testSection(frame: []const u8, wanted: u8) ![]const u8 {
++    if (frame.len < 36) return error.InvalidFrame;
++    const count = std.mem.readInt(u32, frame[32..36], .big);
++    var offset: usize = 36;
++    for (0..count) |_| {
++        if (frame.len - offset < 8) return error.InvalidFrame;
++        const kind = frame[offset];
++        const length: usize = std.mem.readInt(u32, frame[offset + 4 ..][0..4], .big);
++        offset += 8;
++        if (length > frame.len - offset) return error.InvalidFrame;
++        if (kind == wanted) return frame[offset .. offset + length];
++        offset += length;
++    }
++    return error.MissingSection;
++}
++
++test "cockpit bridge hides an off-viewport cursor" {
++    const bridge = cockpit_ghostty_vt_create(4, 2, 128).?;
++    defer cockpit_ghostty_vt_destroy(bridge);
++    const lines = "one\r\ntwo\r\nthree\r\nfour";
++    try std.testing.expectEqual(@as(c_int, 0), cockpit_ghostty_vt_feed(bridge, lines.ptr, lines.len));
++    bridge.terminal.scrollViewport(.top);
++    var bytes: Bytes = .{ .bytes = null, .length = 0 };
++    try std.testing.expectEqual(@as(c_int, 0), cockpit_ghostty_vt_snapshot(bridge, &bytes));
++    defer cockpit_ghostty_bytes_free(bytes);
++    const frame = bytes.bytes.?[0..bytes.length];
++    const cursor = try testSection(frame, 2);
++    try std.testing.expectEqual(@as(usize, 12), cursor.len);
++    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, cursor[0..4], .big));
++    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, cursor[4..8], .big));
++    try std.testing.expectEqual(@as(u8, 0), cursor[9]);
++}
++
++test "cockpit bridge retains the maximal scrollback suffix across relocation" {
++    const old = [_]HistoryRow{
++        .{ .identity = .{ .node = 1, .serial = 1, .row = 0 }, .absolute_index = 10, .text = @constCast("discarded"), .wrapped = false },
++        .{ .identity = .{ .node = 1, .serial = 1, .row = 1 }, .absolute_index = 11, .text = @constCast("repeat"), .wrapped = true },
++        .{ .identity = .{ .node = 1, .serial = 1, .row = 2 }, .absolute_index = 12, .text = @constCast("repeat"), .wrapped = true },
++    };
++    const retained = [_]HistoryRow{
++        .{ .identity = .{ .node = 1, .serial = 1, .row = 1 }, .absolute_index = 0, .text = @constCast("repeat"), .wrapped = true },
++        .{ .identity = .{ .node = 1, .serial = 1, .row = 2 }, .absolute_index = 0, .text = @constCast("repeat"), .wrapped = true },
++        .{ .identity = .{ .node = 1, .serial = 1, .row = 3 }, .absolute_index = 0, .text = @constCast("new"), .wrapped = false },
++    };
++    try std.testing.expectEqual(@as(usize, 2), try historyIdentityOverlap(&old, &retained));
++
++    const relocated = [_]HistoryRow{
++        .{ .identity = .{ .node = 2, .serial = 2, .row = 0 }, .absolute_index = 0, .text = @constCast("repeat"), .wrapped = true },
++        .{ .identity = .{ .node = 2, .serial = 2, .row = 1 }, .absolute_index = 0, .text = @constCast("repeat"), .wrapped = true },
++        .{ .identity = .{ .node = 2, .serial = 2, .row = 2 }, .absolute_index = 0, .text = @constCast("new"), .wrapped = false },
++    };
++    try std.testing.expectEqual(@as(usize, 0), try historyIdentityOverlap(&old, &relocated));
++}

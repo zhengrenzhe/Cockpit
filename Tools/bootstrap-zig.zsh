@@ -28,15 +28,14 @@ esac
 
 typeset -a expected_manifest_lines
 expected_manifest_lines=(
-  'GHOSTTY_VERSION=1.3.1'
-  'GHOSTTY_TAG=v1.3.1'
-  'GHOSTTY_TAG_OBJECT=22efb0be2bbea73e5339f5426fa3b20edabcaa11'
-  'GHOSTTY_COMMIT=332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28'
+  'GHOSTTY_VERSION=1.3.2-dev'
+  'GHOSTTY_SOURCE_REF=main'
+  'GHOSTTY_COMMIT=05221c11c9db0715666fc6e038915128fc6a563e'
   'GHOSTTY_REPOSITORY_URL=https://github.com/ghostty-org/ghostty.git'
-  'ZIG_VERSION=0.15.2'
-  'ZIG_AARCH64_MACOS_URL=https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz'
-  'ZIG_AARCH64_MACOS_SHA256=3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b'
-  'ZIG_AARCH64_MACOS_SIZE=50635984'
+  'ZIG_VERSION=0.16.0'
+  'ZIG_AARCH64_MACOS_URL=https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz'
+  'ZIG_AARCH64_MACOS_SHA256=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489'
+  'ZIG_AARCH64_MACOS_SIZE=52238004'
 )
 for expected_line in "${expected_manifest_lines[@]}"; do
   [[ "$(/usr/bin/grep -Fxc -- "$expected_line" "$manifest")" == "1" ]] || fail "manifest value is missing, duplicated, or changed: $expected_line"
@@ -49,7 +48,7 @@ source "$manifest"
 tools_root="$repo_root/.tools"
 zig_parent="$tools_root/zig"
 archive_dir="$tools_root/archives"
-project_archive="$archive_dir/zig-aarch64-macos-0.15.2.tar.xz"
+project_archive="$archive_dir/zig-aarch64-macos-0.16.0.tar.xz"
 install_root="$zig_parent/$ZIG_VERSION"
 zig_binary="$install_root/zig"
 lock_file="$zig_parent/.bootstrap-lock"

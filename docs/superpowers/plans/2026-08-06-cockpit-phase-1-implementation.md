@@ -6,7 +6,7 @@
 
 **Architecture:** CockpitHost 是 Project、Environment、Conversation、DocumentSession、文件树和设备布局的唯一权威端；CockpitTerminalSupervisor 是 TerminalSession 注册表和两阶段创建的唯一权威端；每个 CockpitPTYKeeper 独占一个 PTY、CLI 进程组、Ghostty VT、scrollback 与本地 UDS 数据面；Cockpit.app 只持有 AppKit 视图、每窗口一个 Monaco WKWebView、Ghostty Metal viewer 和客户端状态。Project Context 与全部 Direct Conversation 共享一个 Direct Environment，页签与 TerminalSession 按 WorkspaceContext 隔离。
 
-**Tech Stack:** macOS 15、Xcode 26.6 (17F113)、Swift 6.3.3、Swift tools 6.3、AppKit、WebKit、NSXPCConnection、Unix Domain Socket、SQLite3、Security/Keychain、CryptoKit、FSEvents、SwiftProtobuf 1.38.1、Monaco 0.56.0、esbuild 0.28.1、Node 26.7.0、pnpm 11.20.0、XcodeGen 2.46.0、Ghostty v1.3.1 (`332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28`) 与 Zig 0.15.2。
+**Tech Stack:** macOS 15、Xcode 26.6 (17F113)、Swift 6.3.3、Swift tools 6.3、AppKit、WebKit、NSXPCConnection、Unix Domain Socket、SQLite3、Security/Keychain、CryptoKit、FSEvents、SwiftProtobuf 1.38.1、Monaco 0.56.0、esbuild 0.28.1、Node 26.7.0、pnpm 11.20.0、XcodeGen 2.46.0、Ghostty 1.3.2-dev (`05221c11c9db0715666fc6e038915128fc6a563e`) 与 Zig 0.16.0。
 
 ## Global Constraints
 
@@ -22,7 +22,7 @@
 - 不设置主观性能数字。结构验收固定为：文件树延迟展开、每 Environment 一个 Kernel、每窗口一个 WKWebView、终端热路径不转发、非活动终端停止 Metal 帧、PTY 读取不等待 viewer 或归档。
 - 每个任务只运行本任务列出的 focused checks；Task 20 只运行一次统一 Phase 1 gate，不增加独立“再验证”任务。
 - 每项功能先提交能失败的测试，再实现，再运行同一测试通过；禁止用只验证 mock 的测试替代进程或磁盘所有权场景。
-- 当前依赖基线已由本机命令与官方来源核验。Task 1 再执行一次固定版本检查；发现正式稳定版本发生变化时停止，不修改版本，先按 `AGENTS.md` 向用户报告必要性、范围、成本、耗时、风险与不更新结果。
+- 当前依赖基线已由本机命令与官方来源核验。Ghostty 1.3.2-dev 的精确提交与其 `build.zig.zon` 声明的 Zig 0.16.0 是用户为 Task 11 明确批准的例外；其余依赖发现正式稳定版本发生变化时停止，不修改版本，先按 `AGENTS.md` 向用户报告必要性、范围、成本、耗时、风险与不更新结果。
 
 ## Execution Protocol
 
@@ -33,16 +33,15 @@
 git worktree add .worktrees/phase-1 -b codex/phase-1-direct-workspace main
 ```
 
-- [ ] 从已验收的 Phase 0 本地输入准备 Phase 1 工作树，不下载替代归档：
+- [ ] 按 Phase 1 manifest 的精确提交与官方归档准备 Ghostty/Zig 输入：
 
 ```bash
 git -C .worktrees/phase-1 submodule update --init ThirdParty/ghostty
 mkdir -p .worktrees/phase-1/.tools/archives
-cp .worktrees/phase-0/.tools/archives/zig-aarch64-macos-0.15.2.tar.xz .worktrees/phase-1/.tools/archives/
 .worktrees/phase-1/Tools/bootstrap-zig.zsh
 ```
 
-Expected: Phase 1 worktree 的 Ghostty HEAD 为 `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28`；归档 SHA/size 与 `Config/Toolchains/ghostty.env` 一致；`.tools/zig/0.15.2/zig version` 输出 `0.15.2`。
+Expected: Phase 1 worktree 的 Ghostty HEAD 为 `05221c11c9db0715666fc6e038915128fc6a563e`；归档 SHA/size 与 `Config/Toolchains/ghostty.env` 一致；`.tools/zig/0.16.0/zig version` 输出 `0.16.0`。
 
 - [ ] 后续全部命令在 `.worktrees/phase-1` 执行，禁止直接修改 `main`。
 - [ ] 创建计划账本 `.superpowers/sdd/phase1-direct-workspace/ledger.md`，只记录 Task 1–20 的 `pending | implementing | spec-review | quality-review | complete`、实现 commit、review commit 和 focused check 结果。
@@ -147,16 +146,15 @@ git ls-remote --tags https://github.com/yonaskolb/XcodeGen.git refs/tags/2.46.0
 git ls-remote --tags https://github.com/apple/swift-protobuf.git refs/tags/1.38.1
 git ls-remote --tags https://github.com/microsoft/monaco-editor.git refs/tags/v0.56.0
 git ls-remote --tags https://github.com/evanw/esbuild.git refs/tags/v0.28.1
-git ls-remote --tags https://github.com/ghostty-org/ghostty.git refs/tags/v1.3.1 refs/tags/v1.3.1^{}
+git -C ThirdParty/ghostty cat-file -e 05221c11c9db0715666fc6e038915128fc6a563e^{commit}
 git ls-remote --tags --refs https://github.com/yonaskolb/XcodeGen.git | /usr/bin/python3 -c 'import re,sys; v=[tuple(map(int,m.groups())) for x in sys.stdin for m in [re.search(r"refs/tags/v?(\d+)\.(\d+)\.(\d+)$",x)] if m]; assert max(v)==(2,46,0)'
 git ls-remote --tags --refs https://github.com/apple/swift-protobuf.git | /usr/bin/python3 -c 'import re,sys; v=[tuple(map(int,m.groups())) for x in sys.stdin for m in [re.search(r"refs/tags/v?(\d+)\.(\d+)\.(\d+)$",x)] if m]; assert max(v)==(1,38,1)'
 git ls-remote --tags --refs https://github.com/microsoft/monaco-editor.git | /usr/bin/python3 -c 'import re,sys; v=[tuple(map(int,m.groups())) for x in sys.stdin for m in [re.search(r"refs/tags/v?(\d+)\.(\d+)\.(\d+)$",x)] if m]; assert max(v)==(0,56,0)'
 git ls-remote --tags --refs https://github.com/evanw/esbuild.git | /usr/bin/python3 -c 'import re,sys; v=[tuple(map(int,m.groups())) for x in sys.stdin for m in [re.search(r"refs/tags/v?(\d+)\.(\d+)\.(\d+)$",x)] if m]; assert max(v)==(0,28,1)'
-git ls-remote --tags --refs https://github.com/ghostty-org/ghostty.git | /usr/bin/python3 -c 'import re,sys; v=[tuple(map(int,m.groups())) for x in sys.stdin for m in [re.search(r"refs/tags/v?(\d+)\.(\d+)\.(\d+)$",x)] if m]; assert max(v)==(1,3,1)'
 Tools/verify-ghostty.zsh --no-bootstrap
 ```
 
-Expected: 与本计划 Tech Stack 完全一致；Ghostty commit 和 Zig 0.15.2 校验通过。
+Expected: 与本计划 Tech Stack 完全一致；Ghostty commit、source version/minimum Zig contract 和 Zig 0.16.0 校验通过。
 
 - [ ] **Step 6: 运行 focused checks 并提交**
 
@@ -1664,10 +1662,15 @@ git commit -m "feat: bridge monaco document editing"
 - Create: `Native/CockpitGhosttyBridge/FrameFormat.md`
 - Create: `Tools/build-ghostty-bridge.zsh`
 - Create: `Tests/ToolingTests/ghostty-bridge.zsh`
+- Modify: `Config/Toolchains/ghostty.env`
+- Modify: `Tools/bootstrap-zig.zsh`
 - Modify: `Tools/verify-ghostty.zsh`
+- Modify: `Tests/ToolingTests/ghostty-toolchain.zsh`
+- Modify: `Tests/ToolingTests/ghostty-toolchain-hardening.zsh`
+- Modify: `ThirdParty/ghostty` gitlink
 - Modify: `project.yml`
 
-**Upstream boundary and hard gate:** 已初始化的 Phase 0 checkout `.worktrees/phase-0/ThirdParty/ghostty` 在本计划编写时为 commit `332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28` 且 clean；其中 `src/Surface.zig` 明确写明 Surface 创建并拥有 PTY，`include/ghostty.h` 没有外部 VT snapshot/delta 注入 API，`include/ghostty/vt.h` 标记 incomplete/work-in-progress，`src/lib_vt.zig` 导出 Terminal input encoding 与 RenderState。Task 11 执行时必须先在 Phase 1 worktree 重新通过 submodule HEAD/clean 和 `Tools/verify-ghostty.zsh --no-bootstrap`；任一门槛失败立即停止，不生成补丁。通过后实现总体架构已批准的固定版本轻量 fork，不改用 Ghostty 自己持有 App 内 PTY 的 Surface。
+**Upstream boundary and hard gate:** 用户为 Task 11 批准的 Ghostty 基础版本固定为 1.3.2-dev commit `05221c11c9db0715666fc6e038915128fc6a563e`；该提交的 `build.zig.zon` 声明 `.version = "1.3.2-dev"` 与 `.minimum_zig_version = "0.16.0"`。其中 `src/Surface.zig` 明确写明 Surface 创建并拥有 PTY，公开 C header 没有外部 VT snapshot/delta 注入 API，`src/lib_vt.zig` 导出 Terminal input encoding 与 RenderState。Task 11 执行时必须先在 Phase 1 worktree 重新通过 submodule HEAD/clean 和 `Tools/verify-ghostty.zsh --no-bootstrap`；任一门槛失败立即停止，不生成补丁。通过后实现总体架构已批准的固定版本轻量 fork，不改用 Ghostty 自己持有 App 内 PTY 的 Surface。
 
 **C ABI:**
 
@@ -1755,6 +1758,8 @@ COCKPIT_GHOSTTY_API int cockpit_ghostty_vt_encode_paste(
 COCKPIT_GHOSTTY_API int cockpit_ghostty_vt_encode_mouse(
     cockpit_ghostty_vt_t *, const cockpit_ghostty_mouse_event_t *,
     cockpit_ghostty_bytes_t *);
+COCKPIT_GHOSTTY_API void cockpit_ghostty_vt_reset_input_state(
+    cockpit_ghostty_vt_t *);
 COCKPIT_GHOSTTY_API void cockpit_ghostty_bytes_free(cockpit_ghostty_bytes_t);
 
 COCKPIT_GHOSTTY_API cockpit_ghostty_renderer_t *cockpit_ghostty_renderer_create(
@@ -1776,18 +1781,20 @@ COCKPIT_GHOSTTY_API void cockpit_ghostty_renderer_set_visible(
 
 Task 11 的输入数值语义直接使用 Task 2 冻结的 Protocol 1.1 定义：logical key 是未加修饰键的 Unicode scalar，physical key 是 W3C/Chromium table 的 USB HID usage code；modifier 只允许 bit `0...9`；mouse buttons 使用 left/right/middle/button4...11 的 bit `0...10`；wheel 使用有符号 Q16.16 cell 单位。bridge 对 Cockpit action 与 Ghostty 内部 enum 做显式映射，不把 Ghostty ordinal 暴露为 ABI。以上补充不改变已批准 C struct 的字段顺序、类型或大小。
 
+`cockpit_ghostty_vt_reset_input_state` 是用户批准的 Task 11 ABI 补充：它只清零 bridge 持有的上一 mouse button bitset 与横纵 wheel Q16.16 remainder，不修改 VT grid、mode、sequence 或 scrollback。Task 14 Keeper 在 input lease grant、transfer、revoke 与 holder disconnect 时调用它，禁止把前一 holder 的按键/按钮/滚轮累积状态带入下一 holder。
+
 header 在 typedef 前完整定义 key/mouse event 的固定宽度 enum/struct。所有返回 bytes 均由 bridge 分配，成功时由调用方且只由调用方调用 `cockpit_ghostty_bytes_free`；失败时必须返回 `{NULL, 0}`。renderer create 在 destroy 前 retain 传入的 NSView；其余指针只在调用期间借用。
 
 `FrameFormat.md` 是 CKGF v1 的规范源：网络字节序；固定 header 为 magic `CKGF`、u16 version、u8 kind（1 snapshot/2 delta/3 scrollback）、u8 flags、u64 base sequence、u64 output sequence、u32 rows、u32 columns、u32 section count；每个 section 是 u8 type + 3 reserved zero bytes + u32 byte length + payload。文档固定 palette/cursor/row/cell/grapheme/style/scrollback section 的字段顺序、宽度、合法 enum 和边界校验，并提供 snapshot、delta、scrollback 三个 golden byte fixture。CKGF 不再增加 CRC；UDS 外层使用现有 Frame 边界，归档使用 manifest SHA-256。单帧硬上限复用 `FrameHeader.maximumPayloadLength` 的 16 MiB。Delta 只包含 Ghostty `RenderState` dirty rows；snapshot 包含完整 viewport；scrollback 使用单独分页 frame。
 
 - [ ] **Step 1: 写失败的 ABI/build smoke test**
 
-测试先运行 `Tools/verify-ghostty.zsh --no-bootstrap`，核对 submodule commit 和 clean state，再把 `git archive` 解包到测试临时目录、按 `series` 应用补丁、使用 `.tools/zig/0.15.2/zig` 构建两份 arm64 macOS 产物。C 与 C++ harness 编译 header，VT/renderer 两端分别对三个 golden fixture 做逐字节验证；运行时执行 feed `red + hello + reset`、key/paste/mouse mode-aware encoding、snapshot、row delta、offscreen Metal apply，隐藏 renderer 后确认不请求新帧。
+测试先运行 `Tools/verify-ghostty.zsh --no-bootstrap`，核对 submodule commit 和 clean state，再把 `git archive` 解包到测试临时目录、按 `series` 应用补丁、使用 `.tools/zig/0.16.0/zig` 构建两份 arm64 macOS 产物。C 与 C++ harness 编译 header，VT/renderer 两端分别对三个 golden fixture 做逐字节验证；运行时执行 feed `red + hello + reset`、key/paste/mouse mode-aware encoding、snapshot、row delta、offscreen Metal apply，隐藏 renderer 后确认不请求新帧。
 
 - [ ] **Step 2: 运行失败测试**
 
 ```bash
-test "$(git -C ThirdParty/ghostty rev-parse HEAD)" = 332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28
+test "$(git -C ThirdParty/ghostty rev-parse HEAD)" = 05221c11c9db0715666fc6e038915128fc6a563e
 test -z "$(git -C ThirdParty/ghostty status --short)"
 Tools/verify-ghostty.zsh --no-bootstrap
 Tests/ToolingTests/ghostty-bridge.zsh
@@ -1797,7 +1804,7 @@ Expected: 失败，原因是补丁、ABI header 和构建脚本不存在。
 
 - [ ] **Step 3: 实现派生构建与轻量补丁**
 
-`Tools/build-ghostty-bridge.zsh` 接受 `--configuration Debug|Release --output "$DERIVED_FILE_DIR/Ghostty"`；cache key 固定为 Ghostty commit + patch SHA-256 + Zig version + configuration + target triple。脚本只写 output 与临时目录，不写 `ThirdParty/ghostty`。产物固定为：
+`Tools/build-ghostty-bridge.zsh` 接受 `--configuration Debug|Release --output "$DERIVED_FILE_DIR/Ghostty"`；output parent 必须与物理、canonical `DERIVED_FILE_DIR` exact equal，替换已有 output 前必须核验 Cockpit ownership marker，只删除 marker-owned leaf。cache key 固定为 Ghostty commit + patch SHA-256 + public header SHA-256 + module map SHA-256 + Zig version + configuration + target triple。脚本只写 output 与临时目录，不写 `ThirdParty/ghostty`。产物固定为：
 
 ```text
 ${output}/include/CockpitGhostty/cockpit_ghostty.h
@@ -1820,7 +1827,7 @@ Tests/ToolingTests/ghostty-bridge.zsh
 xcodegen generate --no-env
 /usr/bin/xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug -derivedDataPath DerivedData -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates -skipPackagePluginValidation build
 /usr/bin/git diff --check
-git add Patches/ghostty Native/CockpitGhosttyBridge Tools/build-ghostty-bridge.zsh Tools/verify-ghostty.zsh Tests/ToolingTests/ghostty-bridge.zsh project.yml Cockpit.xcodeproj Cockpit.xcworkspace
+git add Config/Toolchains/ghostty.env Patches/ghostty Native/CockpitGhosttyBridge ThirdParty/ghostty Tools/bootstrap-zig.zsh Tools/build-ghostty-bridge.zsh Tools/verify-ghostty.zsh Tests/ToolingTests/ghostty-bridge.zsh Tests/ToolingTests/ghostty-toolchain.zsh Tests/ToolingTests/ghostty-toolchain-hardening.zsh project.yml Cockpit.xcodeproj Cockpit.xcworkspace docs
 git commit -m "feat: add cockpit ghostty bridge"
 ```
 
@@ -2054,7 +2061,7 @@ public actor TerminalStreamCoordinator {
 }
 ```
 
-Supervisor 是输入租约唯一权威端，通过 control protocol 创建/转移/释放 `InputLeaseGrant(leaseID, holderViewerID, sequenceBase, capabilities)` 并注册给 Keeper；Keeper 只校验和执行。每个 viewer queue 固定为最多 2 个 screen frame；第三个 frame 到来时合并中间帧并保留最新权威 frame。输入 lease 单调 sequence，重复 sequence 返回原 ACK，不重复写 PTY；断开持有者时 Keeper 立即使本地 grant 失效并向 Supervisor 报告 revocation，Supervisor 不可用时不授予替代 lease。read-only viewer 无权 input/resize/signal/terminate。
+Supervisor 是输入租约唯一权威端，通过 control protocol 创建/转移/释放 `InputLeaseGrant(leaseID, holderViewerID, sequenceBase, capabilities)` 并注册给 Keeper；Keeper 只校验和执行。Keeper 在 grant、transfer、revoke 与 holder disconnect 的本地线性化点调用 Task 11 `cockpit_ghostty_vt_reset_input_state`，清除前一租约的 mouse button 与 wheel remainder 状态。每个 viewer queue 固定为最多 2 个 screen frame；第三个 frame 到来时合并中间帧并保留最新权威 frame。输入 lease 单调 sequence，重复 sequence 返回原 ACK，不重复写 PTY；断开持有者时 Keeper 立即使本地 grant 失效并向 Supervisor 报告 revocation，Supervisor 不可用时不授予替代 lease。read-only viewer 无权 input/resize/signal/terminate。
 
 text 直接写 UTF-8；key/paste/mouse 必须调用 Task 11 基于当前 Ghostty VT mode 的 encoder 后再写 PTY；resize 在 Keeper 调用 `TIOCSWINSZ`。input capability 已允许 key encoder 产生 terminal-driver Ctrl+C/Ctrl+\\ bytes，并可由终端驱动向 foreground job 产生 SIGINT/SIGQUIT。signal capability 只接受 Task 2 冻结的 interrupt/quit/suspend/continue，经 Channel 0 control transport 直接把 SIGINT/SIGQUIT/SIGTSTP/SIGCONT 发送给 PTY 当前 foreground process group；这些 signal 按 Darwin 语义可以结束、中断、挂起或继续 foreground job。terminate capability 使用独立 policy 对整个 TerminalSession process group 发送 SIGTERM/SIGKILL，并驱动 lifecycle 与 archive state。SIGHUP 被拒绝。signal/terminate 都不伪装成 PTY bytes，二者区别在控制目标与生命周期职责。所有输入只接受 Task 2 的结构化 `TerminalInput`，不传 AppKit `NSEvent`。
 
@@ -2562,6 +2569,6 @@ Expected: gate 全部通过；提交后工作树干净。
 - [ ] `Package.swift` target DAG 与总体架构依赖规则一致，无环。
 - [ ] 设计文档的 6 个 Phase 1 acceptance scenarios 全部映射到 Task 20，并单独覆盖“一个 Keeper 崩溃不影响其他会话”子场景。
 - [ ] 明确排除多 Project、Worktree、Search/Git/LSP、远程网络、自动标题、自动保存、CRDT/OT 和通用 Agent Profile。
-- [ ] Ghostty 轻量 fork 不污染 submodule，Zig 固定 0.15.2，App Bundle 不携带工具链或源码。
+- [ ] Ghostty 轻量 fork 不污染 submodule，Ghostty 固定 1.3.2-dev commit `05221c11…`、Zig 固定 0.16.0，App Bundle 不携带工具链或源码。
 - [ ] 没有独立的性能指标、额外加固、额外测试或未来功能任务。
 - [ ] 实施使用 sub-Agent-driven development，任务串行、每任务新的 implementer 和两阶段 review。

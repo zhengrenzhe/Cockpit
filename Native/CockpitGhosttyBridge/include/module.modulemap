@@ -1,0 +1,4 @@
+module CockpitGhostty {
+  header "cockpit_ghostty.h"
+  export *
+}
