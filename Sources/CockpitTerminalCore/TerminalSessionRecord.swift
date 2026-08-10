@@ -14,7 +14,7 @@ public struct CLIProcessIdentity: Hashable, Codable, Sendable {
     public let processGroupID: Int32
 
     public init(validatingProcessID processID: Int32, processGroupID: Int32) throws {
-        guard processID > 0, processGroupID > 0 else {
+        guard processID > 0, processGroupID > 0, processID == processGroupID else {
             throw TerminalSessionRecordError.invalidProcessIdentity
         }
         self.processID = processID

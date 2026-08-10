@@ -125,6 +125,115 @@ struct TerminalAttachTicketTests {
         #expect(TerminalAttachCapabilities.terminate.rawValue == 16)
         #expect(TerminalAttachCapabilities.all.rawValue == 31)
     }
+
+    @Test func registrationDecodingAndKeeperBoundaryRejectMalformedOrExcessivePolicy() async throws {
+        let clock = AdjustableTerminalSecurityClock(Date(timeIntervalSince1970: 4_000))
+        let binding = makeBinding(session: 0x61, worker: 0x62, client: 0x63)
+        let valid = try TerminalAttachTicketRegistration(
+            ticketDigest: Data(repeating: 0xD1, count: 32),
+            binding: binding,
+            capabilities: [.view, .input],
+            expiresAt: clock.now().addingTimeInterval(30)
+        )
+        let encoded = try JSONEncoder().encode(valid)
+        let root = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+
+        var shortDigest = root
+        shortDigest["ticketDigest"] = Data([0xD1]).base64EncodedString()
+        #expect(throws: TerminalAttachTicketError.invalidRegistration) {
+            _ = try JSONDecoder().decode(
+                TerminalAttachTicketRegistration.self,
+                from: JSONSerialization.data(withJSONObject: shortDigest)
+            )
+        }
+
+        var unknownCapabilities = root
+        unknownCapabilities["capabilities"] = 33
+        #expect(throws: TerminalAttachTicketError.invalidCapabilities) {
+            _ = try JSONDecoder().decode(
+                TerminalAttachTicketRegistration.self,
+                from: JSONSerialization.data(withJSONObject: unknownCapabilities)
+            )
+        }
+
+        let excessive = try TerminalAttachTicketRegistration(
+            ticketDigest: Data(repeating: 0xD2, count: 32),
+            binding: binding,
+            capabilities: [.view],
+            expiresAt: clock.now().addingTimeInterval(31)
+        )
+        let keeper = TerminalAttachTicketStore(
+            clock: clock,
+            randomBytes: FixedTerminalSecurityRandomBytes(Array(repeating: 0xD2, count: 32))
+        )
+        await #expect(throws: TerminalAttachTicketError.invalidRegistration) {
+            try await keeper.register(excessive)
+        }
+    }
+
+    @Test func consumptionAcknowledgementRestartInvalidationAndExpiryCleanupBoundTicketState() async throws {
+        let clock = AdjustableTerminalSecurityClock(Date(timeIntervalSince1970: 5_000))
+        let random = IncrementingTerminalSecurityRandomBytes(startingAt: 0x10)
+        let supervisor = TerminalAttachTicketStore(clock: clock, randomBytes: random)
+        let keeper = TerminalAttachTicketStore(
+            clock: clock,
+            randomBytes: FixedTerminalSecurityRandomBytes(Array(repeating: 0xA0, count: 32))
+        )
+        let binding = makeBinding(session: 0x71, worker: 0x72, client: 0x73)
+
+        let consumedTicket = try await supervisor.issue(binding: binding, capabilities: [.view, .input])
+        try await keeper.register(consumedTicket.registration)
+        _ = try await keeper.consume(
+            wireValue: consumedTicket.wireValue,
+            binding: binding,
+            capabilities: [.view]
+        )
+        try await supervisor.acknowledgeConsumption(
+            ticketDigest: consumedTicket.registration.ticketDigest
+        )
+        await #expect(throws: TerminalAttachTicketError.replay) {
+            _ = try await supervisor.consume(
+                wireValue: consumedTicket.wireValue,
+                binding: binding,
+                capabilities: [.view]
+            )
+        }
+
+        let keeperRestartTicket = try await supervisor.issue(binding: binding, capabilities: [.view])
+        try await keeper.register(keeperRestartTicket.registration)
+        await keeper.invalidateAll()
+        await #expect(throws: TerminalAttachTicketError.invalidCanonicalTicket) {
+            _ = try await keeper.consume(
+                wireValue: keeperRestartTicket.wireValue,
+                binding: binding,
+                capabilities: [.view]
+            )
+        }
+
+        let supervisorRestartTicket = try await supervisor.issue(binding: binding, capabilities: [.view])
+        await supervisor.invalidateAll()
+        await #expect(throws: TerminalAttachTicketError.invalidCanonicalTicket) {
+            _ = try await supervisor.consume(
+                wireValue: supervisorRestartTicket.wireValue,
+                binding: binding,
+                capabilities: [.view]
+            )
+        }
+
+        let cleanup = TerminalAttachTicketStore(
+            clock: clock,
+            randomBytes: IncrementingTerminalSecurityRandomBytes(startingAt: 0x40)
+        )
+        _ = try await cleanup.issue(binding: binding, capabilities: [.view])
+        _ = try await cleanup.issue(binding: binding, capabilities: [.view])
+        _ = try await cleanup.issue(binding: binding, capabilities: [.view])
+        #expect(await cleanup.activeRegistrationCount() == 3)
+        clock.advance(by: 30)
+        _ = try await cleanup.issue(binding: binding, capabilities: [.view])
+        #expect(await cleanup.activeRegistrationCount() == 1)
+    }
 }
 
 private func makeBinding(session: UInt8, worker: UInt8, client: UInt8) -> TerminalAttachBinding {
@@ -159,5 +268,21 @@ private struct FixedTerminalSecurityRandomBytes: TerminalSecurityRandomBytes {
 
     func bytes(count: Int) throws -> [UInt8] {
         Array(value.prefix(count))
+    }
+}
+
+private final class IncrementingTerminalSecurityRandomBytes: TerminalSecurityRandomBytes, @unchecked Sendable {
+    private let lock = NSLock()
+    private var next: UInt8
+
+    init(startingAt: UInt8) {
+        next = startingAt
+    }
+
+    func bytes(count: Int) throws -> [UInt8] {
+        lock.withLock {
+            defer { next &+= 1 }
+            return Array(repeating: next, count: count)
+        }
     }
 }

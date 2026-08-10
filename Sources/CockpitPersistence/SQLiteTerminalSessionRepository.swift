@@ -3,7 +3,7 @@ import SQLite3
 import CockpitTerminalCore
 import CockpitTypes
 
-public actor SQLiteTerminalSessionRepository: TerminalSessionRepository {
+public actor SQLiteTerminalSessionRepository: TerminalSessionRepository, AgentExecutableRepository {
     private static let recordColumns = """
         session_id, context_kind, context_id, environment_id,
         protocol_major, protocol_minor, launch_spec, worker_id,
@@ -28,10 +28,11 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository {
         await connection.close()
     }
 
+    @discardableResult
     public func insertPreparing(
         _ record: TerminalSessionRecord,
         idempotencyKey: RequestID
-    ) async throws {
+    ) async throws -> TerminalSessionRecord {
         guard record.lifecycleState == .preparing,
               record.workerID == nil,
               record.processIdentity == nil,
@@ -42,12 +43,23 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository {
             throw TerminalSessionRepositoryError.recordMustBePreparing
         }
         let context = Self.contextParts(record.contextID)
-        try await connection.withImmediateTransaction { connection in
+        return try await connection.withImmediateTransaction { connection in
             let existing = try connection.query(
-                "SELECT session_id FROM terminal_idempotency WHERE request_id = ?",
+                """
+                SELECT \(Self.recordColumns)
+                FROM terminal_sessions
+                WHERE session_id = (
+                    SELECT session_id FROM terminal_idempotency WHERE request_id = ?
+                )
+                """,
                 bindings: [.text(idempotencyKey.description)]
             )
-            guard existing.isEmpty else { return }
+            if let row = existing.first {
+                guard existing.count == 1 else {
+                    throw TerminalSessionRepositoryError.corruptRecord
+                }
+                return try Self.decodeRecord(row)
+            }
 
             try connection.execute(
                 """
@@ -80,6 +92,7 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository {
                 "INSERT INTO terminal_idempotency (request_id, session_id) VALUES (?, ?)",
                 bindings: [.text(idempotencyKey.description), .text(record.sessionID.description)]
             )
+            return record
         }
     }
 
@@ -234,9 +247,49 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository {
         return try rows.map(Self.decodeRecord)
     }
 
+    public func storeCanonicalExecutable(
+        _ path: String,
+        for profileID: AgentProfileID
+    ) async throws {
+        guard Self.isCanonicalAbsolutePath(path) else {
+            throw TerminalSessionRepositoryError.invalidCanonicalExecutablePath
+        }
+        try await connection.execute(
+            """
+            INSERT INTO agent_executables (profile_id, canonical_path)
+            VALUES (?, ?)
+            ON CONFLICT(profile_id) DO UPDATE SET canonical_path = excluded.canonical_path
+            """,
+            bindings: [.text(profileID.rawValue), .text(path)]
+        )
+    }
+
+    public func canonicalExecutable(for profileID: AgentProfileID) async throws -> String? {
+        let rows = try await connection.query(
+            "SELECT canonical_path FROM agent_executables WHERE profile_id = ?",
+            bindings: [.text(profileID.rawValue)]
+        )
+        guard rows.count <= 1 else {
+            throw TerminalSessionRepositoryError.corruptRecord
+        }
+        guard let row = rows.first else { return nil }
+        guard row.count == 1,
+              let path = Self.text(row[0]),
+              Self.isCanonicalAbsolutePath(path)
+        else {
+            throw TerminalSessionRepositoryError.corruptRecord
+        }
+        return path
+    }
+
     private static let finalStates: Set<TerminalLifecycleState> = [
         .exited, .terminated, .interrupted,
     ]
+
+    private static func isCanonicalAbsolutePath(_ path: String) -> Bool {
+        guard path.hasPrefix("/"), !path.contains("\0") else { return false }
+        return URL(fileURLWithPath: path).standardizedFileURL.path == path
+    }
 
     private static func requireStateRow(
         connection: isolated SQLiteConnection,

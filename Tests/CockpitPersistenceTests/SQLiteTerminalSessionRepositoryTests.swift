@@ -38,7 +38,7 @@ struct SQLiteTerminalSessionRepositoryTests {
                 nonceByte: 0x31
             )
             let workerID = WorkerInstanceID(fixedUUID(0x41))
-            let identity = try CLIProcessIdentity(validatingProcessID: 101, processGroupID: 202)
+            let identity = try CLIProcessIdentity(validatingProcessID: 101, processGroupID: 101)
 
             try await repository.insertPreparing(
                 preparing,
@@ -115,20 +115,37 @@ struct SQLiteTerminalSessionRepositoryTests {
                 contextID: contextID,
                 nonceByte: 0x92
             )
+            let unrelated = try makePreparingRecord(
+                sessionID: fixedSession(0x83),
+                contextID: contextID,
+                nonceByte: 0x93
+            )
 
             let first = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
-            try await first.insertPreparing(original, idempotencyKey: requestID)
-            try await first.insertPreparing(conflictingRetry, idempotencyKey: requestID)
-            #expect(try await first.activeRecords() == [original])
+            let inserted = try await first.insertPreparing(original, idempotencyKey: requestID)
+            _ = try await first.insertPreparing(
+                unrelated,
+                idempotencyKey: RequestID(fixedUUID(0x62))
+            )
+            let retried = try await first.insertPreparing(conflictingRetry, idempotencyKey: requestID)
+            #expect(inserted == original)
+            #expect(retried == original)
+            #expect(try await first.activeRecords() == [original, unrelated])
             #expect(await first.close() == SQLITE_OK)
 
             let reopened = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
             let persisted = try await reopened.activeRecords()
-            #expect(persisted == [original])
+            #expect(persisted == [original, unrelated])
             #expect(persisted.first?.startNonce == Data(repeating: 0x91, count: 16))
 
-            try await reopened.insertPreparing(conflictingRetry, idempotencyKey: requestID)
-            #expect(try await reopened.activeRecords() == [original])
+            let reopenedRetry = try await reopened.insertPreparing(
+                conflictingRetry,
+                idempotencyKey: requestID
+            )
+            #expect(reopenedRetry == original)
+            #expect(reopenedRetry.sessionID == original.sessionID)
+            #expect(reopenedRetry.startNonce == Data(repeating: 0x91, count: 16))
+            #expect(try await reopened.activeRecords() == [original, unrelated])
             #expect(await reopened.close() == SQLITE_OK)
         }
     }
@@ -206,6 +223,84 @@ struct SQLiteTerminalSessionRepositoryTests {
                 .map(\.lifecycleState)
             #expect(terminalStates == [.interrupted, .interrupted, .terminated])
             #expect(await repository.close() == SQLITE_OK)
+        }
+    }
+
+    @Test func processIdentityRequiresTheCLIToLeadItsOwnProcessGroupAtEveryBoundary() async throws {
+        #expect(throws: TerminalSessionRecordError.invalidProcessIdentity) {
+            _ = try CLIProcessIdentity(validatingProcessID: 404, processGroupID: 405)
+        }
+        #expect(throws: TerminalSessionRecordError.invalidProcessIdentity) {
+            _ = try JSONDecoder().decode(
+                CLIProcessIdentity.self,
+                from: Data(#"{"processID":404,"processGroupID":405}"#.utf8)
+            )
+        }
+
+        try await withTerminalDatabase { databaseURL in
+            let repository = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            let record = try makePreparingRecord(
+                sessionID: fixedSession(0xE1),
+                contextID: .project(ProjectID(fixedUUID(0xE2))),
+                nonceByte: 0xE3
+            )
+            try await repository.insertPreparing(record, idempotencyKey: RequestID(fixedUUID(0xE4)))
+            try await repository.markCommitted(
+                sessionID: record.sessionID,
+                workerID: WorkerInstanceID(fixedUUID(0xE5))
+            )
+            let inspection = try SQLiteConnection(databaseURL: databaseURL)
+            await #expect(throws: (any Error).self) {
+                try await inspection.execute(
+                    "UPDATE terminal_sessions SET process_id = 404, process_group_id = 405 WHERE session_id = '\(record.sessionID.description)'"
+                )
+            }
+            #expect(await inspection.close() == SQLITE_OK)
+            #expect(await repository.close() == SQLITE_OK)
+        }
+    }
+
+    @Test func agentExecutablePortPersistsOnlyTypedCanonicalAbsolutePaths() async throws {
+        try await withTerminalDatabase { databaseURL in
+            let first = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            #expect(try await first.canonicalExecutable(for: .codex) == nil)
+            #expect(try await first.canonicalExecutable(for: .claude) == nil)
+
+            try await first.storeCanonicalExecutable(
+                "/Applications/Codex.app/Contents/MacOS/codex",
+                for: .codex
+            )
+            try await first.storeCanonicalExecutable(
+                "/opt/homebrew/bin/codex",
+                for: .codex
+            )
+            await #expect(
+                throws: TerminalSessionRepositoryError.invalidCanonicalExecutablePath
+            ) {
+                try await first.storeCanonicalExecutable("bin/claude", for: .claude)
+            }
+            #expect(await first.close() == SQLITE_OK)
+
+            let reopened = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            #expect(
+                try await reopened.canonicalExecutable(for: .codex)
+                    == "/opt/homebrew/bin/codex"
+            )
+            #expect(try await reopened.canonicalExecutable(for: .claude) == nil)
+
+            let inspection = try SQLiteConnection(databaseURL: databaseURL)
+            await #expect(throws: (any Error).self) {
+                try await inspection.execute(
+                    "INSERT INTO agent_executables (profile_id, canonical_path) VALUES ('other', '/tmp/other')"
+                )
+            }
+            await #expect(throws: (any Error).self) {
+                try await inspection.execute(
+                    "INSERT INTO agent_executables (profile_id, canonical_path) VALUES ('claude', 'bin/claude')"
+                )
+            }
+            #expect(await inspection.close() == SQLITE_OK)
+            #expect(await reopened.close() == SQLITE_OK)
         }
     }
 }

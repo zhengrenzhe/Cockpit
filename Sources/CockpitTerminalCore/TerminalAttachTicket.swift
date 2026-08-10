@@ -49,10 +49,38 @@ public struct TerminalAttachTicketRegistration: Hashable, Codable, Sendable {
         guard !capabilities.isEmpty, capabilities.isSubset(of: .all) else {
             throw TerminalAttachTicketError.invalidCapabilities
         }
+        guard expiresAt.timeIntervalSinceReferenceDate.isFinite else {
+            throw TerminalAttachTicketError.invalidRegistration
+        }
         self.ticketDigest = ticketDigest
         self.binding = binding
         self.capabilities = capabilities
         self.expiresAt = expiresAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case ticketDigest
+        case binding
+        case capabilities
+        case expiresAt
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            ticketDigest: container.decode(Data.self, forKey: .ticketDigest),
+            binding: container.decode(TerminalAttachBinding.self, forKey: .binding),
+            capabilities: container.decode(TerminalAttachCapabilities.self, forKey: .capabilities),
+            expiresAt: container.decode(Date.self, forKey: .expiresAt)
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(ticketDigest, forKey: .ticketDigest)
+        try container.encode(binding, forKey: .binding)
+        try container.encode(capabilities, forKey: .capabilities)
+        try container.encode(expiresAt, forKey: .expiresAt)
     }
 }
 
@@ -90,6 +118,8 @@ public protocol AttachTicketPolicy: Sendable {
         capabilities: TerminalAttachCapabilities
     ) async throws -> IssuedTerminalAttachTicket
     func register(_ registration: TerminalAttachTicketRegistration) async throws
+    func acknowledgeConsumption(ticketDigest: Data) async throws
+    func invalidateAll() async
     func consume(
         wireValue: String,
         binding: TerminalAttachBinding,
@@ -118,7 +148,7 @@ public actor TerminalAttachTicketStore: AttachTicketPolicy {
         guard !capabilities.isEmpty, capabilities.isSubset(of: .all) else {
             throw TerminalAttachTicketError.invalidCapabilities
         }
-        purgeExpiredTombstones()
+        purgeExpiredState()
         for _ in 0..<8 {
             let raw: [UInt8]
             do {
@@ -159,10 +189,24 @@ public actor TerminalAttachTicketStore: AttachTicketPolicy {
     }
 
     public func register(_ registration: TerminalAttachTicketRegistration) throws {
-        guard clock.now() < registration.expiresAt else {
+        let now = clock.now()
+        guard now < registration.expiresAt else {
             throw TerminalAttachTicketError.expired
         }
-        purgeExpiredTombstones()
+        guard registration.ticketDigest.count == 32 else {
+            throw TerminalAttachTicketError.invalidRegistration
+        }
+        guard !registration.capabilities.isEmpty,
+              registration.capabilities.isSubset(of: .all)
+        else {
+            throw TerminalAttachTicketError.invalidCapabilities
+        }
+        guard registration.expiresAt.timeIntervalSinceReferenceDate.isFinite,
+              registration.expiresAt.timeIntervalSince(now) <= 30
+        else {
+            throw TerminalAttachTicketError.invalidRegistration
+        }
+        purgeExpiredState()
         if let existing = registrations[registration.ticketDigest] {
             guard existing == registration else {
                 throw TerminalAttachTicketError.digestCollision
@@ -175,6 +219,25 @@ public actor TerminalAttachTicketStore: AttachTicketPolicy {
         registrations[registration.ticketDigest] = registration
     }
 
+    public func acknowledgeConsumption(ticketDigest: Data) throws {
+        guard ticketDigest.count == 32 else {
+            throw TerminalAttachTicketError.invalidRegistration
+        }
+        purgeExpiredState()
+        if replayTombstones[ticketDigest] != nil {
+            return
+        }
+        guard let registration = registrations.removeValue(forKey: ticketDigest) else {
+            throw TerminalAttachTicketError.invalidCanonicalTicket
+        }
+        replayTombstones[ticketDigest] = registration.expiresAt
+    }
+
+    public func invalidateAll() {
+        registrations.removeAll(keepingCapacity: false)
+        replayTombstones.removeAll(keepingCapacity: false)
+    }
+
     public func consume(
         wireValue: String,
         binding: TerminalAttachBinding,
@@ -184,11 +247,12 @@ public actor TerminalAttachTicketStore: AttachTicketPolicy {
             throw TerminalAttachTicketError.invalidCanonicalTicket
         }
         let digest = Self.digest(raw)
-        purgeExpiredTombstones()
+        let requestedRegistration = registrations[digest]
+        purgeExpiredState()
         if let replayExpiry = replayTombstones[digest], clock.now() < replayExpiry {
             throw TerminalAttachTicketError.replay
         }
-        guard let registration = registrations[digest] else {
+        guard let registration = requestedRegistration else {
             throw TerminalAttachTicketError.invalidCanonicalTicket
         }
         guard clock.now() < registration.expiresAt else {
@@ -210,8 +274,14 @@ public actor TerminalAttachTicketStore: AttachTicketPolicy {
         return registration
     }
 
-    private func purgeExpiredTombstones() {
+    func activeRegistrationCount() -> Int {
+        purgeExpiredState()
+        return registrations.count
+    }
+
+    private func purgeExpiredState() {
         let now = clock.now()
+        registrations = registrations.filter { now < $0.value.expiresAt }
         replayTombstones = replayTombstones.filter { now < $0.value }
     }
 

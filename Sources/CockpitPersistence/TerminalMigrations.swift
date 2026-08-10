@@ -33,7 +33,11 @@ enum TerminalMigrations {
                 archive_manifest TEXT,
                 CHECK (
                     (process_id IS NULL AND process_group_id IS NULL)
-                    OR (process_id > 0 AND process_group_id > 0)
+                    OR (
+                        process_id > 0
+                        AND process_group_id > 0
+                        AND process_id = process_group_id
+                    )
                 )
             )
             """,
@@ -46,8 +50,16 @@ enum TerminalMigrations {
             """,
             """
             CREATE TABLE agent_executables (
-                profile_id TEXT PRIMARY KEY,
-                canonical_path TEXT NOT NULL CHECK (length(canonical_path) > 0)
+                profile_id TEXT PRIMARY KEY CHECK (profile_id IN ('codex', 'claude')),
+                canonical_path TEXT NOT NULL CHECK (
+                    length(canonical_path) > 1
+                    AND substr(canonical_path, 1, 1) = '/'
+                    AND instr(canonical_path, '//') = 0
+                    AND instr(canonical_path, '/../') = 0
+                    AND instr(canonical_path, '/./') = 0
+                    AND canonical_path NOT LIKE '%/..'
+                    AND canonical_path NOT LIKE '%/.'
+                )
             )
             """,
             "CREATE INDEX terminal_sessions_context_idx ON terminal_sessions (context_kind, context_id, session_id)",
