@@ -53,56 +53,47 @@ import CockpitTerminalCore
     #expect(replies[0].1 != nil)
 }
 
-@Test func terminalSupervisorExportEncodesKeeperLaunchReceiptAsJSON() throws {
+@Test func terminalSupervisorExportReturnsArchiveAsFileHandle() async throws {
     let sessionID = TerminalSessionID(try #require(
         UUID(uuidString: "00000000-0000-0000-0000-000000000041")
     ))
-    let workerInstanceID = WorkerInstanceID(try #require(
-        UUID(uuidString: "00000000-0000-0000-0000-000000000042")
-    ))
-    let request = KeeperProbeRequest(
-        sessionID: sessionID,
-        workerInstanceID: workerInstanceID
-    )
+    let archiveURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cockpit-terminal-archive-\(UUID().uuidString)")
+    let archiveBytes = Data([0x43, 0x4B, 0x47, 0x46])
+    try archiveBytes.write(to: archiveURL)
+    defer { try? FileManager.default.removeItem(at: archiveURL) }
     let exported = TerminalSupervisorXPCExport(
         handshakeHandler: { request in try HostHandshakeHandler().handle(request) },
-        spawnHandler: { probe in
-            KeeperLaunchReceipt(
-                sessionID: probe.sessionID,
-                workerInstanceID: probe.workerInstanceID,
-                processID: 4242,
-                runtimeDescriptorPath: "/private/tmp/cockpit.501/terminal/receipt.json"
-            )
+        archiveHandler: { requestedSessionID in
+            guard requestedSessionID == sessionID else {
+                throw CocoaError(.coderInvalidValue)
+            }
+            return try FileHandle(forReadingFrom: archiveURL)
         }
     )
-    var replies: [(Data?, NSError?)] = []
-
-    exported.spawnKeeperProbe(try JSONEncoder().encode(request)) { data, error in
-        replies.append((data, error))
+    let handle: FileHandle = try await withCheckedThrowingContinuation { continuation in
+        exported.openTerminalArchive(try! JSONEncoder().encode(sessionID)) { handle, error in
+            if let error { continuation.resume(throwing: error) }
+            else if let handle { continuation.resume(returning: handle) }
+            else { continuation.resume(throwing: CocoaError(.coderInvalidValue)) }
+        }
     }
 
-    #expect(replies.count == 1)
-    #expect(replies[0].1 == nil)
-    let data = try #require(replies[0].0)
-    #expect(try JSONDecoder().decode(KeeperLaunchReceipt.self, from: data) == KeeperLaunchReceipt(
-        sessionID: sessionID,
-        workerInstanceID: workerInstanceID,
-        processID: 4242,
-        runtimeDescriptorPath: "/private/tmp/cockpit.501/terminal/receipt.json"
-    ))
+    #expect(try handle.readToEnd() == archiveBytes)
+    try handle.close()
 }
 
-@Test func terminalSupervisorExportRejectsMalformedJSONWithoutData() {
+@Test func terminalSupervisorArchiveExportRejectsMalformedJSONWithoutHandle() {
     let exported = TerminalSupervisorXPCExport(
         handshakeHandler: { request in try HostHandshakeHandler().handle(request) },
-        spawnHandler: { _ in
-            fatalError("malformed JSON must not reach the spawn handler")
+        archiveHandler: { _ in
+            fatalError("malformed JSON must not reach the archive handler")
         }
     )
-    var replies: [(Data?, NSError?)] = []
+    var replies: [(FileHandle?, NSError?)] = []
 
-    exported.spawnKeeperProbe(Data("not-json".utf8)) { data, error in
-        replies.append((data, error))
+    exported.openTerminalArchive(Data("not-json".utf8)) { handle, error in
+        replies.append((handle, error))
     }
 
     #expect(replies.count == 1)

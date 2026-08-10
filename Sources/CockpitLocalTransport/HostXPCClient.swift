@@ -148,6 +148,65 @@ public actor HostXPCClient: WorkspaceServing {
         connection.value.invalidate()
     }
 
+    public func terminalCommand(
+        _ request: HostTerminalCommandRequest
+    ) async throws -> HostTerminalCommandResponse {
+        connect()
+        guard let connection = activeConnection?.value else {
+            throw CocoaError(.xpcConnectionInvalid)
+        }
+        let requestData = try JSONEncoder().encode(request)
+        let reply = XPCReplyContinuation<Data>()
+        let responseData = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard reply.install(continuation) else { return }
+                let remote = connection.remoteObjectProxy { error in
+                    reply.resume(throwing: error)
+                }
+                guard let proxy = remote as? HostXPCProtocol else {
+                    reply.resume(throwing: CocoaError(.coderInvalidValue))
+                    return
+                }
+                proxy.terminalCommand(requestData) { data, error in
+                    if let error { reply.resume(throwing: error) }
+                    else if let data { reply.resume(returning: data) }
+                    else { reply.resume(throwing: CocoaError(.coderInvalidValue)) }
+                }
+            }
+        } onCancel: {
+            reply.cancel()
+        }
+        return try JSONDecoder().decode(HostTerminalCommandResponse.self, from: responseData)
+    }
+
+    public func openTerminalArchive(
+        _ request: HostTerminalArchiveRequest
+    ) async throws -> FileHandle {
+        connect()
+        guard let connection = activeConnection?.value else {
+            throw CocoaError(.xpcConnectionInvalid)
+        }
+        let requestData = try JSONEncoder().encode(request)
+        let reply = XPCReplyContinuation<FileHandle>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard reply.install(continuation) else { return }
+                let remote = connection.remoteObjectProxy { error in
+                    reply.resume(throwing: error)
+                }
+                guard let proxy = remote as? HostXPCProtocol else {
+                    reply.resume(throwing: CocoaError(.coderInvalidValue))
+                    return
+                }
+                proxy.openTerminalArchive(requestData) { handle, error in
+                    if let error { reply.resume(throwing: error) }
+                    else if let handle { reply.resume(returning: handle) }
+                    else { reply.resume(throwing: CocoaError(.coderInvalidValue)) }
+                }
+            }
+        } onCancel: { reply.cancel() }
+    }
+
     private func send(
         _ request: WorkspaceCommandRequest
     ) async throws -> WorkspaceCommandResponse {

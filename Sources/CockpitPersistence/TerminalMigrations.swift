@@ -1,7 +1,7 @@
 import Foundation
 
 enum TerminalMigrations {
-    static let all = [version1]
+    static let all = [version1, version2]
 
     private static let version1 = SQLiteMigration(
         version: 1,
@@ -66,6 +66,19 @@ enum TerminalMigrations {
             """,
             "CREATE INDEX terminal_sessions_context_idx ON terminal_sessions (context_kind, context_id, session_id)",
             "CREATE INDEX terminal_sessions_lifecycle_idx ON terminal_sessions (lifecycle_state, session_id)",
+        ]
+    )
+
+    private static let version2 = SQLiteMigration(
+        version: 2,
+        statements: [
+            """
+            CREATE TABLE terminal_supervisor_epoch (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_epoch INTEGER NOT NULL CHECK (last_epoch >= 0)
+            )
+            """,
+            "INSERT INTO terminal_supervisor_epoch (singleton, last_epoch) VALUES (1, 0)",
         ]
     )
 }

@@ -7,7 +7,7 @@ import CockpitTypes
 
 @Suite("SQLiteTerminalSessionRepositoryTests")
 struct SQLiteTerminalSessionRepositoryTests {
-    @Test func migrationCreatesOnlyTheFrozenTerminalTables() async throws {
+    @Test func migrationCreatesTerminalTablesAndDurableSupervisorEpoch() async throws {
         try await withTerminalDatabase { databaseURL in
             let repository = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
             let inspection = try SQLiteConnection(databaseURL: databaseURL)
@@ -17,15 +17,40 @@ struct SQLiteTerminalSessionRepositoryTests {
                 "terminal_idempotency",
                 "terminal_schema_migrations",
                 "terminal_sessions",
+                "terminal_supervisor_epoch",
             ])
             #expect(
                 try await inspection.integerValue(
-                    for: "SELECT version FROM terminal_schema_migrations"
-                ) == 1
+                    for: "SELECT COUNT(*) FROM terminal_schema_migrations"
+                ) == 2
+            )
+            #expect(
+                try await inspection.integerValue(
+                    for: "SELECT MAX(version) FROM terminal_schema_migrations"
+                ) == 2
             )
 
             #expect(await inspection.close() == SQLITE_OK)
             #expect(await repository.close() == SQLITE_OK)
+        }
+    }
+
+    @Test func supervisorGenerationEpochIncrementsAcrossRepositoryRestart() async throws {
+        try await withTerminalDatabase { databaseURL in
+            let firstRepository = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            let first = try KeeperSupervisorGeneration(
+                validating: try await firstRepository.allocateSupervisorGeneration()
+            )
+            #expect(first.epoch == 1)
+            #expect(await firstRepository.close() == SQLITE_OK)
+
+            let secondRepository = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            let second = try KeeperSupervisorGeneration(
+                validating: try await secondRepository.allocateSupervisorGeneration()
+            )
+            #expect(second.epoch == 2)
+            #expect(second.rawValue != first.rawValue)
+            #expect(await secondRepository.close() == SQLITE_OK)
         }
     }
 
@@ -266,6 +291,104 @@ struct SQLiteTerminalSessionRepositoryTests {
                 )
             }
             #expect(await inspection.close() == SQLITE_OK)
+            #expect(await repository.close() == SQLITE_OK)
+        }
+    }
+
+    @Test func purgeFinishedRecordsDeletesOnlyTerminalRowsAndReturnsTheExactCount() async throws {
+        try await withTerminalDatabase { databaseURL in
+            let repository = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            let contextID = WorkspaceContextID.project(ProjectID(fixedUUID(0xF0)))
+            let active = try makePreparingRecord(
+                sessionID: fixedSession(0xF1),
+                contextID: contextID,
+                nonceByte: 0xF1
+            )
+            let exited = try makePreparingRecord(
+                sessionID: fixedSession(0xF2),
+                contextID: contextID,
+                nonceByte: 0xF2
+            )
+            let interrupted = try makePreparingRecord(
+                sessionID: fixedSession(0xF3),
+                contextID: contextID,
+                nonceByte: 0xF3
+            )
+            let terminated = try makePreparingRecord(
+                sessionID: fixedSession(0xF4),
+                contextID: contextID,
+                nonceByte: 0xF4
+            )
+            try await repository.insertPreparing(
+                active,
+                idempotencyKey: RequestID(fixedUUID(0xE1))
+            )
+            try await repository.insertPreparing(
+                exited,
+                idempotencyKey: RequestID(fixedUUID(0xE2))
+            )
+            try await repository.insertPreparing(
+                interrupted,
+                idempotencyKey: RequestID(fixedUUID(0xE3))
+            )
+            try await repository.insertPreparing(
+                terminated,
+                idempotencyKey: RequestID(fixedUUID(0xE4))
+            )
+            for (record, workerByte, processID) in [
+                (exited, UInt8(0xD1), Int32(501)),
+                (terminated, UInt8(0xD2), Int32(502)),
+            ] {
+                try await repository.markCommitted(
+                    sessionID: record.sessionID,
+                    workerID: WorkerInstanceID(fixedUUID(workerByte))
+                )
+                try await repository.markRunning(
+                    sessionID: record.sessionID,
+                    identity: try CLIProcessIdentity(
+                        validatingProcessID: processID,
+                        processGroupID: processID
+                    )
+                )
+            }
+            try await repository.finish(
+                sessionID: exited.sessionID,
+                state: .exited,
+                exitStatus: 0,
+                latestSequence: 1,
+                archiveManifest: nil
+            )
+            try await repository.finish(
+                sessionID: interrupted.sessionID,
+                state: .interrupted,
+                exitStatus: nil,
+                latestSequence: 2,
+                archiveManifest: nil
+            )
+            try await repository.finish(
+                sessionID: terminated.sessionID,
+                state: .terminated,
+                exitStatus: -15,
+                latestSequence: 3,
+                archiveManifest: nil
+            )
+
+            #expect(try await repository.purgeFinishedRecords() == 3)
+            #expect(try await repository.records(contextID: contextID) == [active])
+            let inspection = try SQLiteConnection(databaseURL: databaseURL)
+            let idempotencyRows = try await inspection.query(
+                "SELECT session_id FROM terminal_idempotency ORDER BY session_id"
+            )
+            #expect(idempotencyRows.count == 1)
+            if idempotencyRows.count == 1,
+               idempotencyRows[0].count == 1,
+               case let .text(sessionID) = idempotencyRows[0][0] {
+                #expect(sessionID == active.sessionID.description)
+            } else {
+                Issue.record("expected exactly one surviving idempotency row")
+            }
+            #expect(await inspection.close() == SQLITE_OK)
+            #expect(try await repository.purgeFinishedRecords() == 0)
             #expect(await repository.close() == SQLITE_OK)
         }
     }

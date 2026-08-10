@@ -133,95 +133,124 @@ public actor TerminalReconciler {
             $0.sessionID.description < $1.sessionID.description
         }
         for record in records {
-            guard record.lifecycleState == .committed || record.lifecycleState == .running,
-                  let workerID = record.workerID else { continue }
+            try await reconcile(
+                record,
+                descriptors: descriptors,
+                preserveTransientInspectFailure: false
+            )
+        }
+    }
 
-            if let manifest = try verifiedManifest(for: record) {
-                guard manifest.workerInstanceID == workerID else { continue }
-                let final: (TerminalLifecycleState, Int32) = switch manifest.exitStatus {
-                case let .exited(code): (.exited, Int32(code))
-                case let .signaled(signal): (.terminated, -signal)
-                }
-                try await repository.finish(
-                    sessionID: record.sessionID,
-                    state: final.0,
-                    exitStatus: final.1,
-                    latestSequence: manifest.latestOutputSequence,
-                    archiveManifest: archiveStore.manifestRelativePath(
-                        sessionID: record.sessionID
-                    )
+    public func reconcile(sessionID: TerminalSessionID) async throws {
+        let descriptors = try descriptorReader.descriptors()
+        let record = try await repository.record(sessionID: sessionID)
+        try await reconcile(
+            record,
+            descriptors: descriptors,
+            preserveTransientInspectFailure: false
+        )
+    }
+
+    @_spi(CockpitTerminalSupervisorComposition)
+    public func reconcileAfterTransientDisconnect(
+        sessionID: TerminalSessionID
+    ) async throws {
+        let descriptors = try descriptorReader.descriptors()
+        let record = try await repository.record(sessionID: sessionID)
+        try await reconcile(
+            record,
+            descriptors: descriptors,
+            preserveTransientInspectFailure: true
+        )
+    }
+
+    private func reconcile(
+        _ record: TerminalSessionRecord,
+        descriptors: [KeeperRuntimeDescriptor],
+        preserveTransientInspectFailure: Bool
+    ) async throws {
+        guard record.lifecycleState == .committed || record.lifecycleState == .running,
+              let workerID = record.workerID else { return }
+
+        if let manifest = try verifiedManifest(for: record) {
+            guard manifest.workerInstanceID == workerID else { return }
+            let final: (TerminalLifecycleState, Int32) = switch manifest.exitStatus {
+            case let .exited(code): (.exited, Int32(code))
+            case let .signaled(signal): (.terminated, -signal)
+            }
+            try await repository.finish(
+                sessionID: record.sessionID,
+                state: final.0,
+                exitStatus: final.1,
+                latestSequence: manifest.latestOutputSequence,
+                archiveManifest: archiveStore.manifestRelativePath(
+                    sessionID: record.sessionID
                 )
-                continue
-            }
+            )
+            return
+        }
 
-            let sessionDescriptors = descriptors.filter { $0.sessionID == record.sessionID }
-            guard let runtime = sessionDescriptors.first(where: {
-                $0.workerInstanceID == workerID
-            }) else {
-                if sessionDescriptors.isEmpty {
-                    try await markInterrupted(record)
-                }
-                continue
-            }
-            guard let endpoint = runtime.endpoint,
-                  endpoint.sessionID == record.sessionID,
-                  endpoint.workerID == workerID else { continue }
+        let sessionDescriptors = descriptors.filter { $0.sessionID == record.sessionID }
+        guard let runtime = sessionDescriptors.first(where: {
+            $0.workerInstanceID == workerID
+        }) else {
+            if sessionDescriptors.isEmpty { try await markInterrupted(record) }
+            return
+        }
+        guard let endpoint = runtime.endpoint,
+              endpoint.sessionID == record.sessionID,
+              endpoint.workerID == workerID else { return }
 
-            let secret: Data
-            do {
-                secret = try await workerSecretDeriver.derive(
-                    sessionID: record.sessionID,
-                    workerID: workerID
-                )
-            } catch {
-                // Keychain/master-key unavailability preserves the durable state.
-                continue
-            }
+        let secret: Data
+        do {
+            secret = try await workerSecretDeriver.derive(
+                sessionID: record.sessionID,
+                workerID: workerID
+            )
+        } catch {
+            // Keychain/master-key unavailability preserves the durable state.
+            return
+        }
 
-            let keeper: KeeperIdentity
-            do { keeper = try await controller.inspect(endpoint) }
-            catch {
+        let keeper: KeeperIdentity
+        do { keeper = try await controller.inspect(endpoint) }
+        catch {
+            if !preserveTransientInspectFailure {
                 try await markInterrupted(record)
-                continue
             }
-            guard keeper.endpoint == endpoint,
-                  keeper.sessionID == record.sessionID,
-                  keeper.workerID == workerID else { continue }
+            return
+        }
+        guard keeper.endpoint == endpoint,
+              keeper.sessionID == record.sessionID,
+              keeper.workerID == workerID else { return }
 
-            if let identity = keeper.processIdentity {
-                if let recorded = record.processIdentity, recorded != identity { continue }
-                try await repository.markRunning(
-                    sessionID: record.sessionID,
-                    identity: identity
-                )
-                continue
-            }
-            guard record.lifecycleState == .committed else {
-                try await markInterrupted(record)
-                continue
-            }
-            let request = AuthenticatedStartRequest(
+        if let identity = keeper.processIdentity {
+            if let recorded = record.processIdentity, recorded != identity { return }
+            try await repository.markRunning(sessionID: record.sessionID, identity: identity)
+            return
+        }
+        guard record.lifecycleState == .committed else {
+            try await markInterrupted(record)
+            return
+        }
+        let request = AuthenticatedStartRequest(
+            endpoint: endpoint,
+            sessionID: record.sessionID,
+            workerID: workerID,
+            startNonce: record.startNonce,
+            proofMAC: KeeperAuthentication.startProof(
+                secret: secret,
                 endpoint: endpoint,
                 sessionID: record.sessionID,
                 workerID: workerID,
-                startNonce: record.startNonce,
-                proofMAC: KeeperAuthentication.startProof(
-                    secret: secret,
-                    endpoint: endpoint,
-                    sessionID: record.sessionID,
-                    workerID: workerID,
-                    startNonce: record.startNonce
-                )
+                startNonce: record.startNonce
             )
-            do {
-                let identity = try await controller.authenticatedStart(request)
-                try await repository.markRunning(
-                    sessionID: record.sessionID,
-                    identity: identity
-                )
-            } catch {
-                // A reachable committed Keeper remains retryable after transient start failure.
-            }
+        )
+        do {
+            let identity = try await controller.authenticatedStart(request)
+            try await repository.markRunning(sessionID: record.sessionID, identity: identity)
+        } catch {
+            // A reachable committed Keeper remains retryable after transient start failure.
         }
     }
 

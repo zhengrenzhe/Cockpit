@@ -36,7 +36,8 @@ cleanup_service_root() {
 
 render_host() {
   /usr/bin/sed \
-    "s|__EXECUTABLE__|$1|g" \
+    -e "s|__EXECUTABLE__|$1|g" \
+    -e "s|__APPLICATION_SUPPORT_ROOT__|$application_support_root|g" \
     "$repo_root/Config/LaunchAgents/dev.cockpit.host.local.plist.template" \
     > "$fixture_dir/host.plist"
 }
@@ -46,6 +47,8 @@ render_terminal() {
     -e "s|__EXECUTABLE__|$1|g" \
     -e "s|__KEEPER_EXECUTABLE__|$2|g" \
     -e "s|__RUNTIME_DIRECTORY__|$runtime_dir|g" \
+    -e "s|__APPLICATION_SUPPORT_ROOT__|$application_support_root|g" \
+    -e "s|__INTEGRATION_MASTER_KEY__|$integration_master_key|g" \
     "$repo_root/Config/LaunchAgents/dev.cockpit.terminal.local.plist.template" \
     > "$fixture_dir/terminal.plist"
 }
@@ -53,6 +56,19 @@ render_terminal() {
 case "${1:-}" in
   start)
     /usr/bin/swift build --package-path "$repo_root" --disable-automatic-resolution --skip-update
+    /opt/homebrew/bin/xcodegen generate --no-env
+    /usr/bin/xcodebuild \
+      -project "$repo_root/Cockpit.xcodeproj" \
+      -target CockpitPTYKeeper \
+      -configuration Debug \
+      OBJROOT="$repo_root/DerivedData/Build/Intermediates.noindex" \
+      SYMROOT="$repo_root/DerivedData/Build/Products" \
+      ARCHS=arm64 \
+      ONLY_ACTIVE_ARCH=YES \
+      CODE_SIGNING_ALLOWED=NO \
+      -skipPackagePluginValidation \
+      -skipMacroValidation \
+      build >/tmp/cockpit-phase0-keeper-build.log
     /bin/mkdir -p "$fixture_dir"
 
     stop_service dev.cockpit.host.local
@@ -80,16 +96,20 @@ case "${1:-}" in
     service_root=$(/usr/bin/mktemp -d /private/tmp/cockpit-phase0.XXXXXX)
     runtime_dir="$service_root/runtime"
     binary_dir="$service_root/bin"
+    application_support_root="$service_root/storage"
+    integration_master_key=$(/usr/bin/openssl rand -base64 32)
     /bin/chmod 700 "$service_root"
     print -r -- "$service_root" > "$service_root_record"
-    /bin/mkdir "$runtime_dir" "$binary_dir"
-    /bin/chmod 700 "$runtime_dir" "$binary_dir"
+    /bin/mkdir "$runtime_dir" "$binary_dir" "$application_support_root"
+    /bin/chmod 700 "$runtime_dir" "$binary_dir" "$application_support_root"
 
     /bin/cp -X "$repo_root/.build/debug/CockpitHost" "$binary_dir/CockpitHost"
     /bin/cp -X \
       "$repo_root/.build/debug/CockpitTerminalSupervisor" \
       "$binary_dir/CockpitTerminalSupervisor"
-    /bin/cp -X "$repo_root/.build/debug/CockpitPTYKeeper" "$binary_dir/CockpitPTYKeeper"
+    /bin/cp -X \
+      "$repo_root/DerivedData/Build/Products/Debug/CockpitPTYKeeper" \
+      "$binary_dir/CockpitPTYKeeper"
     /bin/cp -X "$repo_root/.build/debug/CockpitProbe" "$binary_dir/CockpitProbe"
 
     host="$binary_dir/CockpitHost"
@@ -97,10 +117,17 @@ case "${1:-}" in
     keeper="$binary_dir/CockpitPTYKeeper"
     probe="$binary_dir/CockpitProbe"
 
-    /usr/bin/codesign --force --sign - "$host"
+    bookmark_requirement='=designated => identifier "dev.cockpit.phase0.bookmark"'
+    /usr/bin/codesign --force --sign - \
+      --identifier dev.cockpit.phase0.bookmark \
+      --requirements "$bookmark_requirement" \
+      "$host"
     /usr/bin/codesign --force --sign - "$terminal"
     /usr/bin/codesign --force --sign - "$keeper"
-    /usr/bin/codesign --force --sign - "$probe"
+    /usr/bin/codesign --force --sign - \
+      --identifier dev.cockpit.phase0.bookmark \
+      --requirements "$bookmark_requirement" \
+      "$probe"
 
     render_host "$host"
     render_terminal "$terminal" "$keeper"
@@ -123,12 +150,13 @@ case "${1:-}" in
     load_service_root
     "$service_root/bin/CockpitProbe" services
     ;;
-  spawn-keeper)
+  create-terminal)
     load_service_root
-    "$service_root/bin/CockpitProbe" spawn-keeper
+    "$service_root/bin/CockpitProbe" create-terminal \
+      "$service_root/runtime" "$repo_root"
     ;;
   *)
-    print -u2 "usage: Tools/phase0-services.zsh start|stop|probe|spawn-keeper"
+    print -u2 "usage: Tools/phase0-services.zsh start|stop|probe|create-terminal"
     exit 64
     ;;
 esac

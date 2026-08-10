@@ -1,5 +1,7 @@
 import Foundation
+import CockpitHostCore
 import CockpitTerminalCore
+import CockpitTypes
 
 public actor TerminalSupervisorXPCClient {
     private struct ActiveConnection: Sendable {
@@ -41,15 +43,53 @@ public actor TerminalSupervisorXPCClient {
         connection.resume()
     }
 
-    public func spawnKeeperProbe(
-        _ request: KeeperProbeRequest
-    ) async throws -> KeeperLaunchReceipt {
+    public func command(
+        _ request: TerminalSupervisorCommandRequest
+    ) async throws -> TerminalSupervisorCommandResponse {
         connect()
         guard let connection = activeConnection?.value else {
             throw CocoaError(.xpcConnectionInvalid)
         }
         let data = try JSONEncoder().encode(request)
-        let reply = XPCReplyContinuation<KeeperLaunchReceipt>()
+        let reply = XPCReplyContinuation<Data>()
+        let response = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard reply.install(continuation) else { return }
+                let remote = connection.remoteObjectProxy { error in
+                    reply.resume(throwing: error)
+                }
+                guard let proxy = remote as? TerminalSupervisorXPCProtocol else {
+                    reply.resume(throwing: CocoaError(.coderInvalidValue))
+                    return
+                }
+                proxy.terminalCommand(data) { data, error in
+                    if let error { reply.resume(throwing: error) }
+                    else if let data { reply.resume(returning: data) }
+                    else { reply.resume(throwing: CocoaError(.coderInvalidValue)) }
+                }
+            }
+        } onCancel: {
+            reply.cancel()
+        }
+        return try JSONDecoder().decode(TerminalSupervisorCommandResponse.self, from: response)
+    }
+
+    public func createResolved(
+        _ request: ResolvedTerminalCreateRequest
+    ) async throws -> TerminalSessionRecord {
+        guard case let .session(value) = try await command(.createResolved(request)) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return value
+    }
+
+    public func openArchive(sessionID: TerminalSessionID) async throws -> FileHandle {
+        connect()
+        guard let connection = activeConnection?.value else {
+            throw CocoaError(.xpcConnectionInvalid)
+        }
+        let data = try JSONEncoder().encode(sessionID)
+        let reply = XPCReplyContinuation<FileHandle>()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 guard reply.install(continuation) else { return }
@@ -60,26 +100,13 @@ public actor TerminalSupervisorXPCClient {
                     reply.resume(throwing: CocoaError(.coderInvalidValue))
                     return
                 }
-                proxy.spawnKeeperProbe(data) { data, error in
-                    if let error {
-                        reply.resume(throwing: error)
-                    } else if let data {
-                        do {
-                            reply.resume(returning: try JSONDecoder().decode(
-                                KeeperLaunchReceipt.self,
-                                from: data
-                            ))
-                        } catch {
-                            reply.resume(throwing: error)
-                        }
-                    } else {
-                        reply.resume(throwing: CocoaError(.coderInvalidValue))
-                    }
+                proxy.openTerminalArchive(data) { handle, error in
+                    if let error { reply.resume(throwing: error) }
+                    else if let handle { reply.resume(returning: handle) }
+                    else { reply.resume(throwing: CocoaError(.coderInvalidValue)) }
                 }
             }
-        } onCancel: {
-            reply.cancel()
-        }
+        } onCancel: { reply.cancel() }
     }
 
     public func disconnect() {

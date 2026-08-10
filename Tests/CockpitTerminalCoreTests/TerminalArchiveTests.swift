@@ -3,7 +3,7 @@ import Foundation
 import Testing
 import CockpitProtocol
 import CockpitTypes
-@testable import CockpitTerminalCore
+@_spi(CockpitTerminalSupervisorComposition) @testable import CockpitTerminalCore
 
 @Suite("TerminalArchiveTests")
 struct TerminalArchiveTests {
@@ -163,6 +163,82 @@ struct TerminalArchiveTests {
             _ = try fixture.store.verifiedManifest(sessionID: sessionID)
         }
     }
+
+    @Test func terminalArchiveOpenRequiresMatchingFinalDurableRecord() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.cleanup() }
+        let sessionID = TerminalSessionID()
+        let workerID = WorkerInstanceID()
+        let snapshot = Data("durable-authoritative-snapshot".utf8)
+        _ = try fixture.store.publish(
+            sessionID: sessionID,
+            workerID: workerID,
+            chunks: [],
+            firstOutputSequence: 1,
+            latestOutputSequence: 7,
+            finalSnapshot: snapshot,
+            exitStatus: .exited(0),
+            completedAt: Date(timeIntervalSince1970: 20_000)
+        )
+        let manifestPath = try fixture.store.manifestRelativePath(sessionID: sessionID)
+
+        let active = try terminalArchiveRecord(
+            sessionID: sessionID,
+            workerID: workerID,
+            state: .running,
+            latestSequence: 7,
+            archiveManifest: manifestPath
+        )
+        #expect(throws: TerminalArchiveError.invalidManifest) {
+            _ = try fixture.store.openFinalSnapshot(record: active)
+        }
+
+        let wrongWorker = try terminalArchiveRecord(
+            sessionID: sessionID,
+            workerID: WorkerInstanceID(),
+            state: .exited,
+            latestSequence: 7,
+            archiveManifest: manifestPath
+        )
+        #expect(throws: TerminalArchiveError.invalidManifest) {
+            _ = try fixture.store.openFinalSnapshot(record: wrongWorker)
+        }
+
+        let finalized = try terminalArchiveRecord(
+            sessionID: sessionID,
+            workerID: workerID,
+            state: .exited,
+            latestSequence: 7,
+            archiveManifest: manifestPath
+        )
+        #expect(try fixture.store.openFinalSnapshot(record: finalized).readAll() == snapshot)
+    }
+}
+
+private func terminalArchiveRecord(
+    sessionID: TerminalSessionID,
+    workerID: WorkerInstanceID,
+    state: TerminalLifecycleState,
+    latestSequence: UInt64,
+    archiveManifest: RelativeArchivePath?
+) throws -> TerminalSessionRecord {
+    try TerminalSessionRecord(
+        validatingSessionID: sessionID,
+        contextID: .project(ProjectID()),
+        environmentID: EnvironmentID(),
+        protocolVersion: .current,
+        launchSpecData: Data([1]),
+        lifecycleState: state,
+        startNonce: Data(repeating: 1, count: 16),
+        workerID: workerID,
+        processIdentity: try CLIProcessIdentity(
+            validatingProcessID: 123,
+            processGroupID: 123
+        ),
+        exitStatus: state == .exited ? 0 : nil,
+        latestSequence: latestSequence,
+        archiveManifest: archiveManifest
+    )
 }
 
 private final class ArchiveFixture {

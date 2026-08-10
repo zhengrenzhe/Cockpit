@@ -10,4 +10,14 @@ import Foundation
         _ request: Data,
         withReply reply: @escaping (Data?, NSError?) -> Void
     )
+
+    func terminalCommand(
+        _ request: Data,
+        withReply reply: @escaping (Data?, NSError?) -> Void
+    )
+
+    func openTerminalArchive(
+        _ request: Data,
+        withReply reply: @escaping (FileHandle?, NSError?) -> Void
+    )
 }

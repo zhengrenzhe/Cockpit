@@ -11,6 +11,7 @@ enum GhosttyVTAdapterError: Error, Equatable {
     case createFailed
     case feedFailed
     case snapshotFailed
+    case deltaFailed
     case resizeFailed
     case encodeFailed
 }
@@ -20,6 +21,7 @@ final class GhosttyVTAdapter: @unchecked Sendable {
 
 #if COCKPIT_GHOSTTY_LINKED
     private var terminal: OpaquePointer?
+    private var viewportSequence: UInt64 = 0
 
     init(launchSpec: LaunchSpec) throws {
         let size = launchSpec.terminalSize
@@ -59,16 +61,42 @@ final class GhosttyVTAdapter: @unchecked Sendable {
     func snapshot() throws -> Data {
         try lock.withLock {
             guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            guard viewportSequence < UInt64.max else {
+                throw GhosttyVTAdapterError.snapshotFailed
+            }
             var bytes = cockpit_ghostty_bytes_t(bytes: nil, length: 0)
             guard cockpit_ghostty_vt_snapshot(terminal, &bytes) == 0 else {
                 throw GhosttyVTAdapterError.snapshotFailed
             }
             defer { cockpit_ghostty_bytes_free(bytes) }
-            if bytes.length == 0 { return Data() }
-            guard let base = bytes.bytes else {
+            guard bytes.length == 0 || bytes.bytes != nil else {
                 throw GhosttyVTAdapterError.snapshotFailed
             }
-            return Data(bytes: base, count: bytes.length)
+            let data = bytes.length == 0
+                ? Data()
+                : Data(bytes: bytes.bytes!, count: bytes.length)
+            viewportSequence += 1
+            return data
+        }
+    }
+
+    func delta() throws -> Data {
+        try lock.withLock {
+            guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            guard viewportSequence > 0, viewportSequence < UInt64.max else {
+                throw GhosttyVTAdapterError.deltaFailed
+            }
+            var bytes = cockpit_ghostty_bytes_t(bytes: nil, length: 0)
+            guard cockpit_ghostty_vt_delta(terminal, viewportSequence, &bytes) == 0 else {
+                throw GhosttyVTAdapterError.deltaFailed
+            }
+            defer { cockpit_ghostty_bytes_free(bytes) }
+            guard bytes.length > 0, let base = bytes.bytes else {
+                throw GhosttyVTAdapterError.deltaFailed
+            }
+            let data = Data(bytes: base, count: bytes.length)
+            viewportSequence += 1
+            return data
         }
     }
 
@@ -177,6 +205,10 @@ final class GhosttyVTAdapter: @unchecked Sendable {
     }
 
     func snapshot() throws -> Data {
+        throw GhosttyVTAdapterError.unavailable
+    }
+
+    func delta() throws -> Data {
         throw GhosttyVTAdapterError.unavailable
     }
 

@@ -28,6 +28,27 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository, AgentEx
         await connection.close()
     }
 
+    public func allocateSupervisorGeneration() async throws -> UUID {
+        try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                "SELECT last_epoch FROM terminal_supervisor_epoch WHERE singleton = 1"
+            )
+            guard rows.count == 1,
+                  rows[0].count == 1,
+                  case let .integer(current) = rows[0][0],
+                  current >= 0,
+                  current < Int64.max else {
+                throw TerminalSessionRepositoryError.corruptRecord
+            }
+            let next = current + 1
+            try connection.execute(
+                "UPDATE terminal_supervisor_epoch SET last_epoch = ? WHERE singleton = 1",
+                bindings: [.integer(next)]
+            )
+            return try KeeperSupervisorGeneration(epoch: UInt64(next)).rawValue
+        }
+    }
+
     @discardableResult
     public func insertPreparing(
         _ record: TerminalSessionRecord,
@@ -233,6 +254,21 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository, AgentEx
         return try rows.map(Self.decodeRecord)
     }
 
+    public func record(sessionID: TerminalSessionID) async throws -> TerminalSessionRecord {
+        let rows = try await connection.query(
+            """
+            SELECT \(Self.recordColumns)
+            FROM terminal_sessions
+            WHERE session_id = ?
+            """,
+            bindings: [.text(sessionID.description)]
+        )
+        guard rows.count == 1 else {
+            throw TerminalSessionRepositoryError.recordNotFound
+        }
+        return try Self.decodeRecord(rows[0])
+    }
+
     public func records(contextID: WorkspaceContextID) async throws -> [TerminalSessionRecord] {
         let context = Self.contextParts(contextID)
         let rows = try await connection.query(
@@ -245,6 +281,31 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository, AgentEx
             bindings: [.text(context.kind), .text(context.id)]
         )
         return try rows.map(Self.decodeRecord)
+    }
+
+    public func purgeFinishedRecords() async throws -> Int {
+        try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                """
+                SELECT COUNT(*)
+                FROM terminal_sessions
+                WHERE lifecycle_state IN ('exited', 'terminated', 'interrupted')
+                """
+            )
+            guard rows.count == 1,
+                  rows[0].count == 1,
+                  let count = Self.integer(rows[0][0]).flatMap(Int.init(exactly:)),
+                  count >= 0 else {
+                throw TerminalSessionRepositoryError.corruptRecord
+            }
+            try connection.execute(
+                """
+                DELETE FROM terminal_sessions
+                WHERE lifecycle_state IN ('exited', 'terminated', 'interrupted')
+                """
+            )
+            return count
+        }
     }
 
     public func storeCanonicalExecutable(

@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 import CockpitTypes
-@testable import CockpitTerminalCore
+@_spi(CockpitTerminalSupervisorComposition) @testable import CockpitTerminalCore
 
 @Suite("TerminalReconcilerTests")
 struct TerminalReconcilerTests {
@@ -83,6 +83,42 @@ struct TerminalReconcilerTests {
 
         #expect(await fixture.repository.record(missing.sessionID)?.lifecycleState == .interrupted)
         #expect(await fixture.repository.record(inaccessible.sessionID) == inaccessible)
+    }
+
+    @Test func targetedReconcileDoesNotMutateAnotherActiveSession() async throws {
+        let fixture = try ReconcilerFixture()
+        defer { fixture.cleanup() }
+        let disconnected = try fixture.record(state: .running, workerID: WorkerInstanceID())
+        let concurrentlyControlled = try fixture.record(
+            state: .running,
+            workerID: WorkerInstanceID()
+        )
+        await fixture.repository.set([disconnected, concurrentlyControlled])
+
+        try await fixture.reconciler(descriptors: []).reconcile(
+            sessionID: disconnected.sessionID
+        )
+
+        #expect(
+            await fixture.repository.record(disconnected.sessionID)?.lifecycleState
+                == .interrupted
+        )
+        #expect(await fixture.repository.record(concurrentlyControlled.sessionID) == concurrentlyControlled)
+    }
+
+    @Test func watcherDisconnectPreservesRunningRecordWhenRuntimeInspectIsTransientlyUnavailable() async throws {
+        let fixture = try ReconcilerFixture()
+        defer { fixture.cleanup() }
+        let running = try fixture.record(state: .running, workerID: WorkerInstanceID())
+        await fixture.repository.set([running])
+        let descriptor = try fixture.descriptor(for: running, processID: 406)
+        await fixture.controller.failInspect(for: running.sessionID)
+
+        try await fixture.reconciler(descriptors: [descriptor])
+            .reconcileAfterTransientDisconnect(sessionID: running.sessionID)
+
+        #expect(await fixture.repository.record(running.sessionID) == running)
+        #expect(await fixture.controller.inspectCount == 1)
     }
 
     @Test func terminalReconcilerOnlyPublishesVerifiedArchiveTerminalState() async throws {
@@ -230,7 +266,7 @@ private struct FixedDescriptorReader: TerminalRuntimeDescriptorReading {
     func descriptors() throws -> [KeeperRuntimeDescriptor] { values }
 }
 
-private enum ReconciliationTestError: Error { case keychain }
+private enum ReconciliationTestError: Error { case keychain, inspect }
 
 private actor ReconciliationSecretDeriver: WorkerSecretDeriving {
     private var failures: Set<TerminalSessionID> = []
@@ -243,9 +279,13 @@ private actor ReconciliationSecretDeriver: WorkerSecretDeriving {
 
 private actor ReconciliationController: KeeperControlling {
     private var identities: [TerminalSessionID: CLIProcessIdentity?] = [:]
+    private var inspectFailures: Set<TerminalSessionID> = []
     private(set) var inspectCount = 0
     func setIdentity(_ identity: CLIProcessIdentity?, for sessionID: TerminalSessionID) {
         identities[sessionID] = identity
+    }
+    func failInspect(for sessionID: TerminalSessionID) {
+        inspectFailures.insert(sessionID)
     }
     func awaitReady(_ keeper: LaunchedKeeper) throws -> KeeperReady {
         throw KeeperControlError.disconnected
@@ -253,8 +293,11 @@ private actor ReconciliationController: KeeperControlling {
     func authenticatedStart(_ request: AuthenticatedStartRequest) throws -> CLIProcessIdentity {
         throw KeeperControlError.disconnected
     }
-    func inspect(_ endpoint: KeeperEndpoint) -> KeeperIdentity {
+    func inspect(_ endpoint: KeeperEndpoint) throws -> KeeperIdentity {
         inspectCount += 1
+        if inspectFailures.contains(endpoint.sessionID) {
+            throw ReconciliationTestError.inspect
+        }
         return KeeperIdentity(
             endpoint: endpoint,
             sessionID: endpoint.sessionID,
@@ -318,8 +361,22 @@ private actor ReconciliationRepository: TerminalSessionRepository {
         values.values.filter { [.preparing, .committed, .running].contains($0.lifecycleState) }
     }
 
+    func record(sessionID: TerminalSessionID) throws -> TerminalSessionRecord {
+        try require(sessionID)
+    }
+
     func records(contextID: WorkspaceContextID) -> [TerminalSessionRecord] {
         values.values.filter { $0.contextID == contextID }
+    }
+
+    func purgeFinishedRecords() -> Int {
+        let finished = values.values.filter {
+            [.exited, .terminated, .interrupted].contains($0.lifecycleState)
+        }
+        for record in finished {
+            values.removeValue(forKey: record.sessionID)
+        }
+        return finished.count
     }
 
     private func require(_ id: TerminalSessionID) throws -> TerminalSessionRecord {

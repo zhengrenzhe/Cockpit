@@ -74,6 +74,8 @@ targets:
         OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitTerminalSupervisor
     dependencies:
       - package: CockpitKit
+        product: CockpitHostCore
+      - package: CockpitKit
         product: CockpitTerminalCore
       - package: CockpitKit
         product: CockpitLocalTransport
@@ -89,7 +91,7 @@ targets:
         OTHER_CODE_SIGN_FLAGS: --identifier dev.cockpit.CockpitPTYKeeper
         ARCHS: arm64
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) COCKPIT_GHOSTTY_LINKED
-        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include
+        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty
         LIBRARY_SEARCH_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib
         OTHER_LDFLAGS: $(inherited) "$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/lib/libCockpitGhosttyVT.a"
     dependencies:
@@ -115,7 +117,7 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         ARCHS: arm64
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) COCKPIT_GHOSTTY_LINKED
-        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include
+        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty
         LIBRARY_SEARCH_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64
         OTHER_LDFLAGS: $(inherited) "$(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/CockpitGhosttyRenderer.xcframework/macos-arm64/libCockpitGhosttyRenderer.a" -lc++
     dependencies:
@@ -197,6 +199,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Cockpit.app/Contents/MacOS/Cockpit
         BUNDLE_LOADER: $(TEST_HOST)
+        SWIFT_INCLUDE_PATHS: $(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty
     dependencies:
       - target: Cockpit
       - sdk: WebKit.framework

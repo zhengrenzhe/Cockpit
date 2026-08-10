@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import CoreFoundation
 import CockpitLocalTransport
 import CockpitTerminalCore
 import CockpitTypes
@@ -233,19 +234,40 @@ final class KeeperSessionRuntime: @unchecked Sendable {
                         guard let self else { return }
                         do {
                             try adapter.feed(data)
-                            let snapshot = try adapter.snapshot()
                             let coordinator: TerminalStreamCoordinator?
                             condition.lock()
                             guard outputSequence < UInt64.max else {
                                 condition.unlock()
                                 return
                             }
-                            outputSequence += 1
-                            let sequence = outputSequence
+                            let sequence = outputSequence + 1
+                            condition.unlock()
+                            let kind: TerminalStreamFrameKind
+                            let frame: Data
+                            if sequence.isMultiple(of: 2) {
+                                do {
+                                    frame = try adapter.delta()
+                                    kind = .delta
+                                } catch GhosttyVTAdapterError.deltaFailed {
+                                    frame = try adapter.snapshot()
+                                    kind = .snapshot
+                                }
+                            } else {
+                                frame = try adapter.snapshot()
+                                kind = .snapshot
+                            }
+                            condition.lock()
+                            outputSequence = sequence
                             coordinator = streamCoordinator
                             condition.unlock()
                             if let coordinator {
-                                Task { await coordinator.publish(outputSequence: sequence, frame: snapshot) }
+                                waitForFramePublish {
+                                    await coordinator.publish(
+                                        outputSequence: sequence,
+                                        kind: kind,
+                                        frame: frame
+                                    )
+                                }
                             }
                         } catch {
                             return
@@ -341,8 +363,140 @@ final class KeeperSessionRuntime: @unchecked Sendable {
     }
 }
 
+private func waitForFramePublish(
+    _ operation: @escaping @Sendable () async -> Void
+) {
+    let semaphore = DispatchSemaphore(value: 0)
+    Task.detached {
+        await operation()
+        semaphore.signal()
+    }
+    semaphore.wait()
+}
+
+private final class KeeperProcessLifetime: @unchecked Sendable {
+    private let runtime: KeeperSessionRuntime
+    private let server: KeeperUDSServer
+    private let bootstrapDescriptor: BootstrapDescriptorOwner
+    private let bootstrapQueue = DispatchQueue(
+        label: "dev.cockpit.keeper.bootstrap-control"
+    )
+    private let terminationQueue = DispatchQueue(
+        label: "dev.cockpit.keeper.termination"
+    )
+    private let deadlineLock = NSLock()
+    private var deadline: DispatchSourceTimer?
+    private var terminationSource: DispatchSourceSignal?
+
+    init(
+        runtime: KeeperSessionRuntime,
+        server: KeeperUDSServer,
+        bootstrapDescriptor: BootstrapDescriptorOwner
+    ) {
+        self.runtime = runtime
+        self.server = server
+        self.bootstrapDescriptor = bootstrapDescriptor
+    }
+
+    func start() {
+        runtime.installCompletionHandler { [self] code in
+            cancelSources()
+            server.stop()
+            Darwin._exit(code)
+        }
+
+        let terminationSource = DispatchSource.makeSignalSource(
+            signal: SIGTERM,
+            queue: terminationQueue
+        )
+        terminationSource.setEventHandler { [self] in
+            try? runtime.terminate(force: true)
+            server.stop()
+            Darwin._exit(0)
+        }
+        deadlineLock.withLock { self.terminationSource = terminationSource }
+        terminationSource.resume()
+
+        let deadline = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "dev.cockpit.keeper.bootstrap-timeout")
+        )
+        deadline.schedule(
+            deadline: .now() + .nanoseconds(
+                Int(KeeperBootstrap.bootstrapTimeoutNanoseconds)
+            )
+        )
+        deadline.setEventHandler { [self] in
+            if !runtime.hasStarted() { Darwin._exit(ETIMEDOUT) }
+        }
+        deadlineLock.withLock { self.deadline = deadline }
+        deadline.resume()
+
+        bootstrapQueue.async { [self] in
+            handleBootstrapStart()
+        }
+    }
+
+    private func handleBootstrapStart() {
+        var responseDescriptor: Int32?
+        do {
+            let request = try KeeperBootstrapChannel.receiveStart()
+            responseDescriptor = try bootstrapDescriptor.duplicateForResponseAndClose()
+            let identity = try runtime.start(request)
+            try server.recordBootstrapStart(request, identity: identity)
+            try KeeperBootstrapChannel.sendStarted(identity, to: responseDescriptor!)
+            cancelDeadline()
+        } catch {
+            if responseDescriptor == nil {
+                responseDescriptor = try? bootstrapDescriptor.duplicateForResponseAndClose()
+            }
+            if let responseDescriptor,
+               let controlError = error as? KeeperControlError {
+                try? KeeperBootstrapChannel.sendFailure(controlError, to: responseDescriptor)
+            }
+        }
+        if let responseDescriptor { _ = Darwin.close(responseDescriptor) }
+    }
+
+    private func cancelDeadline() {
+        let deadline = deadlineLock.withLock { () -> DispatchSourceTimer? in
+            defer { self.deadline = nil }
+            return self.deadline
+        }
+        deadline?.cancel()
+    }
+
+    private func cancelSources() {
+        let sources = deadlineLock.withLock {
+            let values = (deadline, terminationSource)
+            deadline = nil
+            terminationSource = nil
+            return values
+        }
+        sources.0?.cancel()
+        sources.1?.cancel()
+    }
+}
+
+private func parkKeeperProcess(retaining graph: [Any]) {
+    withExtendedLifetime(graph) {
+        let processLifetime = CFRunLoopTimerCreateWithHandler(
+            kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + 3_153_600_000,
+            0,
+            0,
+            0
+        ) { _ in }
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), processLifetime, .defaultMode)
+        CFRunLoopRun()
+    }
+}
+
 let previousSIGCHLDHandler = signal(SIGCHLD, SIG_DFL)
 guard unsafeBitCast(previousSIGCHLDHandler, to: Int.self) != -1 else {
+    throw CocoaError(.executableRuntimeMismatch)
+}
+let previousSIGTERMHandler = signal(SIGTERM, SIG_IGN)
+guard unsafeBitCast(previousSIGTERMHandler, to: Int.self) != -1 else {
     throw CocoaError(.executableRuntimeMismatch)
 }
 _ = umask(S_IRWXG | S_IRWXO)
@@ -359,7 +513,7 @@ if bootstrap.mode == .probe {
         processGroupID: getpgrp()
     )
     try SecureRuntimeDirectory.write(descriptor, at: bootstrap.runtimeDirectory)
-    dispatchMain()
+    parkKeeperProcess(retaining: [bootstrapDescriptor])
 }
 
 let validatedBootstrap = try bootstrap.validated()
@@ -387,7 +541,15 @@ let streamCoordinator = TerminalStreamCoordinator(
     attachTicketPolicy: attachTickets,
     performInput: { payload in try runtime.performInput(payload) },
     resetInputState: { runtime.resetInputState() },
-    reportLeaseRevoked: { leaseID in await leaseRevocations.record(leaseID) },
+    reportLeaseRevoked: { grant, nextSequence in
+        await leaseRevocations.recordLeaseRevocation(
+            grant.leaseID,
+            nextSequence: nextSequence
+        )
+    },
+    reportTicketConsumed: { digest in
+        await leaseRevocations.recordAttachTicketConsumption(digest)
+    },
     signalForeground: { signal in try runtime.signalForeground(signal) },
     terminateSession: { force in try runtime.terminate(force: force) }
 )
@@ -401,10 +563,6 @@ let server = KeeperUDSServer(
     terminateHandler: { force in try runtime.terminate(force: force) }
 )
 try server.start()
-runtime.installCompletionHandler { [weak server] code in
-    server?.stop()
-    Darwin._exit(code)
-}
 
 let descriptor = KeeperRuntimeDescriptor(
     sessionID: validatedBootstrap.sessionID,
@@ -431,30 +589,15 @@ let ready = KeeperReady(
 )
 try KeeperBootstrapChannel.sendReady(ready)
 
-let deadline = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-deadline.schedule(deadline: .now() + .nanoseconds(Int(KeeperBootstrap.bootstrapTimeoutNanoseconds)))
-deadline.setEventHandler {
-    if !runtime.hasStarted() { Darwin._exit(ETIMEDOUT) }
-}
-deadline.resume()
-
-DispatchQueue(label: "dev.cockpit.keeper.bootstrap-control").async {
-    var responseDescriptor: Int32?
-    do {
-        let request = try KeeperBootstrapChannel.receiveStart()
-        responseDescriptor = try bootstrapDescriptor.duplicateForResponseAndClose()
-        let identity = try runtime.start(request)
-        try KeeperBootstrapChannel.sendStarted(identity, to: responseDescriptor!)
-    } catch {
-        if responseDescriptor == nil {
-            responseDescriptor = try? bootstrapDescriptor.duplicateForResponseAndClose()
-        }
-        if let responseDescriptor,
-           let controlError = error as? KeeperControlError {
-            try? KeeperBootstrapChannel.sendFailure(controlError, to: responseDescriptor)
-        }
-    }
-    if let responseDescriptor { _ = Darwin.close(responseDescriptor) }
-}
-
-dispatchMain()
+private let processLifetime = KeeperProcessLifetime(
+    runtime: runtime,
+    server: server,
+    bootstrapDescriptor: bootstrapDescriptor
+)
+processLifetime.start()
+parkKeeperProcess(
+    retaining: [
+        runtime, streamCoordinator, leaseRevocations, attachTickets,
+        server, processLifetime,
+    ]
+)

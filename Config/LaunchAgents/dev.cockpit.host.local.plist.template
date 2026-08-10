@@ -6,5 +6,10 @@
   <array><string>__EXECUTABLE__</string></array>
   <key>MachServices</key>
   <dict><key>dev.cockpit.host</key><true/></dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>COCKPIT_APPLICATION_SUPPORT_ROOT</key>
+    <string>__APPLICATION_SUPPORT_ROOT__</string>
+  </dict>
   <key>ProcessType</key><string>Interactive</string>
 </dict></plist>

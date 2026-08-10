@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import CockpitHostCore
 import CockpitTerminalCore
 import CockpitTypes
 @testable import CockpitLocalTransport
@@ -136,16 +137,16 @@ private final class TerminalProxy:
     @unchecked Sendable
 {
     typealias HandshakeBehavior = (Data, @escaping (Data?, NSError?) -> Void) -> Void
-    typealias SpawnBehavior = (Data, @escaping (Data?, NSError?) -> Void) -> Void
+    typealias CommandBehavior = (Data, @escaping (Data?, NSError?) -> Void) -> Void
     private let handshakeBehavior: HandshakeBehavior
-    private let spawnBehavior: SpawnBehavior
+    private let commandBehavior: CommandBehavior
 
     init(
         handshakeBehavior: @escaping HandshakeBehavior = { _, _ in },
-        spawnBehavior: @escaping SpawnBehavior
+        commandBehavior: @escaping CommandBehavior
     ) {
         self.handshakeBehavior = handshakeBehavior
-        self.spawnBehavior = spawnBehavior
+        self.commandBehavior = commandBehavior
     }
 
     func exchangeHandshake(
@@ -155,11 +156,18 @@ private final class TerminalProxy:
         handshakeBehavior(request, reply)
     }
 
-    func spawnKeeperProbe(
+    func terminalCommand(
         _ request: Data,
         withReply reply: @escaping (Data?, NSError?) -> Void
     ) {
-        spawnBehavior(request, reply)
+        commandBehavior(request, reply)
+    }
+
+    func openTerminalArchive(
+        _ request: Data,
+        withReply reply: @escaping (FileHandle?, NSError?) -> Void
+    ) {
+        reply(nil, CocoaError(.featureUnsupported) as NSError)
     }
 }
 
@@ -348,12 +356,8 @@ private actor StartGate {
     )
     let factory = ConnectionFactoryRecorder([connection])
     let client = TerminalSupervisorXPCClient(connectionFactory: factory.make)
-    let request = KeeperProbeRequest(
-        sessionID: TerminalSessionID(),
-        workerInstanceID: WorkerInstanceID()
-    )
     var iterator = requests.makeAsyncIterator()
-    let task = Task { try await client.spawnKeeperProbe(request) }
+    let task = Task { try await client.command(.reconcile) }
     _ = await iterator.next()
 
     task.cancel()
@@ -362,13 +366,7 @@ private actor StartGate {
         _ = try await task.value
     }
 
-    let lateReceipt = KeeperLaunchReceipt(
-        sessionID: request.sessionID,
-        workerInstanceID: request.workerInstanceID,
-        processID: 4242,
-        runtimeDescriptorPath: "/private/tmp/cockpit.501/terminal/late.json"
-    )
-    replyBox.value?(try JSONEncoder().encode(lateReceipt), nil)
+    replyBox.value?(try JSONEncoder().encode(TerminalSupervisorCommandResponse.empty), nil)
     await Task.yield()
 }
 

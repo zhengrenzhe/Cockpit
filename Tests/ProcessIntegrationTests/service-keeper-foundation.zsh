@@ -28,11 +28,11 @@ trap cleanup EXIT
 
 service_output=$("$repo_root/Tools/phase0-services.zsh" probe)
 print -r -- "$service_output"
-[[ "$service_output" == *"dev.cockpit.host host 1.0"* ]]
-[[ "$service_output" == *"dev.cockpit.terminal terminal 1.0"* ]]
+[[ "$service_output" == *"dev.cockpit.host host 1.1"* ]]
+[[ "$service_output" == *"dev.cockpit.terminal terminal 1.1"* ]]
 
-receipt=$("$repo_root/Tools/phase0-services.zsh" spawn-keeper)
-IFS=$'\t' read -r keeper_pid session_id worker_id descriptor_path <<< "$receipt"
+receipt=$("$repo_root/Tools/phase0-services.zsh" create-terminal)
+IFS=$'\t' read -r session_id worker_id descriptor_path <<< "$receipt"
 
 for _ in {1..100}; do
   [[ -f "$descriptor_path" ]] && break
@@ -54,7 +54,8 @@ descriptor_pgid=$(
 )
 [[ "${descriptor_session_id:l}" == "${session_id:l}" ]]
 [[ "${descriptor_worker_id:l}" == "${worker_id:l}" ]]
-[[ "$descriptor_pid" == "$keeper_pid" ]]
+keeper_pid=$descriptor_pid
+[[ "$keeper_pid" == <-> ]]
 [[ "$(/usr/bin/stat -f %Lp "${descriptor_path:h}")" == 700 ]]
 [[ "$(/usr/bin/stat -f %Lp "$descriptor_path")" == 600 ]]
 /bin/kill -0 "$keeper_pid"
@@ -98,6 +99,9 @@ for _ in {1..100}; do
   /bin/kill -0 "$keeper_pid" >/dev/null 2>&1 || break
   /bin/sleep 0.05
 done
-! /bin/kill -0 "$keeper_pid" >/dev/null 2>&1
+if /bin/kill -0 "$keeper_pid" >/dev/null 2>&1; then
+  print -u2 -- "keeper ignored SIGTERM: pid=$keeper_pid"
+  exit 1
+fi
 print -r -- "keeper terminated without zombie: pid=$keeper_pid"
 keeper_pid=""

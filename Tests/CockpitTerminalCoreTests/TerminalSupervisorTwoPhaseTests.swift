@@ -320,8 +320,22 @@ private actor MemoryTerminalSessionRepository: TerminalSessionRepository {
         values.values.filter { [.preparing, .committed, .running].contains($0.lifecycleState) }
     }
 
+    func record(sessionID: TerminalSessionID) throws -> TerminalSessionRecord {
+        try require(sessionID)
+    }
+
     func records(contextID: WorkspaceContextID) -> [TerminalSessionRecord] {
         values.values.filter { $0.contextID == contextID }
+    }
+
+    func purgeFinishedRecords() -> Int {
+        let finished = values.values.filter {
+            [.exited, .terminated, .interrupted].contains($0.lifecycleState)
+        }
+        for record in finished {
+            values.removeValue(forKey: record.sessionID)
+        }
+        return finished.count
     }
 
     private func require(_ id: TerminalSessionID) throws -> TerminalSessionRecord {

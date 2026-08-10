@@ -4,6 +4,7 @@ import Testing
 import CockpitTypes
 import CockpitProtocol
 import CockpitHostCore
+import CockpitTerminalCore
 @testable import CockpitLocalTransport
 
 @Test func workspaceCommandUsesExplicitTagAndRejectsForbiddenFields() throws {
@@ -370,6 +371,585 @@ import CockpitHostCore
         )
     }
     #expect(!output.contains("SWIFT TASK CONTINUATION MISUSE"))
+}
+
+@Test func hostTerminalCreatePayloadOmitsWorkspaceRootAndHostAddsResolvedRoot() async throws {
+    let projectID = ProjectID()
+    let contextID = WorkspaceContextID.project(projectID)
+    let environmentID = EnvironmentID()
+    let intent = TerminalCreateRequest(
+        contextID: contextID,
+        environmentID: environmentID,
+        kind: .shell,
+        arguments: [],
+        terminalSize: try TerminalResize(validatingColumns: 100, rows: 30),
+        environmentOverrides: ["TERM": "xterm-256color"],
+        idempotencyKey: RequestID()
+    )
+    let wire = try JSONEncoder().encode(HostTerminalCommandRequest.create(intent))
+    let wireText = String(decoding: wire, as: UTF8.self)
+    #expect(!wireText.contains("workspaceRoot"))
+    #expect(!wireText.contains("/private/tmp/Cockpit"))
+
+    let supervisor = RecordingTerminalSupervisorControl()
+    let service = WorkspaceTerminalService(
+        resolveContext: { requested in
+            #expect(requested == contextID)
+            return try ResolvedWorkspaceContext(
+                validating: contextID,
+                projectID: projectID,
+                conversationID: nil,
+                environmentID: environmentID,
+                workspaceRootIdentity: "root-id"
+            )
+        },
+        resolveWorkspaceRoot: { _ in "/private/tmp/Cockpit" },
+        supervisor: supervisor
+    )
+
+    _ = try await service.perform(.create(intent))
+    #expect(await supervisor.created?.workspaceRoot == "/private/tmp/Cockpit")
+}
+
+@Test func hostTerminalResponsesRedactLaunchStateEndpointPathAndArchiveBytes() async throws {
+    let fixture = try WorkspaceFixture()
+    let contextID = fixture.projectContext.contextID
+    let environmentID = fixture.environmentID
+    let sessionID = TerminalSessionID()
+    let workerID = WorkerInstanceID()
+    let clientID = ClientInstanceID()
+    let viewerID = ViewerID(clientID.rawValue)
+    let secretRoot = "/private/tmp/Cockpit-Secret-Workspace"
+    let secretEndpoint = "/private/tmp/cockpit.501/terminal/secret-viewer.sock"
+    let launchSpec = try LaunchSpec(
+        kind: .shell,
+        loginShellPath: "/bin/zsh",
+        executablePath: "/bin/zsh",
+        arguments: [],
+        workspaceRoot: secretRoot,
+        terminalSize: try TerminalResize(validatingColumns: 100, rows: 30),
+        environmentOverrides: [:]
+    )
+    let record = try TerminalSessionRecord(
+        validatingSessionID: sessionID,
+        contextID: contextID,
+        environmentID: environmentID,
+        protocolVersion: .current,
+        launchSpecData: try JSONEncoder().encode(launchSpec),
+        lifecycleState: .running,
+        startNonce: Data(repeating: 0xA7, count: 16),
+        workerID: workerID,
+        processIdentity: try CLIProcessIdentity(validatingProcessID: 771, processGroupID: 771),
+        latestSequence: 9,
+        archiveManifest: try RelativeArchivePath(validating: "session/final.ckgf")
+    )
+    let authorization = TerminalAttachAuthorization(
+        endpoint: try KeeperEndpoint(
+            path: secretEndpoint,
+            sessionID: sessionID,
+            workerID: workerID
+        ),
+        wireTicket: String(repeating: "A", count: 43),
+        binding: TerminalAttachBinding(
+            sessionID: sessionID,
+            workerID: workerID,
+            clientInstanceID: clientID
+        ),
+        viewerID: viewerID,
+        capabilities: [.view]
+    )
+    let archiveURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cockpit-host-archive-\(UUID().uuidString)")
+    let archiveBytes = Data([0x43, 0x4B, 0x47, 0x46, 0x10, 0x20])
+    try archiveBytes.write(to: archiveURL)
+    defer { try? FileManager.default.removeItem(at: archiveURL) }
+
+    let supervisor = RecordingTerminalSupervisorControl()
+    await supervisor.setRecords([record])
+    await supervisor.setAuthorization(authorization)
+    await supervisor.setArchiveURL(archiveURL)
+    let terminalService = WorkspaceTerminalService(
+        resolveContext: { requested in
+            #expect(requested == contextID)
+            return fixture.projectContext
+        },
+        resolveWorkspaceRoot: { _ in secretRoot },
+        supervisor: supervisor
+    )
+    let workspace = RecordingWorkspaceService(fixture: fixture)
+    let exported = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(service: workspace),
+        workspaceTerminalService: terminalService
+    )
+    let create = TerminalCreateRequest(
+        contextID: contextID,
+        environmentID: environmentID,
+        kind: .shell,
+        arguments: [],
+        terminalSize: try TerminalResize(validatingColumns: 100, rows: 30),
+        environmentOverrides: [:],
+        idempotencyKey: RequestID()
+    )
+    let attach = TerminalAttachTicketRequest(
+        sessionID: sessionID,
+        clientInstanceID: clientID,
+        viewerID: viewerID,
+        capabilities: [.view]
+    )
+    let responseData = try await [
+        HostTerminalCommandRequest.create(create),
+        .list(contextID: contextID),
+        .issueAttachTicket(
+            contextID: contextID,
+            environmentID: environmentID,
+            request: attach
+        ),
+    ].asyncMap { try await terminalWireResponse($0, through: exported) }
+
+    for data in responseData {
+        let text = String(decoding: data, as: UTF8.self)
+        #expect(!text.contains("launchSpecData"))
+        #expect(!text.contains("startNonce"))
+        #expect(!text.contains(secretRoot))
+        #expect(!text.contains(secretEndpoint))
+        #expect(!text.contains("\"endpoint\""))
+    }
+
+    let archiveHandle: FileHandle = try await withCheckedThrowingContinuation { continuation in
+        exported.openTerminalArchive(
+            try! JSONEncoder().encode(
+                HostTerminalArchiveRequest(
+                    contextID: contextID,
+                    environmentID: environmentID,
+                    sessionID: sessionID
+                )
+            )
+        ) { handle, error in
+            if let error { continuation.resume(throwing: error) }
+            else if let handle { continuation.resume(returning: handle) }
+            else { continuation.resume(throwing: CocoaError(.coderInvalidValue)) }
+        }
+    }
+    #expect(try archiveHandle.readToEnd() == archiveBytes)
+    try archiveHandle.close()
+}
+
+@Test func hostTerminalServiceRejectsContextEnvironmentAndSessionMismatch() async throws {
+    let projectID = ProjectID()
+    let contextID = WorkspaceContextID.project(projectID)
+    let environmentID = EnvironmentID()
+    let otherEnvironment = EnvironmentID()
+    let supervisor = RecordingTerminalSupervisorControl()
+    let existing = try TerminalSessionRecord(
+        validatingSessionID: TerminalSessionID(),
+        contextID: contextID,
+        environmentID: environmentID,
+        protocolVersion: .current,
+        launchSpecData: Data([1]),
+        lifecycleState: .running,
+        startNonce: Data(repeating: 2, count: 16),
+        workerID: WorkerInstanceID(),
+        processIdentity: try CLIProcessIdentity(validatingProcessID: 777, processGroupID: 777)
+    )
+    await supervisor.setRecords([existing])
+    let service = WorkspaceTerminalService(
+        resolveContext: { _ in
+            try ResolvedWorkspaceContext(
+                validating: contextID,
+                projectID: projectID,
+                conversationID: nil,
+                environmentID: environmentID,
+                workspaceRootIdentity: "root-id"
+            )
+        },
+        resolveWorkspaceRoot: { _ in "/private/tmp/Cockpit" },
+        supervisor: supervisor
+    )
+
+    let mismatchedCreate = TerminalCreateRequest(
+        contextID: contextID,
+        environmentID: otherEnvironment,
+        kind: .shell,
+        arguments: [],
+        terminalSize: try TerminalResize(validatingColumns: 80, rows: 24),
+        environmentOverrides: [:],
+        idempotencyKey: RequestID()
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.contextEnvironmentMismatch) {
+        _ = try await service.perform(.create(mismatchedCreate))
+    }
+
+    let mismatchedReturnedSession = try TerminalSessionRecord(
+        validatingSessionID: TerminalSessionID(),
+        contextID: contextID,
+        environmentID: otherEnvironment,
+        protocolVersion: .current,
+        launchSpecData: Data([1]),
+        lifecycleState: .running,
+        startNonce: Data(repeating: 4, count: 16),
+        workerID: WorkerInstanceID(),
+        processIdentity: try CLIProcessIdentity(validatingProcessID: 778, processGroupID: 778)
+    )
+    await supervisor.setRecords([mismatchedReturnedSession])
+    await #expect(throws: WorkspaceTerminalServiceError.sessionBindingMismatch) {
+        _ = try await service.perform(.list(contextID: contextID))
+    }
+    let validCreate = TerminalCreateRequest(
+        contextID: contextID,
+        environmentID: environmentID,
+        kind: .shell,
+        arguments: [],
+        terminalSize: try TerminalResize(validatingColumns: 80, rows: 24),
+        environmentOverrides: [:],
+        idempotencyKey: RequestID()
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.sessionBindingMismatch) {
+        _ = try await service.perform(.create(validCreate))
+    }
+
+    await supervisor.setRecords([existing])
+    let attach = TerminalAttachTicketRequest(
+        sessionID: TerminalSessionID(),
+        clientInstanceID: ClientInstanceID(),
+        viewerID: ViewerID(),
+        capabilities: [.view]
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.sessionBindingMismatch) {
+        _ = try await service.perform(
+            .issueAttachTicket(
+                contextID: contextID,
+                environmentID: environmentID,
+                request: attach
+            )
+        )
+    }
+}
+
+@Test func hostTerminalServiceExactBindsResolverTicketAndLeaseResponses() async throws {
+    let projectID = ProjectID()
+    let contextID = WorkspaceContextID.project(projectID)
+    let environmentID = EnvironmentID()
+    let sessionID = TerminalSessionID()
+    let workerID = WorkerInstanceID()
+    let clientID = ClientInstanceID()
+    let viewerID = ViewerID(clientID.rawValue)
+    let record = try TerminalSessionRecord(
+        validatingSessionID: sessionID,
+        contextID: contextID,
+        environmentID: environmentID,
+        protocolVersion: .current,
+        launchSpecData: Data([1]),
+        lifecycleState: .running,
+        startNonce: Data(repeating: 7, count: 16),
+        workerID: workerID,
+        processIdentity: try CLIProcessIdentity(validatingProcessID: 881, processGroupID: 881)
+    )
+    let supervisor = RecordingTerminalSupervisorControl()
+    await supervisor.setRecords([record])
+    let service = WorkspaceTerminalService(
+        resolveContext: { _ in
+            try ResolvedWorkspaceContext(
+                validating: contextID,
+                projectID: projectID,
+                conversationID: nil,
+                environmentID: environmentID,
+                workspaceRootIdentity: "root-id"
+            )
+        },
+        resolveWorkspaceRoot: { _ in "/private/tmp/Cockpit" },
+        supervisor: supervisor
+    )
+
+    let unrelatedProject = ProjectID()
+    let mismatchedResolver = WorkspaceTerminalService(
+        resolveContext: { _ in
+            try ResolvedWorkspaceContext(
+                validating: .project(unrelatedProject),
+                projectID: unrelatedProject,
+                conversationID: nil,
+                environmentID: environmentID,
+                workspaceRootIdentity: "wrong-root"
+            )
+        },
+        resolveWorkspaceRoot: { _ in "/private/tmp/Cockpit" },
+        supervisor: supervisor
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.contextEnvironmentMismatch) {
+        _ = try await mismatchedResolver.perform(.list(contextID: contextID))
+    }
+
+    let independentViewer = ViewerID()
+    await supervisor.setAuthorization(
+        TerminalAttachAuthorization(
+            endpoint: try KeeperEndpoint(
+                path: "/private/tmp/cockpit-test/keeper.sock",
+                sessionID: sessionID,
+                workerID: workerID
+            ),
+            wireTicket: String(repeating: "A", count: 43),
+            binding: TerminalAttachBinding(
+                sessionID: sessionID,
+                workerID: workerID,
+                clientInstanceID: clientID
+            ),
+            viewerID: independentViewer,
+            capabilities: [.view]
+        )
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.invalidResponse) {
+        _ = try await service.perform(
+            .issueAttachTicket(
+                contextID: contextID,
+                environmentID: environmentID,
+                request: TerminalAttachTicketRequest(
+                    sessionID: sessionID,
+                    clientInstanceID: clientID,
+                    viewerID: independentViewer,
+                    capabilities: [.view]
+                )
+            )
+        )
+    }
+
+    let unrelatedWorker = WorkerInstanceID()
+    await supervisor.setAuthorization(
+        TerminalAttachAuthorization(
+            endpoint: try KeeperEndpoint(
+                path: "/private/tmp/cockpit-test/keeper.sock",
+                sessionID: sessionID,
+                workerID: unrelatedWorker
+            ),
+            wireTicket: String(repeating: "C", count: 43),
+            binding: TerminalAttachBinding(
+                sessionID: sessionID,
+                workerID: unrelatedWorker,
+                clientInstanceID: clientID
+            ),
+            viewerID: viewerID,
+            capabilities: [.view]
+        )
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.invalidResponse) {
+        _ = try await service.perform(
+            .issueAttachTicket(
+                contextID: contextID,
+                environmentID: environmentID,
+                request: TerminalAttachTicketRequest(
+                    sessionID: sessionID,
+                    clientInstanceID: clientID,
+                    viewerID: viewerID,
+                    capabilities: [.view]
+                )
+            )
+        )
+    }
+
+    await supervisor.setAuthorization(
+        TerminalAttachAuthorization(
+            endpoint: try KeeperEndpoint(
+                path: "/private/tmp/cockpit-test/keeper.sock",
+                sessionID: sessionID,
+                workerID: workerID
+            ),
+            wireTicket: String(repeating: "B", count: 43),
+            binding: TerminalAttachBinding(
+                sessionID: sessionID,
+                workerID: workerID,
+                clientInstanceID: ClientInstanceID()
+            ),
+            viewerID: viewerID,
+            capabilities: [.view, .input]
+        )
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.invalidResponse) {
+        _ = try await service.perform(
+            .issueAttachTicket(
+                contextID: contextID,
+                environmentID: environmentID,
+                request: TerminalAttachTicketRequest(
+                    sessionID: sessionID,
+                    clientInstanceID: clientID,
+                    viewerID: viewerID,
+                    capabilities: [.view]
+                )
+            )
+        )
+    }
+
+    await supervisor.setInputLease(
+        try InputLeaseGrant(
+            validatingLeaseID: InputLeaseID(),
+            holderViewerID: ViewerID(),
+            sequenceBase: 9,
+            capabilities: [.input, .resize]
+        )
+    )
+    await #expect(throws: WorkspaceTerminalServiceError.invalidResponse) {
+        _ = try await service.perform(
+            .acquireInputLease(
+                contextID: contextID,
+                environmentID: environmentID,
+                request: TerminalInputLeaseRequest(
+                    sessionID: sessionID,
+                    viewerID: viewerID,
+                    capabilities: [.input]
+                )
+            )
+        )
+    }
+
+    let oldLeaseID = InputLeaseID()
+    let transferredLease = try InputLeaseGrant(
+        validatingLeaseID: InputLeaseID(),
+        holderViewerID: viewerID,
+        sequenceBase: 10,
+        capabilities: [.input]
+    )
+    await supervisor.setInputLease(transferredLease)
+    let transfer = try await service.perform(
+        .transferInputLease(
+            contextID: contextID,
+            environmentID: environmentID,
+            request: TerminalInputLeaseTransferRequest(
+                sessionID: sessionID,
+                leaseID: oldLeaseID,
+                toViewerID: viewerID,
+                capabilities: [.input]
+            )
+        )
+    )
+    #expect(transfer == .inputLease(transferredLease))
+}
+
+@Test func hostTerminalXPCSanitizesCommandAndArchiveErrors() async throws {
+    let fixture = try WorkspaceFixture()
+    let secretPath = "/private/tmp/Cockpit-Secret-Workspace/private.ckgf"
+    let injected = NSError(
+        domain: NSCocoaErrorDomain,
+        code: NSFileReadNoSuchFileError,
+        userInfo: [NSFilePathErrorKey: secretPath, NSURLErrorKey: URL(fileURLWithPath: secretPath)]
+    )
+    let terminalService = WorkspaceTerminalService(
+        resolveContext: { _ in throw injected },
+        resolveWorkspaceRoot: { _ in throw injected },
+        supervisor: RecordingTerminalSupervisorControl()
+    )
+    let export = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(service: RecordingWorkspaceService(fixture: fixture)),
+        workspaceTerminalService: terminalService
+    )
+
+    let commandError: NSError = await withCheckedContinuation { continuation in
+        export.terminalCommand(
+            try! JSONEncoder().encode(
+                HostTerminalCommandRequest.list(contextID: fixture.projectContext.contextID)
+            )
+        ) { _, error in continuation.resume(returning: error!) }
+    }
+    let archiveError: NSError = await withCheckedContinuation { continuation in
+        export.openTerminalArchive(
+            try! JSONEncoder().encode(
+                HostTerminalArchiveRequest(
+                    contextID: fixture.projectContext.contextID,
+                    environmentID: fixture.environmentID,
+                    sessionID: TerminalSessionID()
+                )
+            )
+        ) { _, error in continuation.resume(returning: error!) }
+    }
+
+    for error in [commandError, archiveError] {
+        #expect(error.domain == "dev.cockpit.host-terminal")
+        #expect(error.userInfo.isEmpty)
+        #expect(!error.description.contains(secretPath))
+    }
+}
+
+private actor RecordingTerminalSupervisorControl: TerminalSupervisorControlling {
+    private(set) var created: ResolvedTerminalCreateRequest?
+    private var records: [TerminalSessionRecord] = []
+    private var authorization: TerminalAttachAuthorization?
+    private var inputLease: InputLeaseGrant?
+    private var archiveURL: URL?
+
+    func setRecords(_ records: [TerminalSessionRecord]) { self.records = records }
+    func setAuthorization(_ authorization: TerminalAttachAuthorization) {
+        self.authorization = authorization
+    }
+    func setInputLease(_ inputLease: InputLeaseGrant) { self.inputLease = inputLease }
+    func setArchiveURL(_ archiveURL: URL) { self.archiveURL = archiveURL }
+    func createResolved(_ request: ResolvedTerminalCreateRequest) async throws -> TerminalSessionRecord {
+        created = request
+        if let first = records.first { return first }
+        return try TerminalSessionRecord(
+            validatingSessionID: TerminalSessionID(),
+            contextID: request.contextID,
+            environmentID: request.environmentID,
+            protocolVersion: .current,
+            launchSpecData: Data([1]),
+            lifecycleState: .preparing,
+            startNonce: Data(repeating: 3, count: 16)
+        )
+    }
+    func list(contextID: WorkspaceContextID) async throws -> [TerminalSessionRecord] { records }
+    func issueAttachTicket(_ request: TerminalAttachTicketRequest) async throws -> TerminalAttachAuthorization {
+        guard let authorization else { throw CocoaError(.featureUnsupported) }
+        return authorization
+    }
+    func acquireInputLease(_ request: TerminalInputLeaseRequest) async throws -> InputLeaseGrant {
+        guard let inputLease else { throw CocoaError(.featureUnsupported) }
+        return inputLease
+    }
+    func transferInputLease(_ request: TerminalInputLeaseTransferRequest) async throws -> InputLeaseGrant {
+        guard let inputLease else { throw CocoaError(.featureUnsupported) }
+        return inputLease
+    }
+    func releaseInputLease(sessionID: TerminalSessionID, leaseID: InputLeaseID) async throws {}
+    func signal(
+        sessionID: TerminalSessionID,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        signal: TerminalSignal
+    ) async throws -> Int32 { 0 }
+    func terminate(
+        sessionID: TerminalSessionID,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        force: Bool
+    ) async throws {}
+    func purgeFinishedRecords() async throws -> Int { 0 }
+    func reconcile() async throws {}
+    func openArchive(sessionID: TerminalSessionID) async throws -> FileHandle {
+        guard let archiveURL else {
+            return try FileHandle(forReadingFrom: URL(fileURLWithPath: "/dev/null"))
+        }
+        return try FileHandle(forReadingFrom: archiveURL)
+    }
+}
+
+private func terminalWireResponse(
+    _ request: HostTerminalCommandRequest,
+    through export: HostXPCExport
+) async throws -> Data {
+    let encoded = try JSONEncoder().encode(request)
+    return try await withCheckedThrowingContinuation { continuation in
+        export.terminalCommand(encoded) { data, error in
+            if let error { continuation.resume(throwing: error) }
+            else if let data { continuation.resume(returning: data) }
+            else { continuation.resume(throwing: CocoaError(.coderInvalidValue)) }
+        }
+    }
+}
+
+private extension Sequence {
+    func asyncMap<T>(_ transform: (Element) async throws -> T) async rethrows -> [T] {
+        var result: [T] = []
+        result.reserveCapacity(underestimatedCount)
+        for element in self { result.append(try await transform(element)) }
+        return result
+    }
 }
 
 private func route(

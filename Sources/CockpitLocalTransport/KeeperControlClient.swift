@@ -12,11 +12,29 @@ enum KeeperControlEnvelope: Hashable, Codable, Sendable {
     case identity(KeeperIdentity)
     case started(CLIProcessIdentity)
     case acknowledged
-    case registerAttachTicket(TerminalAttachTicketRegistration)
-    case registerInputLease(InputLeaseGrant)
-    case revokeInputLease(InputLeaseID)
-    case takeLeaseRevocations
-    case leaseRevocations([InputLeaseID])
+    case registerAttachTicket(TerminalAttachTicketRegistration, supervisorGeneration: UUID)
+    case registerInputLease(InputLeaseGrant, supervisorGeneration: UUID)
+    case transferInputLease(
+        from: InputLeaseID,
+        to: InputLeaseGrant,
+        supervisorGeneration: UUID
+    )
+    case revokeInputLease(InputLeaseID, supervisorGeneration: UUID)
+    case synchronizeSupervisor(KeeperSupervisorSyncRequest)
+    case supervisorSynchronized(KeeperSupervisorSyncResponse)
+    case signalForeground(
+        TerminalSignal,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        supervisorGeneration: UUID
+    )
+    case foregroundSignaled(Int32)
+    case terminateAuthorized(
+        Bool,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        supervisorGeneration: UUID
+    )
     case failure(KeeperControlWireError)
 }
 
@@ -26,16 +44,26 @@ enum KeeperControlWireError: String, Hashable, Codable, Sendable {
     case startRequestMismatch
     case malformedMessage
     case noRunningProcess
+    case leaseHeld
+    case invalidInputLease
+    case nonMonotonicInputSequence
+    case capabilityDenied
+    case viewerNotAttached
     case internalFailure
 
-    var error: KeeperControlError {
+    var error: any Error {
         switch self {
-        case .authenticationFailed: .authenticationFailed
-        case .identityMismatch: .identityMismatch
-        case .startRequestMismatch: .startRequestMismatch
-        case .malformedMessage: .malformedMessage
-        case .noRunningProcess: .noRunningProcess
-        case .internalFailure: .disconnected
+        case .authenticationFailed: KeeperControlError.authenticationFailed
+        case .identityMismatch: KeeperControlError.identityMismatch
+        case .startRequestMismatch: KeeperControlError.startRequestMismatch
+        case .malformedMessage: KeeperControlError.malformedMessage
+        case .noRunningProcess: KeeperControlError.noRunningProcess
+        case .leaseHeld: TerminalStreamError.leaseHeld
+        case .invalidInputLease: TerminalStreamError.invalidInputLease
+        case .nonMonotonicInputSequence: TerminalStreamError.nonMonotonicInputSequence
+        case .capabilityDenied: TerminalStreamError.capabilityDenied
+        case .viewerNotAttached: TerminalStreamError.viewerNotAttached
+        case .internalFailure: KeeperControlError.disconnected
         }
     }
 }
@@ -278,12 +306,16 @@ public actor KeeperControlClient: KeeperControlling {
 
     public func registerAttachTicket(
         _ registration: TerminalAttachTicketRegistration,
+        supervisorGeneration: UUID,
         at endpoint: KeeperEndpoint
     ) async throws {
         try validate(endpoint: endpoint)
         _ = try await requestOverUDS(
             endpoint: endpoint,
-            request: .registerAttachTicket(registration)
+            request: .registerAttachTicket(
+                registration,
+                supervisorGeneration: supervisorGeneration
+            )
         ) { envelope -> Bool in
             if case .acknowledged = envelope { return true }
             throw Self.responseError(envelope)
@@ -292,12 +324,16 @@ public actor KeeperControlClient: KeeperControlling {
 
     public func registerInputLease(
         _ grant: InputLeaseGrant,
+        supervisorGeneration: UUID,
         at endpoint: KeeperEndpoint
     ) async throws {
         try validate(endpoint: endpoint)
         _ = try await requestOverUDS(
             endpoint: endpoint,
-            request: .registerInputLease(grant)
+            request: .registerInputLease(
+                grant,
+                supervisorGeneration: supervisorGeneration
+            )
         ) { envelope -> Bool in
             if case .acknowledged = envelope { return true }
             throw Self.responseError(envelope)
@@ -306,25 +342,96 @@ public actor KeeperControlClient: KeeperControlling {
 
     public func revokeInputLease(
         _ leaseID: InputLeaseID,
+        supervisorGeneration: UUID,
         at endpoint: KeeperEndpoint
     ) async throws {
         try validate(endpoint: endpoint)
         _ = try await requestOverUDS(
             endpoint: endpoint,
-            request: .revokeInputLease(leaseID)
+            request: .revokeInputLease(
+                leaseID,
+                supervisorGeneration: supervisorGeneration
+            )
         ) { envelope -> Bool in
             if case .acknowledged = envelope { return true }
             throw Self.responseError(envelope)
         }
     }
 
-    public func takeLeaseRevocations(at endpoint: KeeperEndpoint) async throws -> [InputLeaseID] {
+    public func transferInputLease(
+        from leaseID: InputLeaseID,
+        to grant: InputLeaseGrant,
+        supervisorGeneration: UUID,
+        at endpoint: KeeperEndpoint
+    ) async throws {
+        try validate(endpoint: endpoint)
+        _ = try await requestOverUDS(
+            endpoint: endpoint,
+            request: .transferInputLease(
+                from: leaseID,
+                to: grant,
+                supervisorGeneration: supervisorGeneration
+            )
+        ) { envelope -> Bool in
+            if case .acknowledged = envelope { return true }
+            throw Self.responseError(envelope)
+        }
+    }
+
+    public func synchronizeSupervisor(
+        _ request: KeeperSupervisorSyncRequest,
+        at endpoint: KeeperEndpoint
+    ) async throws -> KeeperSupervisorSyncResponse {
         try validate(endpoint: endpoint)
         return try await requestOverUDS(
             endpoint: endpoint,
-            request: .takeLeaseRevocations
+            request: .synchronizeSupervisor(request)
         ) { envelope in
-            if case let .leaseRevocations(values) = envelope { return values }
+            if case let .supervisorSynchronized(value) = envelope { return value }
+            throw Self.responseError(envelope)
+        }
+    }
+
+    public func signalForeground(
+        _ signal: TerminalSignal,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        supervisorGeneration: UUID,
+        at endpoint: KeeperEndpoint
+    ) async throws -> Int32 {
+        try validate(endpoint: endpoint)
+        return try await requestOverUDS(
+            endpoint: endpoint,
+            request: .signalForeground(
+                signal,
+                viewerID: viewerID,
+                leaseID: leaseID,
+                supervisorGeneration: supervisorGeneration
+            )
+        ) { envelope in
+            if case let .foregroundSignaled(group) = envelope { return group }
+            throw Self.responseError(envelope)
+        }
+    }
+
+    public func terminateAuthorized(
+        force: Bool,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        supervisorGeneration: UUID,
+        at endpoint: KeeperEndpoint
+    ) async throws {
+        try validate(endpoint: endpoint)
+        _ = try await requestOverUDS(
+            endpoint: endpoint,
+            request: .terminateAuthorized(
+                force,
+                viewerID: viewerID,
+                leaseID: leaseID,
+                supervisorGeneration: supervisorGeneration
+            )
+        ) { envelope -> Bool in
+            if case .acknowledged = envelope { return true }
             throw Self.responseError(envelope)
         }
     }

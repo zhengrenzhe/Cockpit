@@ -52,15 +52,18 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
     private let handshakeHandler: HandshakeHandler
     private let workspaceRouter: WorkspaceCommandRouter
     private let hostDataPlaneTicketIssuer: HostDataPlaneTicketIssuer?
+    private let workspaceTerminalService: WorkspaceTerminalService?
 
     public init(
         handshakeHandler: @escaping HandshakeHandler,
         workspaceRouter: WorkspaceCommandRouter,
-        hostDataPlaneTicketIssuer: HostDataPlaneTicketIssuer? = nil
+        hostDataPlaneTicketIssuer: HostDataPlaneTicketIssuer? = nil,
+        workspaceTerminalService: WorkspaceTerminalService? = nil
     ) {
         self.handshakeHandler = handshakeHandler
         self.workspaceRouter = workspaceRouter
         self.hostDataPlaneTicketIssuer = hostDataPlaneTicketIssuer
+        self.workspaceTerminalService = workspaceTerminalService
     }
 
     public func issueHostDataPlaneTicket(
@@ -123,10 +126,81 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
             }
         }
     }
+
+    public func terminalCommand(
+        _ request: Data,
+        withReply reply: @escaping (Data?, NSError?) -> Void
+    ) {
+        let reply = XPCWorkspaceReply(reply)
+        guard let workspaceTerminalService else {
+            reply.complete(data: nil, error: terminalError(code: 2))
+            return
+        }
+        let command: HostTerminalCommandRequest
+        do {
+            command = try JSONDecoder().decode(HostTerminalCommandRequest.self, from: request)
+        } catch {
+            reply.complete(data: nil, error: terminalError(code: 1))
+            return
+        }
+        Task {
+            do {
+                reply.complete(
+                    data: try JSONEncoder().encode(
+                        try await workspaceTerminalService.perform(command)
+                    ),
+                    error: nil
+                )
+            } catch {
+                reply.complete(data: nil, error: terminalError(code: 3))
+            }
+        }
+    }
+
+    public func openTerminalArchive(
+        _ request: Data,
+        withReply reply: @escaping (FileHandle?, NSError?) -> Void
+    ) {
+        let reply = XPCFileReply(reply)
+        guard let workspaceTerminalService else {
+            reply.complete(handle: nil, error: terminalError(code: 2))
+            return
+        }
+        let decoded: HostTerminalArchiveRequest
+        do { decoded = try JSONDecoder().decode(HostTerminalArchiveRequest.self, from: request) }
+        catch { reply.complete(handle: nil, error: terminalError(code: 1)); return }
+        Task {
+            do {
+                reply.complete(
+                    handle: try await workspaceTerminalService.openArchive(decoded),
+                    error: nil
+                )
+            } catch { reply.complete(handle: nil, error: terminalError(code: 3)) }
+        }
+    }
+}
+
+private final class XPCFileReply: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callback: ((FileHandle?, NSError?) -> Void)?
+
+    init(_ callback: @escaping (FileHandle?, NSError?) -> Void) { self.callback = callback }
+
+    func complete(handle: FileHandle?, error: NSError?) {
+        let callback = lock.withLock {
+            defer { self.callback = nil }
+            return self.callback
+        }
+        callback?(handle, error)
+    }
 }
 
 private func ticketError(code: Int) -> NSError {
     NSError(domain: "dev.cockpit.host-data-plane-ticket", code: code, userInfo: [:])
+}
+
+private func terminalError(code: Int) -> NSError {
+    NSError(domain: "dev.cockpit.host-terminal", code: code, userInfo: [:])
 }
 
 private func exactTicketRequestContext(_ wire: CPRequestContext) throws -> RequestContext {

@@ -4,7 +4,11 @@ import CockpitTypes
 public actor TerminalStreamCoordinator {
     public typealias InputHandler = @Sendable (TerminalInput.Payload) async throws -> Void
     public typealias ResetInputStateHandler = @Sendable () async -> Void
-    public typealias LeaseRevokedHandler = @Sendable (InputLeaseID) async -> Void
+    public typealias LeaseRevokedHandler = @Sendable (
+        InputLeaseGrant,
+        UInt64
+    ) async -> Void
+    public typealias TicketConsumedHandler = @Sendable (Data) async -> Void
     public typealias SignalHandler = @Sendable (TerminalSignal) async throws -> Int32
     public typealias TerminateHandler = @Sendable (Bool) async throws -> Void
 
@@ -24,14 +28,18 @@ public actor TerminalStreamCoordinator {
     private let performInput: InputHandler
     private let resetInputState: ResetInputStateHandler
     private let reportLeaseRevoked: LeaseRevokedHandler
+    private let reportTicketConsumed: TicketConsumedHandler
     private let signalForeground: SignalHandler
     private let terminateSession: TerminateHandler
     private let operationGate = TerminalStreamOperationGate()
     private var viewers: [ViewerID: ViewerState] = [:]
     private var lease: LeaseState?
+    private var supervisorGeneration: UUID?
+    private var supervisorEpoch: UInt64?
+    private var nextInputSequence: UInt64 = 1
     private var latestOutputSequence: UInt64 = 0
+    private var latestSnapshot: TerminalOutputFrame?
     private var retainedFrames: [TerminalOutputFrame] = []
-    private let retainedFrameLimit = 256
 
     public init(
         sessionID: TerminalSessionID,
@@ -40,6 +48,7 @@ public actor TerminalStreamCoordinator {
         performInput: @escaping InputHandler,
         resetInputState: @escaping ResetInputStateHandler,
         reportLeaseRevoked: @escaping LeaseRevokedHandler,
+        reportTicketConsumed: @escaping TicketConsumedHandler = { _ in },
         signalForeground: @escaping SignalHandler,
         terminateSession: @escaping TerminateHandler
     ) {
@@ -49,6 +58,7 @@ public actor TerminalStreamCoordinator {
         self.performInput = performInput
         self.resetInputState = resetInputState
         self.reportLeaseRevoked = reportLeaseRevoked
+        self.reportTicketConsumed = reportTicketConsumed
         self.signalForeground = signalForeground
         self.terminateSession = terminateSession
     }
@@ -56,6 +66,22 @@ public actor TerminalStreamCoordinator {
     public func registerAttachTicket(_ registration: TerminalAttachTicketRegistration) async throws {
         await operationGate.acquire()
         defer { operationGate.release() }
+        try await registerAttachTicketLocked(registration)
+    }
+
+    package func registerAttachTicket(
+        _ registration: TerminalAttachTicketRegistration,
+        supervisorGeneration: UUID
+    ) async throws {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
+        try await registerAttachTicketLocked(registration)
+    }
+
+    private func registerAttachTicketLocked(
+        _ registration: TerminalAttachTicketRegistration
+    ) async throws {
         guard registration.binding.sessionID == sessionID,
               registration.binding.workerID == workerID else {
             throw TerminalAttachTicketError.bindingMismatch
@@ -80,6 +106,7 @@ public actor TerminalStreamCoordinator {
             binding: request.binding,
             capabilities: request.requestedCapabilities
         )
+        await reportTicketConsumed(registration.ticketDigest)
         guard viewers[request.viewerID] == nil else {
             throw TerminalStreamError.viewerAlreadyAttached
         }
@@ -96,16 +123,18 @@ public actor TerminalStreamCoordinator {
             }
             if acknowledged == latestOutputSequence {
                 pending = []
-            } else if let first = retainedFrames.first,
-                      acknowledged >= first.firstOutputSequence - 1 {
+            } else if let snapshot = latestSnapshot,
+                      acknowledged >= snapshot.outputSequence {
                 pending = retainedFrames.filter { $0.outputSequence > acknowledged }
             } else {
-                pending = Array(retainedFrames.suffix(1))
+                pending = retainedFrames
             }
         } else {
-            pending = Array(retainedFrames.suffix(1))
+            pending = retainedFrames
         }
-        for frame in pending { await queue.enqueue(frame) }
+        for frame in pending {
+            await queue.enqueue(frame)
+        }
         return Attachment(
             viewerID: request.viewerID,
             capabilities: request.requestedCapabilities.intersection(registration.capabilities),
@@ -126,6 +155,55 @@ public actor TerminalStreamCoordinator {
     public func registerInputLease(_ grant: InputLeaseGrant) async throws {
         await operationGate.acquire()
         defer { operationGate.release() }
+        try await registerInputLeaseLocked(grant)
+    }
+
+    package func registerInputLease(
+        _ grant: InputLeaseGrant,
+        supervisorGeneration: UUID
+    ) async throws {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
+        try await registerInputLeaseLocked(grant)
+    }
+
+    package func transferInputLease(
+        from leaseID: InputLeaseID,
+        to grant: InputLeaseGrant,
+        supervisorGeneration: UUID
+    ) async throws {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
+        let valid = try validatedInputLeaseGrant(grant)
+        guard let previous = lease,
+              previous.grant.leaseID == leaseID,
+              valid.leaseID != leaseID else {
+            throw TerminalStreamError.invalidInputLease
+        }
+        lease = LeaseState(grant: valid, nextSequence: valid.sequenceBase)
+        nextInputSequence = valid.sequenceBase
+        await reportLeaseRevoked(previous.grant, previous.nextSequence)
+        await resetInputState()
+    }
+
+    private func registerInputLeaseLocked(_ grant: InputLeaseGrant) async throws {
+        let valid = try validatedInputLeaseGrant(grant)
+        if let current = lease {
+            guard current.grant == valid else {
+                throw TerminalStreamError.leaseHeld
+            }
+            return
+        }
+        lease = LeaseState(grant: valid, nextSequence: valid.sequenceBase)
+        nextInputSequence = valid.sequenceBase
+        await resetInputState()
+    }
+
+    private func validatedInputLeaseGrant(
+        _ grant: InputLeaseGrant
+    ) throws -> InputLeaseGrant {
         let valid = try InputLeaseGrant(
             validatingLeaseID: grant.leaseID,
             holderViewerID: grant.holderViewerID,
@@ -138,21 +216,26 @@ public actor TerminalStreamCoordinator {
         guard valid.capabilities.isSubset(of: holder.capabilities) else {
             throw TerminalStreamError.capabilityDenied
         }
-        if let current = lease,
-           current.grant == valid {
-            return
+        guard valid.sequenceBase >= nextInputSequence else {
+            throw TerminalStreamError.nonMonotonicInputSequence
         }
-        if let previous = lease {
-            lease = nil
-            await reportLeaseRevoked(previous.grant.leaseID)
-        }
-        lease = LeaseState(grant: valid, nextSequence: valid.sequenceBase)
-        await resetInputState()
+        return valid
     }
 
     public func revokeInputLease(_ leaseID: InputLeaseID) async {
         await operationGate.acquire()
         defer { operationGate.release() }
+        guard lease?.grant.leaseID == leaseID else { return }
+        await invalidateCurrentLease(report: true)
+    }
+
+    package func revokeInputLease(
+        _ leaseID: InputLeaseID,
+        supervisorGeneration: UUID
+    ) async throws {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
         guard lease?.grant.leaseID == leaseID else { return }
         await invalidateCurrentLease(report: true)
     }
@@ -198,45 +281,162 @@ public actor TerminalStreamCoordinator {
             throw error
         }
         current.nextSequence += 1
+        nextInputSequence = current.nextSequence
         lease = current
         return frame.inputSequence
     }
 
-    public func signal(_ signal: TerminalSignal, viewerID: ViewerID) async throws -> Int32 {
+    public func signal(
+        _ signal: TerminalSignal,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID
+    ) async throws -> Int32 {
         await operationGate.acquire()
         defer { operationGate.release() }
         guard let viewer = viewers[viewerID] else { throw TerminalStreamError.viewerNotAttached }
-        guard viewer.capabilities.contains(.signal) else { throw TerminalStreamError.capabilityDenied }
+        guard viewer.capabilities.contains(.signal),
+              let lease,
+              lease.grant.leaseID == leaseID,
+              lease.grant.holderViewerID == viewerID,
+              lease.grant.capabilities.contains(.signal) else {
+            throw TerminalStreamError.capabilityDenied
+        }
         return try await signalForeground(signal)
     }
 
-    public func terminate(force: Bool, viewerID: ViewerID) async throws {
+    package func signal(
+        _ signal: TerminalSignal,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        supervisorGeneration: UUID
+    ) async throws -> Int32 {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
+        guard let viewer = viewers[viewerID] else { throw TerminalStreamError.viewerNotAttached }
+        guard viewer.capabilities.contains(.signal),
+              let lease,
+              lease.grant.leaseID == leaseID,
+              lease.grant.holderViewerID == viewerID,
+              lease.grant.capabilities.contains(.signal) else {
+            throw TerminalStreamError.capabilityDenied
+        }
+        return try await signalForeground(signal)
+    }
+
+    public func terminate(
+        force: Bool,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID
+    ) async throws {
         await operationGate.acquire()
         defer { operationGate.release() }
         guard let viewer = viewers[viewerID] else { throw TerminalStreamError.viewerNotAttached }
-        guard viewer.capabilities.contains(.terminate) else { throw TerminalStreamError.capabilityDenied }
+        guard viewer.capabilities.contains(.terminate),
+              let lease,
+              lease.grant.leaseID == leaseID,
+              lease.grant.holderViewerID == viewerID,
+              lease.grant.capabilities.contains(.terminate) else {
+            throw TerminalStreamError.capabilityDenied
+        }
         try await terminateSession(force)
     }
 
-    public func publish(outputSequence: UInt64, frame: Data) async {
+    package func terminate(
+        force: Bool,
+        viewerID: ViewerID,
+        leaseID: InputLeaseID,
+        supervisorGeneration: UUID
+    ) async throws {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
+        guard let viewer = viewers[viewerID] else { throw TerminalStreamError.viewerNotAttached }
+        guard viewer.capabilities.contains(.terminate),
+              let lease,
+              lease.grant.leaseID == leaseID,
+              lease.grant.holderViewerID == viewerID,
+              lease.grant.capabilities.contains(.terminate) else {
+            throw TerminalStreamError.capabilityDenied
+        }
+        try await terminateSession(force)
+    }
+
+    public func publish(
+        outputSequence: UInt64,
+        kind: TerminalStreamFrameKind = .snapshot,
+        frame: Data
+    ) async {
         await operationGate.acquire()
         defer { operationGate.release() }
         guard outputSequence > latestOutputSequence,
               let output = try? TerminalOutputFrame(
                 firstOutputSequence: outputSequence,
                 outputSequence: outputSequence,
+                kind: kind,
                 fragments: [frame]
               )
         else { return }
-        latestOutputSequence = outputSequence
-        retainedFrames.append(output)
-        if retainedFrames.count > retainedFrameLimit {
-            retainedFrames.removeFirst(retainedFrames.count - retainedFrameLimit)
+        switch kind {
+        case .snapshot:
+            latestSnapshot = output
+            retainedFrames = [output]
+        case .delta:
+            let (expected, overflow) = latestOutputSequence.addingReportingOverflow(1)
+            guard !overflow,
+                  outputSequence == expected,
+                  latestSnapshot != nil,
+                  retainedFrames.last?.kind == .snapshot else { return }
+            retainedFrames.append(output)
+        case .scrollback:
+            break
         }
-        for viewer in viewers.values { await viewer.queue.enqueue(output) }
+        latestOutputSequence = outputSequence
+        for viewer in viewers.values {
+            await viewer.queue.enqueue(output)
+        }
     }
 
     public func activeViewerCount() -> Int { viewers.count }
+
+    package func supervisorInputLeaseSnapshot(
+        supervisorGeneration: UUID
+    ) async throws -> KeeperSupervisorLeaseSnapshot {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        try requireSupervisorGeneration(supervisorGeneration)
+        return try supervisorInputLeaseSnapshotLocked()
+    }
+
+    private func supervisorInputLeaseSnapshotLocked() throws -> KeeperSupervisorLeaseSnapshot {
+        let current = lease.flatMap {
+            try? KeeperInputLeaseState(grant: $0.grant, nextSequence: $0.nextSequence)
+        }
+        return try KeeperSupervisorLeaseSnapshot(
+            currentLease: current,
+            nextInputSequence: nextInputSequence
+        )
+    }
+
+    package func beginSupervisorGeneration(
+        _ generation: UUID,
+        events: InputLeaseRevocationBuffer
+    ) async throws -> Bool {
+        await operationGate.acquire()
+        defer { operationGate.release() }
+        guard supervisorGeneration != generation else { return false }
+        let incoming = try KeeperSupervisorGeneration(validating: generation)
+        guard supervisorEpoch == nil || incoming.epoch > supervisorEpoch! else {
+            throw KeeperControlError.identityMismatch
+        }
+        let changed = try await events.beginSupervisorGeneration(generation)
+        if changed {
+            await attachTicketPolicy.invalidateAll()
+        }
+        supervisorGeneration = generation
+        supervisorEpoch = incoming.epoch
+        return changed
+    }
 
     public func nextOutput(viewerID: ViewerID) async throws -> TerminalOutputFrame? {
         await operationGate.acquire()
@@ -251,8 +451,15 @@ public actor TerminalStreamCoordinator {
     private func invalidateCurrentLease(report: Bool) async {
         guard let previous = lease else { return }
         lease = nil
+        nextInputSequence = previous.nextSequence
         await resetInputState()
-        if report { await reportLeaseRevoked(previous.grant.leaseID) }
+        if report { await reportLeaseRevoked(previous.grant, previous.nextSequence) }
+    }
+
+    private func requireSupervisorGeneration(_ generation: UUID) throws {
+        guard supervisorGeneration == generation else {
+            throw KeeperControlError.identityMismatch
+        }
     }
 
     private static func requiredCapability(
@@ -309,14 +516,7 @@ private actor TerminalViewerFrameQueue {
             waiter.resume(returning: frame)
             return
         }
-        if buffered.count < 2 {
-            buffered.append(frame)
-        } else {
-            buffered = [
-                TerminalOutputFrame.coalescing(buffered[0], buffered[1]),
-                frame,
-            ]
-        }
+        TerminalOutputFrame.enqueueBounded(frame, into: &buffered)
     }
 
     func next() async -> TerminalOutputFrame? {

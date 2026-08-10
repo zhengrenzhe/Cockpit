@@ -76,6 +76,19 @@ public final class TerminalArchiveReadHandle: @unchecked Sendable {
         }
     }
 
+    public func makeFileHandle() throws -> FileHandle {
+        try lock.withLock {
+            guard descriptor >= 0 else {
+                throw TerminalArchiveError.io(operation: "dup", errno: EBADF)
+            }
+            let duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+            guard duplicate >= 0 else {
+                throw TerminalArchiveError.io(operation: "dup", errno: errno)
+            }
+            return FileHandle(fileDescriptor: duplicate, closeOnDealloc: true)
+        }
+    }
+
     deinit {
         lock.withLock {
             if descriptor >= 0 { _ = Darwin.close(descriptor) }

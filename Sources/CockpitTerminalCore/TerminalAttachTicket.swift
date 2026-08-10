@@ -100,6 +100,28 @@ public struct IssuedTerminalAttachTicket: Hashable, Sendable {
     }
 }
 
+public struct TerminalAttachAuthorization: Hashable, Codable, Sendable {
+    public let endpoint: KeeperEndpoint
+    public let wireTicket: String
+    public let binding: TerminalAttachBinding
+    public let viewerID: ViewerID
+    public let capabilities: TerminalAttachCapabilities
+
+    public init(
+        endpoint: KeeperEndpoint,
+        wireTicket: String,
+        binding: TerminalAttachBinding,
+        viewerID: ViewerID,
+        capabilities: TerminalAttachCapabilities
+    ) {
+        self.endpoint = endpoint
+        self.wireTicket = wireTicket
+        self.binding = binding
+        self.viewerID = viewerID
+        self.capabilities = capabilities
+    }
+}
+
 public enum TerminalAttachTicketError: Error, Equatable, Sendable {
     case randomGenerationFailed
     case invalidCanonicalTicket
@@ -227,10 +249,14 @@ public actor TerminalAttachTicketStore: AttachTicketPolicy {
         if replayTombstones[ticketDigest] != nil {
             return
         }
-        guard let registration = registrations.removeValue(forKey: ticketDigest) else {
-            throw TerminalAttachTicketError.invalidCanonicalTicket
-        }
+        guard let registration = registrations.removeValue(forKey: ticketDigest) else { return }
         replayTombstones[ticketDigest] = registration.expiresAt
+    }
+
+    @_spi(CockpitTerminalSupervisorComposition)
+    public func discardIssuedRegistration(ticketDigest: Data) {
+        guard ticketDigest.count == 32 else { return }
+        registrations.removeValue(forKey: ticketDigest)
     }
 
     public func invalidateAll() {

@@ -3770,6 +3770,12 @@ private final class BlockingHostDataPlaneTicketProxy: NSObject, HostXPCProtocol,
     ) {
         reply(nil, CocoaError(.coderInvalidValue) as NSError)
     }
+    func terminalCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        reply(nil, CocoaError(.coderInvalidValue) as NSError)
+    }
+    func openTerminalArchive(_ request: Data, withReply reply: @escaping (FileHandle?, NSError?) -> Void) {
+        reply(nil, CocoaError(.featureUnsupported) as NSError)
+    }
 }
 
 private final class FixedHostDataPlaneTicketProxy: NSObject, HostXPCProtocol, @unchecked Sendable {
@@ -3795,6 +3801,12 @@ private final class FixedHostDataPlaneTicketProxy: NSObject, HostXPCProtocol, @u
     }
     func workspaceCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
         reply(nil, CocoaError(.coderInvalidValue) as NSError)
+    }
+    func terminalCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        reply(nil, CocoaError(.coderInvalidValue) as NSError)
+    }
+    func openTerminalArchive(_ request: Data, withReply reply: @escaping (FileHandle?, NSError?) -> Void) {
+        reply(nil, CocoaError(.featureUnsupported) as NSError)
     }
 }
 
@@ -3824,6 +3836,12 @@ private final class SwitchingHostDataPlaneTicketProxy: NSObject, HostXPCProtocol
     }
     func workspaceCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
         lock.withLock { export }.workspaceCommand(request, withReply: reply)
+    }
+    func terminalCommand(_ request: Data, withReply reply: @escaping (Data?, NSError?) -> Void) {
+        lock.withLock { export }.terminalCommand(request, withReply: reply)
+    }
+    func openTerminalArchive(_ request: Data, withReply reply: @escaping (FileHandle?, NSError?) -> Void) {
+        lock.withLock { export }.openTerminalArchive(request, withReply: reply)
     }
 }
 

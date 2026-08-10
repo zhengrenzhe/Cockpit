@@ -174,6 +174,30 @@ public final class TerminalArchiveStore: @unchecked Sendable {
         }
     }
 
+    @_spi(CockpitTerminalSupervisorComposition)
+    public func openFinalSnapshot(
+        record: TerminalSessionRecord
+    ) throws -> TerminalArchiveReadHandle {
+        guard [.exited, .terminated].contains(record.lifecycleState),
+              let workerID = record.workerID,
+              let archiveManifest = record.archiveManifest,
+              archiveManifest == (try manifestRelativePath(sessionID: record.sessionID)),
+              let manifest = try verifiedManifest(sessionID: record.sessionID),
+              manifest.workerInstanceID == workerID,
+              manifest.latestOutputSequence == record.latestSequence else {
+            throw TerminalArchiveError.invalidManifest
+        }
+        let expectedExitStatus: Int32 = switch manifest.exitStatus {
+        case let .exited(code): Int32(code)
+        case let .signaled(signal): -signal
+        }
+        guard record.exitStatus == expectedExitStatus,
+              (record.lifecycleState == .exited) == (expectedExitStatus >= 0) else {
+            throw TerminalArchiveError.invalidManifest
+        }
+        return try openFinalSnapshot(sessionID: record.sessionID)
+    }
+
     public func manifestRelativePath(
         sessionID: TerminalSessionID
     ) throws -> RelativeArchivePath {

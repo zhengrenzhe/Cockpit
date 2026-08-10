@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 import CockpitTypes
-@testable import CockpitTerminalCore
+@_spi(CockpitTerminalSupervisorComposition) @testable import CockpitTerminalCore
 
 @Suite("TerminalAttachTicketTests")
 struct TerminalAttachTicketTests {
@@ -233,6 +233,43 @@ struct TerminalAttachTicketTests {
         clock.advance(by: 30)
         _ = try await cleanup.issue(binding: binding, capabilities: [.view])
         #expect(await cleanup.activeRegistrationCount() == 1)
+    }
+
+    @Test func ambiguousRegistrationDiscardsOnlyItsDigestAndMissingConsumptionIsIdempotent() async throws {
+        let clock = AdjustableTerminalSecurityClock(Date(timeIntervalSince1970: 6_000))
+        let store = TerminalAttachTicketStore(
+            clock: clock,
+            randomBytes: IncrementingTerminalSecurityRandomBytes(startingAt: 0x70)
+        )
+        let binding = makeBinding(session: 0x81, worker: 0x82, client: 0x83)
+        let ambiguous = try await store.issue(binding: binding, capabilities: [.view])
+        let unrelated = try await store.issue(binding: binding, capabilities: [.view])
+
+        await store.discardIssuedRegistration(
+            ticketDigest: ambiguous.registration.ticketDigest
+        )
+        #expect(await store.activeRegistrationCount() == 1)
+        await #expect(throws: TerminalAttachTicketError.invalidCanonicalTicket) {
+            _ = try await store.consume(
+                wireValue: ambiguous.wireValue,
+                binding: binding,
+                capabilities: [.view]
+            )
+        }
+        #expect(
+            try await store.consume(
+                wireValue: unrelated.wireValue,
+                binding: binding,
+                capabilities: [.view]
+            ) == unrelated.registration
+        )
+
+        try await store.acknowledgeConsumption(ticketDigest: Data(repeating: 0xEE, count: 32))
+        let expiring = try await store.issue(binding: binding, capabilities: [.view])
+        clock.advance(by: 31)
+        try await store.acknowledgeConsumption(
+            ticketDigest: expiring.registration.ticketDigest
+        )
     }
 }
 

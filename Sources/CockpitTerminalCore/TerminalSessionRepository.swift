@@ -38,5 +38,7 @@ public protocol TerminalSessionRepository: Sendable {
         archiveManifest: RelativeArchivePath?
     ) async throws
     func activeRecords() async throws -> [TerminalSessionRecord]
+    func record(sessionID: TerminalSessionID) async throws -> TerminalSessionRecord
     func records(contextID: WorkspaceContextID) async throws -> [TerminalSessionRecord]
+    func purgeFinishedRecords() async throws -> Int
 }

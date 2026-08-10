@@ -121,7 +121,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9faf8c1b014
 --- /dev/null
 +++ b/src/cockpit/renderer.m
-@@ -0,0 +1,911 @@
+@@ -0,0 +1,940 @@
 +#import <AppKit/AppKit.h>
 +#import <Metal/Metal.h>
 +#import <QuartzCore/CAMetalLayer.h>
@@ -194,6 +194,7 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  uint32_t pixels_h;
 +  double scale;
 +  bool has_viewport;
++  bool wants_visible;
 +  bool visible;
 +  bool original_wants_layer;
 +};
@@ -673,6 +674,7 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  destination->pixels_h = source->pixels_h;
 +  destination->scale = source->scale;
 +  destination->has_viewport = source->has_viewport;
++  destination->wants_visible = source->wants_visible;
 +  destination->visible = source->visible;
 +
 +  if (source->cell_count == 0) return true;
@@ -904,10 +906,15 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +                              bytesPerRow:bytes_per_row];
 +  free(bitmap);
 +
++  id<CAMetalDrawable> drawable = [renderer->layer nextDrawable];
++  if (drawable == nil || drawable.texture.width != width ||
++      drawable.texture.height != height)
++    return false;
 +  id<MTLCommandBuffer> command_buffer =
 +      [renderer->command_queue commandBuffer];
++  if (command_buffer == nil) return false;
 +  id<MTLBlitCommandEncoder> encoder = [command_buffer blitCommandEncoder];
-+  if (command_buffer == nil || encoder == nil) return false;
++  if (encoder == nil) return false;
 +  MTLSize size = MTLSizeMake(width, height, 1);
 +  MTLOrigin origin = MTLOriginMake(0, 0, 0);
 +  [encoder copyFromTexture:renderer->upload_texture
@@ -919,21 +926,17 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +          destinationSlice:0
 +          destinationLevel:0
 +         destinationOrigin:origin];
-+  id<CAMetalDrawable> drawable = [renderer->layer nextDrawable];
-+  if (drawable != nil && drawable.texture.width == width &&
-+      drawable.texture.height == height) {
-+    [encoder copyFromTexture:renderer->offscreen_texture
-+                 sourceSlice:0
-+                 sourceLevel:0
-+                sourceOrigin:origin
-+                  sourceSize:size
-+                   toTexture:drawable.texture
-+            destinationSlice:0
-+            destinationLevel:0
-+           destinationOrigin:origin];
-+  }
++  [encoder copyFromTexture:renderer->offscreen_texture
++               sourceSlice:0
++               sourceLevel:0
++              sourceOrigin:origin
++                sourceSize:size
++                 toTexture:drawable.texture
++          destinationSlice:0
++          destinationLevel:0
++         destinationOrigin:origin];
 +  [encoder endEncoding];
-+  if (drawable != nil) [command_buffer presentDrawable:drawable];
++  [command_buffer presentDrawable:drawable];
 +  [command_buffer commit];
 +  [command_buffer waitUntilCompleted];
 +  if (command_buffer.status == MTLCommandBufferStatusError) return false;
@@ -966,7 +969,9 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  renderer->device = device;
 +  renderer->command_queue = command_queue;
 +  renderer->scale = scale;
-+  renderer->visible = true;
++  renderer->wants_visible = false;
++  renderer->visible = false;
++  layer.hidden = YES;
 +  initialize_palette(renderer->palette);
 +  view.layer = layer;
 +  view.wantsLayer = YES;
@@ -995,7 +1000,6 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +                                    const uint8_t *bytes, size_t length) {
 +  cockpit_frame_t frame;
 +  if (renderer == NULL || !validate_frame(bytes, length, &frame)) return -1;
-+  if (!renderer->visible) return 0;
 +  if (frame.kind == 3) return 1;
 +  if (frame.kind == 2 &&
 +      (!renderer->has_viewport || frame.rows != renderer->rows ||
@@ -1006,18 +1010,28 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  if (!clone_render_state(renderer, &staged)) return -1;
 +  bool applied = frame.kind == 1 ? apply_snapshot(&staged, &frame)
 +                                 : apply_delta(&staged, &frame);
-+  if (!applied || !render_viewport(&staged)) {
++  if (!applied) {
 +    free_cells(staged.cells, staged.cell_count);
 +    return -1;
 +  }
++  if (staged.wants_visible && !render_viewport(&staged)) {
++    free_cells(staged.cells, staged.cell_count);
++    renderer->visible = false;
++    renderer->layer.hidden = YES;
++    return 0;
++  }
 +  commit_render_state(renderer, &staged);
++  if (renderer->wants_visible) {
++    renderer->visible = true;
++    renderer->layer.hidden = NO;
++  }
 +  return 1;
 +}
 +
-+void cockpit_ghostty_renderer_resize(cockpit_ghostty_renderer_t *renderer,
-+                                     uint32_t pixels_w, uint32_t pixels_h,
-+                                     double scale) {
-+  if (renderer == NULL || !isfinite(scale) || scale <= 0) return;
++int cockpit_ghostty_renderer_resize(cockpit_ghostty_renderer_t *renderer,
++                                    uint32_t pixels_w, uint32_t pixels_h,
++                                    double scale) {
++  if (renderer == NULL || !isfinite(scale) || scale <= 0) return -1;
 +  renderer->pixels_w = pixels_w;
 +  renderer->pixels_h = pixels_h;
 +  renderer->scale = scale;
@@ -1025,13 +1039,28 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  renderer->layer.drawableSize = CGSizeMake(pixels_w, pixels_h);
 +  renderer->upload_texture = nil;
 +  renderer->offscreen_texture = nil;
++  if (renderer->wants_visible) {
++    renderer->visible = render_viewport(renderer);
++    renderer->layer.hidden = !renderer->visible;
++  }
++  return !renderer->wants_visible || renderer->visible ? 1 : 0;
 +}
 +
-+void cockpit_ghostty_renderer_set_visible(cockpit_ghostty_renderer_t *renderer,
-+                                          bool visible) {
-+  if (renderer == NULL) return;
-+  renderer->visible = visible;
-+  renderer->layer.hidden = !visible;
++int cockpit_ghostty_renderer_set_visible(cockpit_ghostty_renderer_t *renderer,
++                                         bool visible) {
++  if (renderer == NULL) return -1;
++  if (visible && renderer->wants_visible && renderer->visible &&
++      !renderer->layer.hidden)
++    return 1;
++  renderer->wants_visible = visible;
++  if (!visible) {
++    renderer->visible = false;
++    renderer->layer.hidden = YES;
++    return 1;
++  }
++  renderer->visible = render_viewport(renderer);
++  renderer->layer.hidden = !renderer->visible;
++  return renderer->visible ? 1 : 0;
 +}
 diff --git a/src/cockpit/renderer.zig b/src/cockpit/renderer.zig
 new file mode 100644

@@ -94,10 +94,10 @@ COCKPIT_GHOSTTY_API void cockpit_ghostty_renderer_destroy(
     cockpit_ghostty_renderer_t *);
 COCKPIT_GHOSTTY_API int cockpit_ghostty_renderer_apply(
     cockpit_ghostty_renderer_t *, const uint8_t *, size_t);
-COCKPIT_GHOSTTY_API void cockpit_ghostty_renderer_resize(
+COCKPIT_GHOSTTY_API int cockpit_ghostty_renderer_resize(
     cockpit_ghostty_renderer_t *, uint32_t pixels_w, uint32_t pixels_h,
     double scale);
-COCKPIT_GHOSTTY_API void cockpit_ghostty_renderer_set_visible(
+COCKPIT_GHOSTTY_API int cockpit_ghostty_renderer_set_visible(
     cockpit_ghostty_renderer_t *, bool);
 
 #if defined(__cplusplus)

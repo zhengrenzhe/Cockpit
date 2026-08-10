@@ -12,6 +12,13 @@
   </array>
   <key>MachServices</key>
   <dict><key>dev.cockpit.terminal</key><true/></dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>COCKPIT_APPLICATION_SUPPORT_ROOT</key>
+    <string>__APPLICATION_SUPPORT_ROOT__</string>
+    <key>COCKPIT_INTEGRATION_MASTER_KEY</key>
+    <string>__INTEGRATION_MASTER_KEY__</string>
+  </dict>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
 </dict></plist>

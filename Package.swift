@@ -45,7 +45,10 @@ let package = Package(
             dependencies: ["CockpitProtocol"]
         ),
         .target(name: "CockpitClientCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
-        .target(name: "CockpitHostCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
+        .target(
+            name: "CockpitHostCore",
+            dependencies: ["CockpitTypes", "CockpitProtocol", "CockpitTerminalCore"]
+        ),
         .target(name: "CockpitTerminalCore", dependencies: ["CockpitTypes", "CockpitProtocol"]),
         .target(
             name: "CockpitPersistence",
@@ -58,7 +61,9 @@ let package = Package(
         ),
         .target(
             name: "CockpitTerminalClient",
-            dependencies: ["CockpitTypes", "CockpitProtocol", "CockpitClientCore"]
+            dependencies: [
+                "CockpitTypes", "CockpitProtocol", "CockpitClientCore", "CockpitTerminalCore",
+            ]
         ),
         .target(
             name: "CockpitLocalTransport",
@@ -100,7 +105,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CockpitTerminalClientTests",
-            dependencies: ["CockpitTerminalClient"]
+            dependencies: ["CockpitTerminalClient", "CockpitTerminalCore", "CockpitTypes"]
         ),
         .testTarget(
             name: "CockpitLocalTransportTests",
@@ -135,6 +140,7 @@ let package = Package(
         .executableTarget(
             name: "CockpitTerminalSupervisor",
             dependencies: [
+                "CockpitHostCore",
                 "CockpitTerminalCore",
                 "CockpitLocalTransport",
                 "CockpitPersistence",
@@ -150,8 +156,10 @@ let package = Package(
             name: "CockpitProbe",
             dependencies: [
                 "CockpitClientCore",
+                "CockpitHostCore",
                 "CockpitLocalTransport",
                 "CockpitTerminalCore",
+                "CockpitTerminalClient",
                 "CockpitTypes",
             ],
             path: "Applications/CockpitProbe"

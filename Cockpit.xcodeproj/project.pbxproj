@@ -25,12 +25,14 @@
 /* Begin PBXBuildFile section */
 		00F2CE09C916763801CA9F85 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 521FA9CA3D31F33E20B0CC22 /* main.swift */; };
 		072B27985D56CF0B48E847DE /* MonacoRuntime.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */; };
+		07FECF87EDC303623C2C031A /* TerminalTabViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */; };
 		212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
 		351D3D324BAED80562181E32 /* CockpitWorkspace in Frameworks */ = {isa = PBXBuildFile; productRef = 6B63A056B655604A5CAB68B6 /* CockpitWorkspace */; };
+		38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */; };
 		3B5CBAA8FBFB3F631C2F4EA7 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8EA676EB67971DEACE962407 /* CoreGraphics.framework */; };
 		493D8CBE3E815C9A151FF0F3 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
-		5504EF2E91B30EAA53DE6A0E /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */; };
-		591C5D12CD00A336A5410F70 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 97443DD81BE67B657ED3816E /* CockpitPersistence */; };
+		5504EF2E91B30EAA53DE6A0E /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = DE5F175E55180A6CB6E41C96 /* CockpitHostCore */; };
+		591C5D12CD00A336A5410F70 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 98B021792EC132C38CE754AF /* CockpitLocalTransport */; };
 		5F406859AC1EF68C058E5F6D /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 967DA6F781A08A3775427A27 /* CoreText.framework */; };
 		60026EC79653E301CEE5491E /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9F4222C3217C5CD667A61F57 /* CockpitHostCore */; };
 		636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */; };
@@ -40,6 +42,7 @@
 		717C660DB30DD27E152966D1 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A9306517642B4E50E65EE7C /* Metal.framework */; };
 		739F84561841F69B335B8581 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		80169161B195865C65678342 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 75A939B292A29F0EA7497870 /* CockpitLocalTransport */; };
+		839BAC8E91A0FF76F9018DEA /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 97443DD81BE67B657ED3816E /* CockpitPersistence */; };
 		8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */; };
 		995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BFB39C38A17E2083706555 /* AppDelegate.swift */; };
 		9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */ = {isa = PBXBuildFile; productRef = 5A754E919142603676936801 /* CockpitTerminalClient */; };
@@ -52,9 +55,10 @@
 		BD4D067AEA4D8DD58643509F /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D380A6D5A0B758FBC879A0 /* main.swift */; };
 		CFFBA4DA3EFF3DC697120576 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 21DEEFE2C1B69D1975B38A28 /* CockpitLocalTransport */; };
 		D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */; };
-		DE1A356D6AFAC3DA1F075DCB /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 98B021792EC132C38CE754AF /* CockpitLocalTransport */; };
+		DE1A356D6AFAC3DA1F075DCB /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */; };
 		E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */; };
 		F2FA65E881BC08614E18A4F4 /* MonacoEditorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */; };
+		FA281D4C5CEED0F7CDA552A8 /* GhosttyTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 23AAD691375B8C8DC385B733 /* GhosttyTerminalView.swift */; };
 		FF4336728B6B261A41D126A2 /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 80E0EDA5DF236D4B796E1DC4 /* CockpitHostCore */; };
 /* End PBXBuildFile section */
 
@@ -105,6 +109,8 @@
 
 /* Begin PBXFileReference section */
 		03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridgeTests.swift; sourceTree = "<group>"; };
+		1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTabViewController.swift; sourceTree = "<group>"; };
+		23AAD691375B8C8DC385B733 /* GhosttyTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalView.swift; sourceTree = "<group>"; };
 		263DA7B80F345C7A4A093699 /* MonacoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridge.swift; sourceTree = "<group>"; };
 		2C3A65312477EAD5232A52B0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		3F212D66BE21DB1B93B562CF /* GhosttyVTAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyVTAdapter.swift; sourceTree = "<group>"; };
@@ -124,6 +130,7 @@
 		957D0FDA811FE85865AA5EF4 /* CockpitAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CockpitAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		967DA6F781A08A3775427A27 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
 		A0BFB39C38A17E2083706555 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalViewTests.swift; sourceTree = "<group>"; };
 		C1FB833EEF9FB302DB53867C /* CockpitTerminalSupervisor */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitTerminalSupervisor; sourceTree = BUILT_PRODUCTS_DIR; };
 		C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceStatusViewModel.swift; sourceTree = "<group>"; };
 		C4FA2BE19C1AAE871BA1097F /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
@@ -181,9 +188,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				5504EF2E91B30EAA53DE6A0E /* CockpitTerminalCore in Frameworks */,
-				DE1A356D6AFAC3DA1F075DCB /* CockpitLocalTransport in Frameworks */,
-				591C5D12CD00A336A5410F70 /* CockpitPersistence in Frameworks */,
+				5504EF2E91B30EAA53DE6A0E /* CockpitHostCore in Frameworks */,
+				DE1A356D6AFAC3DA1F075DCB /* CockpitTerminalCore in Frameworks */,
+				591C5D12CD00A336A5410F70 /* CockpitLocalTransport in Frameworks */,
+				839BAC8E91A0FF76F9018DEA /* CockpitPersistence in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -205,6 +213,7 @@
 				A0BFB39C38A17E2083706555 /* AppDelegate.swift */,
 				C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */,
 				6E46CDDC13239DD598F7204A /* Monaco */,
+				D772CDEB91945223562616DB /* Terminal */,
 			);
 			name = CockpitApp;
 			path = Applications/CockpitApp;
@@ -267,6 +276,15 @@
 			name = Packages;
 			sourceTree = "<group>";
 		};
+		D772CDEB91945223562616DB /* Terminal */ = {
+			isa = PBXGroup;
+			children = (
+				23AAD691375B8C8DC385B733 /* GhosttyTerminalView.swift */,
+				1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */,
+			);
+			path = Terminal;
+			sourceTree = "<group>";
+		};
 		DB534674FC3ED4B84218F3D7 /* CockpitTerminalSupervisor */ = {
 			isa = PBXGroup;
 			children = (
@@ -301,6 +319,7 @@
 			isa = PBXGroup;
 			children = (
 				6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */,
+				B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */,
 				03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */,
 			);
 			name = CockpitAppTests;
@@ -414,6 +433,7 @@
 			);
 			name = CockpitTerminalSupervisor;
 			packageProductDependencies = (
+				DE5F175E55180A6CB6E41C96 /* CockpitHostCore */,
 				93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */,
 				98B021792EC132C38CE754AF /* CockpitLocalTransport */,
 				97443DD81BE67B657ED3816E /* CockpitPersistence */,
@@ -566,11 +586,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */,
+				FA281D4C5CEED0F7CDA552A8 /* GhosttyTerminalView.swift in Sources */,
 				BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */,
 				F2FA65E881BC08614E18A4F4 /* MonacoEditorViewController.swift in Sources */,
 				636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */,
 				8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */,
 				E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */,
+				07FECF87EDC303623C2C031A /* TerminalTabViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -596,6 +618,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */,
+				38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */,
 				D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -649,6 +672,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitTests;
 				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Cockpit.app/Contents/MacOS/Cockpit";
 			};
 			name = Debug;
@@ -722,6 +746,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitTests;
 				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Cockpit.app/Contents/MacOS/Cockpit";
 			};
 			name = Release;
@@ -761,7 +786,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitPTYKeeper;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty";
 			};
 			name = Release;
 		};
@@ -786,7 +811,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.CockpitPTYKeeper;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty";
 			};
 			name = Debug;
 		};
@@ -809,7 +834,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty";
 			};
 			name = Debug;
 		};
@@ -846,7 +871,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = dev.cockpit.Cockpit;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) COCKPIT_GHOSTTY_LINKED";
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(COCKPIT_GHOSTTY_ARTIFACTS_DIR)/include/CockpitGhostty";
 			};
 			name = Release;
 		};
@@ -1072,6 +1097,10 @@
 		D51DF015FEF9086662DEC115 /* CockpitTerminalCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = CockpitTerminalCore;
+		};
+		DE5F175E55180A6CB6E41C96 /* CockpitHostCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitHostCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

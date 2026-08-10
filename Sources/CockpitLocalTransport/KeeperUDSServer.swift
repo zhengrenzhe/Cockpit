@@ -17,6 +17,7 @@ public final class KeeperUDSServer: @unchecked Sendable {
     private let leaseRevocations: InputLeaseRevocationBuffer?
     private let startHandler: StartHandler
     private let terminateHandler: TerminateHandler
+    private let afterViewerDetachAcknowledgement: (@Sendable () -> Void)?
     private let calls: any UnixDomainSocketSystemCalls
     private let peerCredentials: any PeerCredentialReading
     private let stateLock = NSLock()
@@ -49,6 +50,7 @@ public final class KeeperUDSServer: @unchecked Sendable {
         self.leaseRevocations = leaseRevocations
         self.startHandler = startHandler
         self.terminateHandler = terminateHandler
+        afterViewerDetachAcknowledgement = nil
         calls = DarwinUnixDomainSocketSystemCalls()
         peerCredentials = DarwinPeerCredentialReader()
     }
@@ -60,6 +62,7 @@ public final class KeeperUDSServer: @unchecked Sendable {
         leaseRevocations: InputLeaseRevocationBuffer? = nil,
         startHandler: @escaping StartHandler,
         terminateHandler: @escaping TerminateHandler,
+        afterViewerDetachAcknowledgement: (@Sendable () -> Void)? = nil,
         calls: any UnixDomainSocketSystemCalls,
         peerCredentials: any PeerCredentialReading
     ) {
@@ -69,6 +72,7 @@ public final class KeeperUDSServer: @unchecked Sendable {
         self.leaseRevocations = leaseRevocations
         self.startHandler = startHandler
         self.terminateHandler = terminateHandler
+        self.afterViewerDetachAcknowledgement = afterViewerDetachAcknowledgement
         self.calls = calls
         self.peerCredentials = peerCredentials
     }
@@ -159,6 +163,27 @@ public final class KeeperUDSServer: @unchecked Sendable {
                 defer { workerGroup.leave() }
                 acceptLoop(descriptor)
             }
+        }
+    }
+
+    public func recordBootstrapStart(
+        _ request: AuthenticatedStartRequest,
+        identity: CLIProcessIdentity
+    ) throws {
+        guard request.endpoint == endpoint,
+              request.sessionID == endpoint.sessionID,
+              request.workerID == endpoint.workerID else {
+            throw KeeperControlError.identityMismatch
+        }
+        try stateLock.withLock {
+            if let acceptedStart {
+                guard acceptedStart == request, processIdentity == identity else {
+                    throw KeeperControlError.startRequestMismatch
+                }
+                return
+            }
+            acceptedStart = request
+            processIdentity = identity
         }
     }
 
@@ -320,19 +345,12 @@ public final class KeeperUDSServer: @unchecked Sendable {
         }
 
         while !stateLock.withLock({ stopped }) {
-            let message: (ChannelID, KeeperViewerRequest)
-            do { message = try stream.read(KeeperViewerRequest.self) }
+            let packet: (ChannelID, Data)
+            do { packet = try stream.readPayload() }
             catch { return }
-            let responseChannel: ChannelID
-            do {
-                switch message.1 {
-                case .attach:
-                    throw TerminalStreamError.malformedMessage
-                case .nextOutput:
-                    throw TerminalStreamError.malformedMessage
-                case let .input(payload):
-                    guard message.0 == .terminalInput else { throw TerminalStreamError.wrongChannel }
-                    let proto = try CPTerminalInput(serializedBytes: payload)
+            if packet.0 == .terminalInput {
+                do {
+                    let proto = try CPTerminalInput(serializedBytes: packet.1)
                     let input = try TerminalMessages.decode(
                         proto,
                         channelID: .terminalInput,
@@ -350,32 +368,91 @@ public final class KeeperUDSServer: @unchecked Sendable {
                         throw TerminalStreamError.capabilityDenied
                     }
                     let ack = try waitForAsync { try await streamCoordinator.acceptInput(input) }
-                    responseChannel = .terminalInput
                     try stream.write(
                         KeeperViewerResponse.inputAcknowledged(ack),
-                        channel: responseChannel
+                        channel: .terminalInput
                     )
+                } catch {
+                    try? stream.write(
+                        KeeperViewerResponse.failure(KeeperStreamFailure.map(error)),
+                        channel: .terminalInput
+                    )
+                }
+                continue
+            }
+            let message: (ChannelID, KeeperViewerRequest)
+            do {
+                message = (
+                    packet.0,
+                    try JSONDecoder().decode(KeeperViewerRequest.self, from: packet.1)
+                )
+            } catch {
+                try? stream.write(
+                    KeeperViewerResponse.failure(.malformedMessage),
+                    channel: .control
+                )
+                continue
+            }
+            let responseChannel: ChannelID
+            do {
+                switch message.1 {
+                case .attach:
+                    throw TerminalStreamError.malformedMessage
+                case .nextOutput:
+                    throw TerminalStreamError.malformedMessage
                 case .visible:
                     guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
                     responseChannel = .control
                     try stream.write(KeeperViewerResponse.acknowledged, channel: responseChannel)
-                case let .signal(signal):
+                case let .signalInput(payload):
+                    guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
+                    let proto = try CPTerminalInput(serializedBytes: payload)
+                    let input = try TerminalMessages.decode(
+                        proto,
+                        channelID: .control,
+                        negotiatedVersion: .current
+                    )
+                    guard input.context.clientInstanceID.rawValue == viewerID.rawValue else {
+                        throw TerminalStreamError.inputLeaseRequired
+                    }
+                    guard attachment.capabilities.contains(.signal) else {
+                        throw TerminalStreamError.capabilityDenied
+                    }
+                    let acknowledgement = try waitForAsync {
+                        try await streamCoordinator.acceptInput(input)
+                    }
+                    responseChannel = .control
+                    try stream.write(
+                        KeeperViewerResponse.inputAcknowledged(acknowledgement),
+                        channel: responseChannel
+                    )
+                case let .signal(signal, leaseID):
                     guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
                     let group = try waitForAsync {
-                        try await streamCoordinator.signal(signal, viewerID: viewerID)
+                        try await streamCoordinator.signal(
+                            signal,
+                            viewerID: viewerID,
+                            leaseID: leaseID
+                        )
                     }
                     responseChannel = .control
                     try stream.write(KeeperViewerResponse.signalDelivered(group), channel: responseChannel)
-                case let .terminate(force):
+                case let .terminate(force, leaseID):
                     guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
                     try waitForAsync {
-                        try await streamCoordinator.terminate(force: force, viewerID: viewerID)
+                        try await streamCoordinator.terminate(
+                            force: force,
+                            viewerID: viewerID,
+                            leaseID: leaseID
+                        )
                     }
                     responseChannel = .control
                     try stream.write(KeeperViewerResponse.acknowledged, channel: responseChannel)
                 case .detach:
                     guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
+                    waitForVoid { await streamCoordinator.detach(viewerID: viewerID) }
                     try stream.write(KeeperViewerResponse.acknowledged, channel: .control)
+                    afterViewerDetachAcknowledgement?()
                     return
                 }
             } catch {
@@ -487,30 +564,115 @@ public final class KeeperUDSServer: @unchecked Sendable {
             }
             return .acknowledged
 
-        case let .registerAttachTicket(registration):
+        case let .registerAttachTicket(registration, supervisorGeneration):
             guard registration.binding.sessionID == endpoint.sessionID,
                   registration.binding.workerID == endpoint.workerID,
                   let streamCoordinator else {
                 throw KeeperControlError.identityMismatch
             }
             try waitForAsync {
-                try await streamCoordinator.registerAttachTicket(registration)
+                try await streamCoordinator.registerAttachTicket(
+                    registration,
+                    supervisorGeneration: supervisorGeneration
+                )
             }
             return .acknowledged
 
-        case let .registerInputLease(grant):
+        case let .registerInputLease(grant, supervisorGeneration):
             guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
-            try waitForAsync { try await streamCoordinator.registerInputLease(grant) }
+            try waitForAsync {
+                try await streamCoordinator.registerInputLease(
+                    grant,
+                    supervisorGeneration: supervisorGeneration
+                )
+            }
             return .acknowledged
 
-        case let .revokeInputLease(leaseID):
+        case let .transferInputLease(leaseID, grant, supervisorGeneration):
             guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
-            waitForVoid { await streamCoordinator.revokeInputLease(leaseID) }
+            try waitForAsync {
+                try await streamCoordinator.transferInputLease(
+                    from: leaseID,
+                    to: grant,
+                    supervisorGeneration: supervisorGeneration
+                )
+            }
             return .acknowledged
 
-        case .takeLeaseRevocations:
-            guard let leaseRevocations else { return .leaseRevocations([]) }
-            return .leaseRevocations(try waitForAsync { await leaseRevocations.takeAll() })
+        case let .revokeInputLease(leaseID, supervisorGeneration):
+            guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
+            try waitForAsync {
+                try await streamCoordinator.revokeInputLease(
+                    leaseID,
+                    supervisorGeneration: supervisorGeneration
+                )
+            }
+            return .acknowledged
+
+        case let .synchronizeSupervisor(request):
+            guard request.acknowledgedThrough <= request.afterSequence,
+                  let leaseRevocations,
+                  let streamCoordinator else {
+                throw KeeperControlError.malformedMessage
+            }
+            _ = try waitForAsync {
+                try await streamCoordinator.beginSupervisorGeneration(
+                    request.supervisorGeneration,
+                    events: leaseRevocations
+                )
+            }
+            let events = try waitForAsync {
+                await leaseRevocations.events(
+                    generation: request.supervisorGeneration,
+                    acknowledgedThrough: request.acknowledgedThrough,
+                    afterSequence: request.afterSequence,
+                    waitForEvents: request.waitForEvents
+                )
+            }
+            let leaseSnapshot = try waitForAsync {
+                try await streamCoordinator.supervisorInputLeaseSnapshot(
+                    supervisorGeneration: request.supervisorGeneration
+                )
+            }
+            let latest = try waitForAsync {
+                await leaseRevocations.latestSequence(
+                    for: request.supervisorGeneration
+                )
+            }
+            return .supervisorSynchronized(
+                KeeperSupervisorSyncResponse(
+                    supervisorGeneration: request.supervisorGeneration,
+                    currentLease: leaseSnapshot.currentLease,
+                    nextInputSequence: leaseSnapshot.nextInputSequence,
+                    events: events,
+                    latestEventSequence: latest
+                )
+            )
+
+        case let .signalForeground(signal, viewerID, leaseID, supervisorGeneration):
+            guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
+            return .foregroundSignaled(
+                try waitForAsync {
+                    try await streamCoordinator.signal(
+                        signal,
+                        viewerID: viewerID,
+                        leaseID: leaseID,
+                        supervisorGeneration: supervisorGeneration
+                    )
+                }
+            )
+
+        case let .terminateAuthorized(force, viewerID, leaseID, supervisorGeneration):
+            guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
+            try waitForAsync {
+                try await streamCoordinator.terminate(
+                    force: force,
+                    viewerID: viewerID,
+                    leaseID: leaseID,
+                    supervisorGeneration: supervisorGeneration
+                )
+            }
+            return .acknowledged
 
         default:
             throw KeeperControlError.malformedMessage
@@ -537,7 +699,17 @@ public final class KeeperUDSServer: @unchecked Sendable {
     }
 
     private static func wireError(_ error: any Error) -> KeeperControlWireError {
-        switch error as? KeeperControlError {
+        if let streamError = error as? TerminalStreamError {
+            return switch streamError {
+            case .leaseHeld: .leaseHeld
+            case .invalidInputLease: .invalidInputLease
+            case .nonMonotonicInputSequence: .nonMonotonicInputSequence
+            case .capabilityDenied: .capabilityDenied
+            case .viewerNotAttached: .viewerNotAttached
+            default: .internalFailure
+            }
+        }
+        return switch error as? KeeperControlError {
         case .authenticationFailed, .invalidProof: .authenticationFailed
         case .identityMismatch: .identityMismatch
         case .startRequestMismatch: .startRequestMismatch

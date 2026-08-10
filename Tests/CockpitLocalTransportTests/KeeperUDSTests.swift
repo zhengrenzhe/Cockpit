@@ -6,7 +6,7 @@ import CockpitTerminalCore
 import CockpitTypes
 @testable import CockpitLocalTransport
 
-@Suite("KeeperUDSTests")
+@Suite("KeeperUDSTests", .serialized)
 struct KeeperUDSTests {
     @Test func protocol11HandshakeRequiresPeerRoleAndRejectsWrongUID() async throws {
         let fixture = try UDSFixture(peerUID: geteuid() + 1)
@@ -40,7 +40,11 @@ struct KeeperUDSTests {
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
 
         let client = KeeperUDSClient(endpoint: fixture.endpoint)
         let viewer = try await client.attach(fixture.attachRequest)
@@ -55,6 +59,7 @@ struct KeeperUDSTests {
                 sequenceBase: 1,
                 capabilities: [.input]
             ),
+            supervisorGeneration: fixture.supervisorGeneration,
             at: fixture.endpoint
         )
         #expect(try await viewer.send(fixture.input(sequence: 1)) == 1)
@@ -63,12 +68,292 @@ struct KeeperUDSTests {
         await viewer.detach()
     }
 
+    @Test func supervisorLeaseTransferIsAtomicAndAcquireCannotSteal() async throws {
+        let fixture = try UDSFixture(peerUID: geteuid())
+        defer { fixture.server.stop() }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let first = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(
+            fixture.attachRequest
+        )
+        let firstGrant = try InputLeaseGrant(
+            validatingLeaseID: fixture.leaseID,
+            holderViewerID: fixture.viewerID,
+            sequenceBase: 1,
+            capabilities: [.input]
+        )
+        try await supervisor.registerInputLease(
+            firstGrant,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        try await supervisor.registerInputLease(
+            firstGrant,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+
+        let secondViewer = ViewerID()
+        let secondBinding = TerminalAttachBinding(
+            sessionID: fixture.sessionID,
+            workerID: fixture.workerID,
+            clientInstanceID: ClientInstanceID(secondViewer.rawValue)
+        )
+        let secondTicket = try await fixture.tickets.issue(
+            binding: secondBinding,
+            capabilities: [.view, .input]
+        )
+        try await supervisor.registerAttachTicket(
+            secondTicket.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let second = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(
+            AttachRequest(
+                viewerID: secondViewer,
+                wireTicket: secondTicket.wireValue,
+                binding: secondBinding,
+                requestedCapabilities: [.view, .input],
+                lastAcknowledgedOutputSequence: nil
+            )
+        )
+        let secondLeaseID = InputLeaseID()
+        let secondGrant = try InputLeaseGrant(
+            validatingLeaseID: secondLeaseID,
+            holderViewerID: secondViewer,
+            sequenceBase: 1,
+            capabilities: [.input]
+        )
+        await #expect(throws: TerminalStreamError.leaseHeld) {
+            try await supervisor.registerInputLease(
+                secondGrant,
+                supervisorGeneration: fixture.supervisorGeneration,
+                at: fixture.endpoint
+            )
+        }
+
+        let invalidTarget = try InputLeaseGrant(
+            validatingLeaseID: InputLeaseID(),
+            holderViewerID: ViewerID(),
+            sequenceBase: 1,
+            capabilities: [.input]
+        )
+        await #expect(throws: TerminalStreamError.viewerNotAttached) {
+            try await supervisor.transferInputLease(
+                from: fixture.leaseID,
+                to: invalidTarget,
+                supervisorGeneration: fixture.supervisorGeneration,
+                at: fixture.endpoint
+            )
+        }
+        #expect(try await first.send(fixture.input(sequence: 1)) == 1)
+
+        let transferred = try InputLeaseGrant(
+            validatingLeaseID: secondLeaseID,
+            holderViewerID: secondViewer,
+            sequenceBase: 2,
+            capabilities: [.input]
+        )
+        try await supervisor.transferInputLease(
+            from: fixture.leaseID,
+            to: transferred,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        #expect(try await second.send(
+            fixture.input(
+                sequence: 2,
+                clientInstanceID: ClientInstanceID(secondViewer.rawValue),
+                leaseID: secondLeaseID
+            )
+        ) == 2)
+        #expect(await fixture.effects.resets == 2)
+        #expect(await fixture.effects.revoked == [fixture.leaseID])
+        await second.detach()
+        await first.detach()
+    }
+
+    @Test func supervisorSynchronizationIsGenerationBoundAndLossSafe() async throws {
+        let fixture = try UDSFixture(peerUID: geteuid())
+        defer { fixture.server.stop() }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        let generation = try KeeperSupervisorGeneration(epoch: 2).rawValue
+        let initial = try await supervisor.synchronizeSupervisor(
+            KeeperSupervisorSyncRequest(
+                supervisorGeneration: generation,
+                acknowledgedThrough: 0,
+                afterSequence: 0,
+                waitForEvents: false
+            ),
+            at: fixture.endpoint
+        )
+        #expect(initial.currentLease == nil)
+        #expect(initial.nextInputSequence == 1)
+        #expect(initial.events.isEmpty)
+
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: generation,
+            at: fixture.endpoint
+        )
+        let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint)
+            .attach(fixture.attachRequest)
+        let consumed = try await supervisor.synchronizeSupervisor(
+            KeeperSupervisorSyncRequest(
+                supervisorGeneration: generation,
+                acknowledgedThrough: 0,
+                afterSequence: 0,
+                waitForEvents: false
+            ),
+            at: fixture.endpoint
+        )
+        #expect(consumed.events == [
+            KeeperSupervisorEvent(
+                sequence: 1,
+                payload: .attachTicketConsumed(fixture.issued.registration.ticketDigest)
+            ),
+        ])
+        let repeated = try await supervisor.synchronizeSupervisor(
+            KeeperSupervisorSyncRequest(
+                supervisorGeneration: generation,
+                acknowledgedThrough: 0,
+                afterSequence: 0,
+                waitForEvents: false
+            ),
+            at: fixture.endpoint
+        )
+        #expect(repeated.events == consumed.events)
+
+        let grant = try InputLeaseGrant(
+            validatingLeaseID: fixture.leaseID,
+            holderViewerID: fixture.viewerID,
+            sequenceBase: 1,
+            capabilities: [.input]
+        )
+        try await supervisor.registerInputLease(
+            grant,
+            supervisorGeneration: generation,
+            at: fixture.endpoint
+        )
+        #expect(try await viewer.send(fixture.input(sequence: 1)) == 1)
+        try await supervisor.revokeInputLease(
+            fixture.leaseID,
+            supervisorGeneration: generation,
+            at: fixture.endpoint
+        )
+        let explicitlyRevoked = try await supervisor.synchronizeSupervisor(
+            KeeperSupervisorSyncRequest(
+                supervisorGeneration: generation,
+                acknowledgedThrough: 1,
+                afterSequence: 1,
+                waitForEvents: false
+            ),
+            at: fixture.endpoint
+        )
+        #expect(explicitlyRevoked.events == [
+            KeeperSupervisorEvent(
+                sequence: 2,
+                payload: .leaseRevoked(fixture.leaseID, nextSequence: 2)
+            ),
+        ])
+        let replacementLeaseID = InputLeaseID()
+        try await supervisor.registerInputLease(
+            try InputLeaseGrant(
+                validatingLeaseID: replacementLeaseID,
+                holderViewerID: fixture.viewerID,
+                sequenceBase: 2,
+                capabilities: [.input]
+            ),
+            supervisorGeneration: generation,
+            at: fixture.endpoint
+        )
+        #expect(
+            try await viewer.send(
+                fixture.input(sequence: 2, leaseID: replacementLeaseID)
+            ) == 2
+        )
+        let watching = Task {
+            try await supervisor.synchronizeSupervisor(
+                KeeperSupervisorSyncRequest(
+                    supervisorGeneration: generation,
+                    acknowledgedThrough: 2,
+                    afterSequence: 2,
+                    waitForEvents: true
+                ),
+                at: fixture.endpoint
+            )
+        }
+        await viewer.detach()
+        let revoked = try await watching.value
+        #expect(revoked.currentLease == nil)
+        #expect(revoked.nextInputSequence == 3)
+        #expect(revoked.events == [
+            KeeperSupervisorEvent(
+                sequence: 3,
+                payload: .leaseRevoked(replacementLeaseID, nextSequence: 3)
+            ),
+        ])
+        let acknowledged = try await supervisor.synchronizeSupervisor(
+            KeeperSupervisorSyncRequest(
+                supervisorGeneration: generation,
+                acknowledgedThrough: 3,
+                afterSequence: 3,
+                waitForEvents: false
+            ),
+            at: fixture.endpoint
+        )
+        #expect(acknowledged.events.isEmpty)
+
+        let replacement = try await fixture.tickets.issue(
+            binding: fixture.attachRequest.binding,
+            capabilities: fixture.attachRequest.requestedCapabilities
+        )
+        try await supervisor.registerAttachTicket(
+            replacement.registration,
+            supervisorGeneration: generation,
+            at: fixture.endpoint
+        )
+        let restarted = try await supervisor.synchronizeSupervisor(
+            KeeperSupervisorSyncRequest(
+                supervisorGeneration: try KeeperSupervisorGeneration(epoch: 3).rawValue,
+                acknowledgedThrough: 0,
+                afterSequence: 0,
+                waitForEvents: false
+            ),
+            at: fixture.endpoint
+        )
+        #expect(restarted.currentLease == nil)
+        #expect(restarted.nextInputSequence == 3)
+        #expect(restarted.events.isEmpty)
+        await #expect(throws: TerminalAttachTicketError.invalidCanonicalTicket) {
+            _ = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(
+                AttachRequest(
+                    viewerID: fixture.viewerID,
+                    wireTicket: replacement.wireValue,
+                    binding: fixture.attachRequest.binding,
+                    requestedCapabilities: fixture.attachRequest.requestedCapabilities,
+                    lastAcknowledgedOutputSequence: nil
+                )
+            )
+        }
+    }
+
     @Test func ticketReplayCrossSessionAndCapabilityEscalationFailClosed() async throws {
         let fixture = try UDSFixture(peerUID: geteuid())
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let client = KeeperUDSClient(endpoint: fixture.endpoint)
         let viewer = try await client.attach(fixture.attachRequest)
         await viewer.detach()
@@ -93,7 +378,11 @@ struct KeeperUDSTests {
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
         try await supervisor.registerInputLease(
             try InputLeaseGrant(
@@ -102,6 +391,7 @@ struct KeeperUDSTests {
                 sequenceBase: 1,
                 capabilities: [.input]
             ),
+            supervisorGeneration: fixture.supervisorGeneration,
             at: fixture.endpoint
         )
         await fixture.coordinator.publish(outputSequence: 1, frame: Data("screen".utf8))
@@ -117,16 +407,20 @@ struct KeeperUDSTests {
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
         await #expect(throws: TerminalStreamError.capabilityDenied) {
             _ = try await viewer.send(fixture.input(sequence: 1))
         }
         await #expect(throws: TerminalStreamError.capabilityDenied) {
-            _ = try await viewer.signal(.interrupt)
+            _ = try await viewer.signal(.interrupt, leaseID: InputLeaseID())
         }
         await #expect(throws: TerminalStreamError.capabilityDenied) {
-            try await viewer.terminate(force: false)
+            try await viewer.terminate(force: false, leaseID: InputLeaseID())
         }
         await viewer.detach()
     }
@@ -139,19 +433,159 @@ struct KeeperUDSTests {
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
-        await #expect(throws: TerminalStreamError.malformedMessage) {
-            _ = try await viewer.send(fixture.input(sequence: 1, payload: .signal(.interrupt)))
+        try await supervisor.registerInputLease(
+            try InputLeaseGrant(
+                validatingLeaseID: fixture.leaseID,
+                holderViewerID: fixture.viewerID,
+                sequenceBase: 1,
+                capabilities: [.signal, .terminate]
+            ),
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        await #expect(throws: (any Error).self) {
+            _ = try await viewer.send(
+                fixture.input(
+                    sequence: 1,
+                    payload: .signal(.interrupt),
+                    leaseID: InputLeaseID()
+                )
+            )
         }
-        #expect(try await viewer.signal(.interrupt) == 100)
-        #expect(try await viewer.signal(.quit) == 100)
-        #expect(try await viewer.signal(.suspend) == 100)
-        #expect(try await viewer.signal(.continue) == 100)
-        try await viewer.terminate(force: false)
-        try await viewer.terminate(force: true)
-        #expect(await fixture.effects.signals == [.interrupt, .quit, .suspend, .continue])
+        #expect(try await viewer.send(fixture.input(sequence: 1, payload: .signal(.interrupt))) == 1)
+        #expect(try await viewer.signal(.interrupt, leaseID: fixture.leaseID) == 100)
+        #expect(try await viewer.signal(.quit, leaseID: fixture.leaseID) == 100)
+        #expect(try await viewer.signal(.suspend, leaseID: fixture.leaseID) == 100)
+        #expect(try await viewer.signal(.continue, leaseID: fixture.leaseID) == 100)
+        try await viewer.terminate(force: false, leaseID: fixture.leaseID)
+        try await viewer.terminate(force: true, leaseID: fixture.leaseID)
+        #expect(await fixture.effects.signals == [
+            .interrupt, .interrupt, .quit, .suspend, .continue,
+        ])
         #expect(await fixture.terminated.values == [false, true])
+        await viewer.detach()
+    }
+
+    @Test func signalRetryUsesInputSequenceAndPerformsTheSignalOnlyOnce() async throws {
+        let fixture = try UDSFixture(
+            peerUID: geteuid(),
+            capabilities: [.view, .input, .signal]
+        )
+        defer { fixture.server.stop() }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
+        try await supervisor.registerInputLease(
+            try InputLeaseGrant(
+                validatingLeaseID: fixture.leaseID,
+                holderViewerID: fixture.viewerID,
+                sequenceBase: 1,
+                capabilities: [.input, .signal]
+            ),
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+
+        let signal = try fixture.input(sequence: 1, payload: .signal(.interrupt))
+        let firstAcknowledgement = try await viewer.send(signal)
+        let retryAcknowledgement = try await viewer.send(signal)
+        let textAcknowledgement: UInt64?
+        do {
+            textAcknowledgement = try await viewer.send(fixture.input(sequence: 2))
+        } catch {
+            textAcknowledgement = nil
+        }
+
+        #expect(firstAcknowledgement == 1)
+        #expect(retryAcknowledgement == 1)
+        #expect(await fixture.effects.signals == [.interrupt])
+        #expect(textAcknowledgement == 2)
+        #expect(await fixture.effects.inputs == [.text("typed")])
+        await viewer.detach()
+    }
+
+    @Test func supervisorSignalAndTerminateRequireTheCurrentAuthorizedViewer() async throws {
+        let fixture = try UDSFixture(
+            peerUID: geteuid(),
+            capabilities: [.view, .signal, .terminate]
+        )
+        defer { fixture.server.stop() }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
+        try await supervisor.registerInputLease(
+            try InputLeaseGrant(
+                validatingLeaseID: fixture.leaseID,
+                holderViewerID: fixture.viewerID,
+                sequenceBase: 1,
+                capabilities: [.signal, .terminate]
+            ),
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+
+        await #expect(throws: (any Error).self) {
+            _ = try await supervisor.signalForeground(
+                .interrupt,
+                viewerID: ViewerID(),
+                leaseID: fixture.leaseID,
+                supervisorGeneration: fixture.supervisorGeneration,
+                at: fixture.endpoint
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await supervisor.signalForeground(
+                .interrupt,
+                viewerID: fixture.viewerID,
+                leaseID: InputLeaseID(),
+                supervisorGeneration: fixture.supervisorGeneration,
+                at: fixture.endpoint
+            )
+        }
+        #expect(await fixture.effects.signals.isEmpty)
+        #expect(
+            try await supervisor.signalForeground(
+                .interrupt,
+                viewerID: fixture.viewerID,
+                leaseID: fixture.leaseID,
+                supervisorGeneration: fixture.supervisorGeneration,
+                at: fixture.endpoint
+            ) == 100
+        )
+        await #expect(throws: (any Error).self) {
+            try await supervisor.terminateAuthorized(
+                force: true,
+                viewerID: fixture.viewerID,
+                leaseID: InputLeaseID(),
+                supervisorGeneration: fixture.supervisorGeneration,
+                at: fixture.endpoint
+            )
+        }
+        try await supervisor.terminateAuthorized(
+            force: true,
+            viewerID: fixture.viewerID,
+            leaseID: fixture.leaseID,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        #expect(await fixture.effects.signals == [.interrupt])
+        #expect(await fixture.terminated.values == [true])
         await viewer.detach()
     }
 
@@ -159,7 +593,11 @@ struct KeeperUDSTests {
         let fixture = try UDSFixture(peerUID: geteuid())
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
         let output = Task.detached { try? await viewer.nextOutput() }
 
@@ -176,6 +614,101 @@ struct KeeperUDSTests {
         }
         await stopping.value
         _ = await output.value
+    }
+
+    @Test func viewerDetachFinalizesPendingOutputAndRevokesItsLease() async throws {
+        let fixture = try UDSFixture(peerUID: geteuid())
+        defer { fixture.server.stop() }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
+        try await supervisor.registerInputLease(
+            try InputLeaseGrant(
+                validatingLeaseID: fixture.leaseID,
+                holderViewerID: fixture.viewerID,
+                sequenceBase: 1,
+                capabilities: [.input]
+            ),
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+
+        let output = PendingResult<TerminalOutputFrame?>()
+        Task.detached {
+            do { output.store(.success(try await viewer.nextOutput())) }
+            catch { output.store(.failure(error)) }
+        }
+        #expect(await waitUntil { fixture.server.pendingOutputWaiterCount() == 1 })
+
+        let detached = CompletionFlag()
+        Task.detached {
+            await viewer.detach()
+            detached.markComplete()
+        }
+        #expect(await waitUntil(timeout: .milliseconds(250)) { detached.isComplete })
+        #expect(await waitUntil(timeout: .milliseconds(250)) { output.value != nil })
+        #expect(try output.value?.get() == nil)
+        #expect(await fixture.effects.revoked == [fixture.leaseID])
+    }
+
+    @Test func detachAcknowledgementLinearizesBeforeSameViewerCanReattach() async throws {
+        let acknowledgement = BlockingHook()
+        let fixture = try UDSFixture(
+            peerUID: geteuid(),
+            afterViewerDetachAcknowledgement: { acknowledgement.pause() }
+        )
+        defer {
+            acknowledgement.resume()
+            fixture.server.stop()
+        }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let client = KeeperUDSClient(endpoint: fixture.endpoint)
+        let first = try await client.attach(fixture.attachRequest)
+
+        let replacementTicket = try await fixture.tickets.issue(
+            binding: fixture.attachRequest.binding,
+            capabilities: fixture.attachRequest.requestedCapabilities
+        )
+        try await supervisor.registerAttachTicket(
+            replacementTicket.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let replacementRequest = AttachRequest(
+            viewerID: fixture.viewerID,
+            wireTicket: replacementTicket.wireValue,
+            binding: fixture.attachRequest.binding,
+            requestedCapabilities: fixture.attachRequest.requestedCapabilities,
+            lastAcknowledgedOutputSequence: nil
+        )
+
+        let detached = CompletionFlag()
+        Task.detached {
+            await first.detach()
+            detached.markComplete()
+        }
+        #expect(await waitUntil { acknowledgement.entered && detached.isComplete })
+
+        let replacement = PendingResult<KeeperViewerConnection>()
+        Task.detached {
+            do { replacement.store(.success(try await client.attach(replacementRequest))) }
+            catch { replacement.store(.failure(error)) }
+        }
+        #expect(await waitUntil(timeout: .milliseconds(250)) { replacement.value != nil })
+        acknowledgement.resume()
+        let reattached = try #require(try replacement.value?.get())
+        await reattached.detach()
     }
 
     @Test func liveKeeperSocketIsNeverUnlinkedByACompetingServer() throws {
@@ -264,7 +797,11 @@ struct KeeperUDSTests {
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
         try await supervisor.registerInputLease(
             try InputLeaseGrant(
@@ -273,6 +810,7 @@ struct KeeperUDSTests {
                 sequenceBase: 1,
                 capabilities: [.input]
             ),
+            supervisorGeneration: fixture.supervisorGeneration,
             at: fixture.endpoint
         )
 
@@ -300,7 +838,11 @@ struct KeeperUDSTests {
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
         let payload = Data(
             repeating: 0xA7,
@@ -331,12 +873,58 @@ struct KeeperUDSTests {
         await viewer.detach()
     }
 
+    @Test func terminalInputChannelCarriesNearLimitProtobufWithoutBase64Expansion() async throws {
+        let fixture = try UDSFixture(peerUID: geteuid())
+        defer { fixture.server.stop() }
+        try fixture.server.start()
+        let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+        let viewer = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(
+            fixture.attachRequest
+        )
+        try await supervisor.registerInputLease(
+            try InputLeaseGrant(
+                validatingLeaseID: fixture.leaseID,
+                holderViewerID: fixture.viewerID,
+                sequenceBase: 1,
+                capabilities: [.input]
+            ),
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
+
+        let text = String(repeating: "x", count: 13 * 1_024 * 1_024)
+        let input = try fixture.input(sequence: 1, payload: .text(text))
+        let protobuf = try TerminalMessages.encode(
+            input,
+            channelID: .terminalInput,
+            negotiatedVersion: .current
+        ).serializedData()
+        #expect(protobuf.count < Int(FrameHeader.maximumPayloadLength))
+        #expect(
+            try JSONEncoder().encode(protobuf).count
+                > Int(FrameHeader.maximumPayloadLength)
+        )
+
+        #expect(try await viewer.send(input) == 1)
+        #expect(await fixture.effects.inputTextUTF8Count == text.utf8.count)
+        await viewer.detach()
+    }
+
     @Test func nonHolderConnectionCannotSpoofLeaseHolderContext() async throws {
         let fixture = try UDSFixture(peerUID: geteuid())
         defer { fixture.server.stop() }
         try fixture.server.start()
         let supervisor = KeeperControlClient(secretProvider: { _, _ in fixture.secret })
-        try await supervisor.registerAttachTicket(fixture.issued.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            fixture.issued.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let holder = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(fixture.attachRequest)
 
         let otherViewerID = ViewerID()
@@ -349,7 +937,11 @@ struct KeeperUDSTests {
             binding: otherBinding,
             capabilities: [.view, .input]
         )
-        try await supervisor.registerAttachTicket(otherTicket.registration, at: fixture.endpoint)
+        try await supervisor.registerAttachTicket(
+            otherTicket.registration,
+            supervisorGeneration: fixture.supervisorGeneration,
+            at: fixture.endpoint
+        )
         let other = try await KeeperUDSClient(endpoint: fixture.endpoint).attach(
             AttachRequest(
                 viewerID: otherViewerID,
@@ -366,6 +958,7 @@ struct KeeperUDSTests {
                 sequenceBase: 1,
                 capabilities: [.input]
             ),
+            supervisorGeneration: fixture.supervisorGeneration,
             at: fixture.endpoint
         )
 
@@ -395,17 +988,23 @@ private final class UDSFixture: @unchecked Sendable {
     let workerID = WorkerInstanceID()
     let viewerID = ViewerID()
     let leaseID = InputLeaseID()
+    let supervisorGeneration: UUID
     let tickets: TerminalAttachTicketStore
     let coordinator: TerminalStreamCoordinator
     let effects = UDSEffects()
     let terminated = TerminationCounter()
+    let supervisorEvents: InputLeaseRevocationBuffer
     let issued: IssuedTerminalAttachTicket
     let attachRequest: AttachRequest
     let inspectRequest: KeeperInspectRequest
     let server: KeeperUDSServer
     private let root: URL
 
-    init(peerUID: uid_t, capabilities: TerminalAttachCapabilities = [.view, .input]) throws {
+    init(
+        peerUID: uid_t,
+        capabilities: TerminalAttachCapabilities = [.view, .input],
+        afterViewerDetachAcknowledgement: (@Sendable () -> Void)? = nil
+    ) throws {
         root = URL(fileURLWithPath: "/private/tmp/cockpit-keeper-stream.\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
@@ -417,16 +1016,42 @@ private final class UDSFixture: @unchecked Sendable {
         let clock = FixedClock()
         let tickets = TerminalAttachTicketStore(clock: clock, randomBytes: UDSIncrementingBytes())
         self.tickets = tickets
-        coordinator = TerminalStreamCoordinator(
+        let supervisorEvents = InputLeaseRevocationBuffer()
+        self.supervisorEvents = supervisorEvents
+        let coordinator = TerminalStreamCoordinator(
             sessionID: sessionID,
             workerID: workerID,
             attachTicketPolicy: tickets,
-            performInput: { [effects] payload in await effects.record(payload) },
+            performInput: { [effects] payload in
+                if case let .signal(signal) = payload {
+                    await effects.signal(signal)
+                } else {
+                    await effects.record(payload)
+                }
+            },
             resetInputState: { [effects] in await effects.reset() },
-            reportLeaseRevoked: { [effects] lease in await effects.revoke(lease) },
+            reportLeaseRevoked: { [effects, supervisorEvents] grant, nextSequence in
+                await effects.revoke(grant.leaseID)
+                await supervisorEvents.recordLeaseRevocation(
+                    grant.leaseID,
+                    nextSequence: nextSequence
+                )
+            },
+            reportTicketConsumed: { [supervisorEvents] digest in
+                await supervisorEvents.recordAttachTicketConsumption(digest)
+            },
             signalForeground: { [effects] signal in await effects.signal(signal); return 100 },
             terminateSession: { [terminated] force in await terminated.record(force) }
         )
+        self.coordinator = coordinator
+        let supervisorGeneration = try KeeperSupervisorGeneration(epoch: 1).rawValue
+        self.supervisorGeneration = supervisorGeneration
+        _ = try waitAsync {
+            try await coordinator.beginSupervisorGeneration(
+                supervisorGeneration,
+                events: supervisorEvents
+            )
+        }
         let binding = TerminalAttachBinding(
             sessionID: sessionID,
             workerID: workerID,
@@ -450,8 +1075,10 @@ private final class UDSFixture: @unchecked Sendable {
             endpoint: endpoint,
             workerSecret: secret,
             streamCoordinator: coordinator,
+            leaseRevocations: supervisorEvents,
             startHandler: { _ in try CLIProcessIdentity(validatingProcessID: 900, processGroupID: 900) },
             terminateHandler: { [terminated] force in await terminated.record(force) },
+            afterViewerDetachAcknowledgement: afterViewerDetachAcknowledgement,
             calls: DarwinUnixDomainSocketSystemCalls(),
             peerCredentials: FixedPeerReader(uid: peerUID)
         )
@@ -462,7 +1089,8 @@ private final class UDSFixture: @unchecked Sendable {
     func input(
         sequence: UInt64,
         payload: TerminalInput.Payload = .text("typed"),
-        clientInstanceID: ClientInstanceID? = nil
+        clientInstanceID: ClientInstanceID? = nil,
+        leaseID: InputLeaseID? = nil
     ) throws -> TerminalInput {
         try TerminalInput(
             validatingContext: RequestContext(
@@ -475,7 +1103,7 @@ private final class UDSFixture: @unchecked Sendable {
                 requestID: RequestID()
             ),
             terminalSessionID: sessionID,
-            inputLeaseID: leaseID,
+            inputLeaseID: leaseID ?? self.leaseID,
             inputSequence: sequence,
             payload: payload
         )
@@ -620,6 +1248,14 @@ private actor UDSEffects {
     private(set) var resets = 0
     private(set) var revoked: [InputLeaseID] = []
     private(set) var signals: [TerminalSignal] = []
+    var inputTextUTF8Count: Int {
+        inputs.reduce(0) { partial, payload in
+            switch payload {
+            case let .text(value), let .paste(value): partial + value.utf8.count
+            default: partial
+            }
+        }
+    }
     func record(_ payload: TerminalInput.Payload) { inputs.append(payload) }
     func reset() { resets += 1 }
     func revoke(_ lease: InputLeaseID) { revoked.append(lease) }
@@ -658,6 +1294,29 @@ private final class CompletionFlag: @unchecked Sendable {
     private var completed = false
     var isComplete: Bool { lock.withLock { completed } }
     func markComplete() { lock.withLock { completed = true } }
+}
+
+private final class BlockingHook: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var didEnter = false
+    private var released = false
+
+    var entered: Bool { condition.withLock { didEnter } }
+
+    func pause() {
+        condition.lock()
+        didEnter = true
+        condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock()
+    }
+
+    func resume() {
+        condition.withLock {
+            released = true
+            condition.broadcast()
+        }
+    }
 }
 
 private final class PendingResult<Value: Sendable>: @unchecked Sendable {

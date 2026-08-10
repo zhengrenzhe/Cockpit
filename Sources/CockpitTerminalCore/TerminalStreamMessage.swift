@@ -15,6 +15,7 @@ public enum TerminalStreamError: String, Error, Hashable, Codable, Sendable {
     case viewerAlreadyAttached
     case viewerNotAttached
     case inputLeaseRequired
+    case leaseHeld
     case invalidInputLease
     case nonMonotonicInputSequence
     case capabilityDenied
@@ -84,22 +85,49 @@ public struct TerminalOutputFrame: Hashable, Codable, Sendable {
         self.fragments = fragments
     }
 
-    static func coalescing(
+    package static func coalescing(
         _ first: TerminalOutputFrame,
         _ second: TerminalOutputFrame
     ) -> TerminalOutputFrame {
         let fragments: [Data]
-        if second.kind == .snapshot, let latest = second.fragments.last {
-            fragments = [latest]
+        if second.kind == .snapshot {
+            fragments = second.fragments
         } else {
             fragments = first.fragments + second.fragments
+        }
+        let kind: TerminalStreamFrameKind
+        if first.kind == .snapshot || second.kind == .snapshot {
+            kind = .snapshot
+        } else if first.kind == .delta || second.kind == .delta {
+            kind = .delta
+        } else {
+            kind = .scrollback
         }
         return try! TerminalOutputFrame(
             firstOutputSequence: first.firstOutputSequence,
             outputSequence: second.outputSequence,
-            kind: second.kind,
+            kind: kind,
             fragments: fragments
         )
+    }
+
+    package static func enqueueBounded(
+        _ frame: TerminalOutputFrame,
+        into buffered: inout [TerminalOutputFrame]
+    ) {
+        if buffered.count < 2 {
+            buffered.append(frame)
+        } else {
+            buffered = [coalescing(buffered[0], buffered[1]), frame]
+        }
+    }
+
+    @_spi(CockpitTerminalApp)
+    public static func enqueueForTerminalApp(
+        _ frame: TerminalOutputFrame,
+        into buffered: inout [TerminalOutputFrame]
+    ) {
+        enqueueBounded(frame, into: &buffered)
     }
 }
 

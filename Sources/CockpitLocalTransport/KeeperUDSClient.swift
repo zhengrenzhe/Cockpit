@@ -21,10 +21,10 @@ struct KeeperSupervisorAuthenticated: Hashable, Codable, Sendable {
 enum KeeperViewerRequest: Hashable, Codable, Sendable {
     case attach(AttachRequest)
     case nextOutput
-    case input(Data)
     case visible(Bool)
-    case signal(TerminalSignal)
-    case terminate(Bool)
+    case signalInput(Data)
+    case signal(TerminalSignal, InputLeaseID)
+    case terminate(Bool, InputLeaseID)
     case detach
 }
 
@@ -129,6 +129,7 @@ enum KeeperStreamFailure: String, Hashable, Codable, Sendable {
     case bindingMismatch
     case capabilityEscalation
     case inputLeaseRequired
+    case leaseHeld
     case invalidInputLease
     case nonMonotonicInputSequence
     case capabilityDenied
@@ -149,6 +150,7 @@ enum KeeperStreamFailure: String, Hashable, Codable, Sendable {
         case .bindingMismatch: TerminalAttachTicketError.bindingMismatch
         case .capabilityEscalation: TerminalAttachTicketError.capabilityEscalation
         case .inputLeaseRequired: TerminalStreamError.inputLeaseRequired
+        case .leaseHeld: TerminalStreamError.leaseHeld
         case .invalidInputLease: TerminalStreamError.invalidInputLease
         case .nonMonotonicInputSequence: TerminalStreamError.nonMonotonicInputSequence
         case .capabilityDenied: TerminalStreamError.capabilityDenied
@@ -177,6 +179,7 @@ enum KeeperStreamFailure: String, Hashable, Codable, Sendable {
             return switch value {
             case .authenticationFailed: .authenticationFailed
             case .inputLeaseRequired: .inputLeaseRequired
+            case .leaseHeld: .leaseHeld
             case .invalidInputLease: .invalidInputLease
             case .nonMonotonicInputSequence: .nonMonotonicInputSequence
             case .capabilityDenied: .capabilityDenied
@@ -237,6 +240,10 @@ final class KeeperStreamConnection: @unchecked Sendable {
 
     func write<Value: Encodable>(_ value: Value, channel: ChannelID) throws {
         let payload = try JSONEncoder().encode(value)
+        try writePayload(payload, channel: channel)
+    }
+
+    func writePayload(_ payload: Data, channel: ChannelID) throws {
         guard payload.count <= Int(FrameHeader.maximumPayloadLength) else {
             throw TerminalStreamError.malformedMessage
         }
@@ -273,6 +280,14 @@ final class KeeperStreamConnection: @unchecked Sendable {
     }
 
     func read<Value: Decodable>(_ type: Value.Type) throws -> (ChannelID, Value) {
+        let (channel, payload) = try readPayload()
+        let decoded: Value
+        do { decoded = try JSONDecoder().decode(type, from: payload) }
+        catch { throw TerminalStreamError.malformedMessage }
+        return (channel, decoded)
+    }
+
+    func readPayload() throws -> (ChannelID, Data) {
         try readLock.withLock {
             try owner.withDescriptor { descriptor in
                 var headerBytes = Data(count: FrameHeader.encodedLength)
@@ -291,16 +306,13 @@ final class KeeperStreamConnection: @unchecked Sendable {
                 }
                 var payload = Data(count: Int(header.payloadLength))
                 try payload.withUnsafeMutableBytes { try readAll($0, from: descriptor) }
-                let decoded: Value
-                do { decoded = try JSONDecoder().decode(type, from: payload) }
-                catch { throw TerminalStreamError.malformedMessage }
                 stateLock.withLock {
                     var current = channelStates[header.channel, default: ChannelState()]
                     current.receivedSequence = header.sequence
                     current.peerAcknowledgement = header.acknowledgement
                     channelStates[header.channel] = current
                 }
-                return (header.channel, decoded)
+                return (header.channel, payload)
             }
         }
     }
@@ -502,6 +514,7 @@ public actor KeeperViewerConnection {
     ] = []
     private var terminalError: (any Error)?
     private var detached = false
+    private var detaching = false
 
     init(
         stream: KeeperStreamConnection,
@@ -545,13 +558,25 @@ public actor KeeperViewerConnection {
     }
 
     public func send(_ input: TerminalInput) async throws -> UInt64 {
+        if case .signal = input.payload {
+            let message = try TerminalMessages.encode(
+                input,
+                channelID: .control,
+                negotiatedVersion: .current
+            )
+            let data = try message.serializedData()
+            return try await request(.signalInput(data), channel: .control) { response in
+                if case let .inputAcknowledged(sequence) = response { return sequence }
+                throw Self.responseError(response)
+            }
+        }
         let message = try TerminalMessages.encode(
             input,
-            channelID: input.payload.isSignal ? .control : .terminalInput,
+            channelID: .terminalInput,
             negotiatedVersion: .current
         )
         let data = try message.serializedData()
-        return try await request(.input(data), channel: .terminalInput) { response in
+        return try await requestPayload(data, channel: .terminalInput) { response in
             if case let .inputAcknowledged(sequence) = response { return sequence }
             throw Self.responseError(response)
         }
@@ -565,15 +590,18 @@ public actor KeeperViewerConnection {
         }
     }
 
-    public func signal(_ signal: TerminalSignal) async throws -> Int32 {
-        try await request(.signal(signal), channel: .control) { response in
+    public func signal(
+        _ signal: TerminalSignal,
+        leaseID: InputLeaseID
+    ) async throws -> Int32 {
+        try await request(.signal(signal, leaseID), channel: .control) { response in
             if case let .signalDelivered(group) = response { return group }
             throw Self.responseError(response)
         }
     }
 
-    public func terminate(force: Bool) async throws {
-        _ = try await request(.terminate(force), channel: .control) {
+    public func terminate(force: Bool, leaseID: InputLeaseID) async throws {
+        _ = try await request(.terminate(force, leaseID), channel: .control) {
             response -> Bool in
             if case .acknowledged = response { return true }
             throw Self.responseError(response)
@@ -581,8 +609,8 @@ public actor KeeperViewerConnection {
     }
 
     public func detach() async {
-        guard !detached else { return }
-        detached = true
+        guard !detached, !detaching else { return }
+        detaching = true
         _ = try? await request(.detach, channel: .control) {
             response -> Bool in
             if case .acknowledged = response { return true }
@@ -596,7 +624,24 @@ public actor KeeperViewerConnection {
         channel: ChannelID,
         transform: @escaping @Sendable (KeeperViewerResponse) throws -> Result
     ) async throws -> Result {
-        guard !detached || request == .detach else { throw TerminalStreamError.disconnected }
+        let payload = try JSONEncoder().encode(request)
+        return try await requestPayload(
+            payload,
+            channel: channel,
+            allowDuringDetaching: request == .detach,
+            transform: transform
+        )
+    }
+
+    private func requestPayload<Result: Sendable>(
+        _ payload: Data,
+        channel: ChannelID,
+        allowDuringDetaching: Bool = false,
+        transform: @escaping @Sendable (KeeperViewerResponse) throws -> Result
+    ) async throws -> Result {
+        guard !detached, !detaching || allowDuringDetaching else {
+            throw TerminalStreamError.disconnected
+        }
         if let terminalError { throw terminalError }
         let id = UUID()
         let response: Swift.Result<KeeperViewerResponse, any Error> = await withCheckedContinuation {
@@ -606,7 +651,7 @@ public actor KeeperViewerConnection {
             )
             let stream = self.stream
             writeQueue.async { [weak self, stream] in
-                do { try stream.write(request, channel: channel) }
+                do { try stream.writePayload(payload, channel: channel) }
                 catch {
                     Task { await self?.requestWriteFailed(id: id, error: error) }
                 }
@@ -650,24 +695,7 @@ public actor KeeperViewerConnection {
             outputWaiters.removeFirst().resume(returning: .success(frame))
             return
         }
-        if bufferedOutput.count < 2 {
-            bufferedOutput.append(frame)
-            return
-        }
-        let prior = bufferedOutput[1]
-        let fragments: [Data]
-        if prior.kind == .snapshot, let latest = prior.fragments.last {
-            fragments = [latest]
-        } else {
-            fragments = bufferedOutput[0].fragments + prior.fragments
-        }
-        let merged = try! TerminalOutputFrame(
-            firstOutputSequence: bufferedOutput[0].firstOutputSequence,
-            outputSequence: prior.outputSequence,
-            kind: prior.kind,
-            fragments: fragments
-        )
-        bufferedOutput = [merged, frame]
+        TerminalOutputFrame.enqueueBounded(frame, into: &bufferedOutput)
     }
 
     private func requestWriteFailed(id: UUID, error: any Error) {
@@ -693,6 +721,7 @@ public actor KeeperViewerConnection {
     private func finish() {
         guard !detached else { return }
         detached = true
+        detaching = false
         readerTask?.cancel()
         stream.close()
         resumeAllPending(with: .failure(TerminalStreamError.disconnected))
@@ -713,12 +742,5 @@ public actor KeeperViewerConnection {
     private static func responseError(_ response: KeeperViewerResponse) -> any Error {
         if case let .failure(error) = response { return error.error }
         return TerminalStreamError.malformedMessage
-    }
-}
-
-private extension TerminalInput.Payload {
-    var isSignal: Bool {
-        if case .signal = self { return true }
-        return false
     }
 }

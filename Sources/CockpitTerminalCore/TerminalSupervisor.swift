@@ -155,11 +155,27 @@ public actor TerminalSupervisor {
     }
 
     public func reconcile() async throws {
+        try await makeReconciler().reconcile()
+    }
+
+    @_spi(CockpitTerminalSupervisorComposition)
+    public func reconcile(sessionID: TerminalSessionID) async throws {
+        try await makeReconciler().reconcile(sessionID: sessionID)
+    }
+
+    @_spi(CockpitTerminalSupervisorComposition)
+    public func reconcileAfterTransientDisconnect(
+        sessionID: TerminalSessionID
+    ) async throws {
+        try await makeReconciler().reconcileAfterTransientDisconnect(sessionID: sessionID)
+    }
+
+    private func makeReconciler() throws -> TerminalReconciler {
         let archiveStore = try TerminalArchiveStore(
             applicationSupportRoot: configuration.applicationSupportRoot,
             terminalArchivesRoot: configuration.terminalArchivesRoot
         )
-        let reconciler = TerminalReconciler(
+        return TerminalReconciler(
             repository: repository,
             controller: controller,
             workerSecretDeriver: workerSecretDeriver,
@@ -168,7 +184,6 @@ public actor TerminalSupervisor {
                 runtimeDirectory: configuration.runtimeDirectory
             )
         )
-        try await reconciler.reconcile()
     }
 
     public func startCommittedSession(
