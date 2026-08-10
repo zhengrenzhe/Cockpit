@@ -43,12 +43,14 @@
 		8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */; };
 		995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BFB39C38A17E2083706555 /* AppDelegate.swift */; };
 		9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */ = {isa = PBXBuildFile; productRef = 5A754E919142603676936801 /* CockpitTerminalClient */; };
+		9D5FC418CC572EF2C0D4BAC6 /* GhosttyVTAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F212D66BE21DB1B93B562CF /* GhosttyVTAdapter.swift */; };
 		A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
 		A7DFA31121D9E31C872E4793 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 41F1F75F27D0D4B661D8228C /* CockpitPersistence */; };
 		B43C4F3BB2CABB70159B9558 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4B5AFD79708EC200DB637479 /* QuartzCore.framework */; };
 		B984303D116E24D3B243414B /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = D51DF015FEF9086662DEC115 /* CockpitTerminalCore */; };
 		BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 263DA7B80F345C7A4A093699 /* MonacoBridge.swift */; };
 		BD4D067AEA4D8DD58643509F /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D380A6D5A0B758FBC879A0 /* main.swift */; };
+		CFFBA4DA3EFF3DC697120576 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 21DEEFE2C1B69D1975B38A28 /* CockpitLocalTransport */; };
 		D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */; };
 		DE1A356D6AFAC3DA1F075DCB /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 98B021792EC132C38CE754AF /* CockpitLocalTransport */; };
 		E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */; };
@@ -105,6 +107,7 @@
 		03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridgeTests.swift; sourceTree = "<group>"; };
 		263DA7B80F345C7A4A093699 /* MonacoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridge.swift; sourceTree = "<group>"; };
 		2C3A65312477EAD5232A52B0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		3F212D66BE21DB1B93B562CF /* GhosttyVTAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyVTAdapter.swift; sourceTree = "<group>"; };
 		434FD56C66EABF9EB68397FE /* CockpitHost */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitHost; sourceTree = BUILT_PRODUCTS_DIR; };
 		44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoMessage.swift; sourceTree = "<group>"; };
 		48D380A6D5A0B758FBC879A0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
@@ -153,6 +156,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B984303D116E24D3B243414B /* CockpitTerminalCore in Frameworks */,
+				CFFBA4DA3EFF3DC697120576 /* CockpitLocalTransport in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -221,6 +225,7 @@
 		457080120E476759F1EC65C5 /* CockpitPTYKeeper */ = {
 			isa = PBXGroup;
 			children = (
+				3F212D66BE21DB1B93B562CF /* GhosttyVTAdapter.swift */,
 				2C3A65312477EAD5232A52B0 /* main.swift */,
 			);
 			name = CockpitPTYKeeper;
@@ -320,6 +325,7 @@
 			name = CockpitPTYKeeper;
 			packageProductDependencies = (
 				D51DF015FEF9086662DEC115 /* CockpitTerminalCore */,
+				21DEEFE2C1B69D1975B38A28 /* CockpitLocalTransport */,
 			);
 			productName = CockpitPTYKeeper;
 			productReference = E7CC18242186F71956E15599 /* CockpitPTYKeeper */;
@@ -572,6 +578,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9D5FC418CC572EF2C0D4BAC6 /* GhosttyVTAdapter.swift in Sources */,
 				69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1010,6 +1017,10 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		21DEEFE2C1B69D1975B38A28 /* CockpitLocalTransport */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = CockpitLocalTransport;
+		};
 		29A3733E9D6777F50A36E911 /* CockpitLocalTransport */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = CockpitLocalTransport;

@@ -134,12 +134,16 @@ let package = Package(
         ),
         .executableTarget(
             name: "CockpitTerminalSupervisor",
-            dependencies: ["CockpitTerminalCore", "CockpitLocalTransport"],
+            dependencies: [
+                "CockpitTerminalCore",
+                "CockpitLocalTransport",
+                "CockpitPersistence",
+            ],
             path: "Applications/CockpitTerminalSupervisor"
         ),
         .executableTarget(
             name: "CockpitPTYKeeper",
-            dependencies: ["CockpitTerminalCore"],
+            dependencies: ["CockpitTerminalCore", "CockpitLocalTransport"],
             path: "Applications/CockpitPTYKeeper"
         ),
         .executableTarget(

@@ -23,8 +23,6 @@ public struct KeeperProcessLauncher: Sendable {
     }
 
     public func launch(_ bootstrap: KeeperBootstrap) throws -> KeeperLaunchReceipt {
-        let payload = try JSONEncoder().encode(bootstrap)
-
         var pipeDescriptors = [Int32](repeating: -1, count: 2)
         let pipeResult = pipeDescriptors.withUnsafeMutableBufferPointer {
             Darwin.pipe($0.baseAddress)
@@ -153,7 +151,7 @@ public struct KeeperProcessLauncher: Sendable {
 
         do {
             try readHandle.close()
-            try writeHandle.write(contentsOf: payload)
+            try KeeperControlFraming.write(bootstrap, to: writeDescriptor)
             try writeHandle.close()
         } catch {
             let launchError = error
@@ -170,6 +168,108 @@ public struct KeeperProcessLauncher: Sendable {
             runtimeDescriptorPath: bootstrap.runtimeDescriptorPath
         )
     }
+}
+
+extension KeeperProcessLauncher: KeeperLaunching {
+    public func launch(_ bootstrap: KeeperBootstrap) async throws -> LaunchedKeeper {
+        _ = try bootstrap.validated()
+        var pair = try KeeperControlFraming.makeSocketPair()
+        do {
+            pair.parent = try moveAwayFromBootstrapDescriptor(pair.parent)
+            pair.child = try moveAwayFromBootstrapDescriptor(pair.child)
+        } catch {
+            Darwin.close(pair.parent)
+            Darwin.close(pair.child)
+            throw error
+        }
+        var parentOwned = true
+        var childOwned = true
+        defer {
+            if parentOwned { Darwin.close(pair.parent) }
+            if childOwned { Darwin.close(pair.child) }
+        }
+
+        var actions: posix_spawn_file_actions_t?
+        var attributes: posix_spawnattr_t?
+        var result = posix_spawn_file_actions_init(&actions)
+        guard result == 0 else {
+            throw KeeperLaunchFailure(operation: "posix_spawn_file_actions_init", code: result)
+        }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        result = posix_spawnattr_init(&attributes)
+        guard result == 0 else {
+            throw KeeperLaunchFailure(operation: "posix_spawnattr_init", code: result)
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        result = posix_spawn_file_actions_adddup2(
+            &actions,
+            pair.child,
+            KeeperBootstrap.inheritedFileDescriptor
+        )
+        guard result == 0 else {
+            throw KeeperLaunchFailure(operation: "posix_spawn_file_actions_adddup2", code: result)
+        }
+        for descriptor in [pair.parent, pair.child] {
+            result = posix_spawn_file_actions_addclose(&actions, descriptor)
+            guard result == 0 else {
+                throw KeeperLaunchFailure(operation: "posix_spawn_file_actions_addclose", code: result)
+            }
+        }
+        result = posix_spawnattr_setflags(&attributes, Self.spawnFlags)
+        guard result == 0 else {
+            throw KeeperLaunchFailure(operation: "posix_spawnattr_setflags", code: result)
+        }
+
+        var processID: pid_t = 0
+        result = executablePath.withCString { executable in
+            var arguments: [UnsafeMutablePointer<CChar>?] = [
+                UnsafeMutablePointer(mutating: executable),
+                nil,
+            ]
+            return arguments.withUnsafeMutableBufferPointer { buffer in
+                posix_spawn(
+                    &processID,
+                    executable,
+                    &actions,
+                    &attributes,
+                    buffer.baseAddress,
+                    environ
+                )
+            }
+        }
+        guard result == 0 else {
+            throw KeeperLaunchFailure(operation: "posix_spawn", code: result)
+        }
+        Darwin.close(pair.child)
+        childOwned = false
+        do {
+            try KeeperControlFraming.write(bootstrap, to: pair.parent)
+        } catch {
+            Darwin.close(pair.parent)
+            parentOwned = false
+            try? terminateAndReap(processID)
+            throw error
+        }
+        parentOwned = false
+        return LaunchedKeeper(
+            sessionID: bootstrap.sessionID,
+            workerID: bootstrap.workerInstanceID,
+            processID: processID,
+            bootstrapControlDescriptor: pair.parent,
+            runtimeDescriptorPath: bootstrap.runtimeDescriptorPath
+        )
+    }
+}
+
+private func moveAwayFromBootstrapDescriptor(_ descriptor: Int32) throws -> Int32 {
+    guard descriptor == KeeperBootstrap.inheritedFileDescriptor else { return descriptor }
+    let duplicated = fcntl(descriptor, F_DUPFD_CLOEXEC, 4)
+    guard duplicated >= 0 else {
+        throw KeeperLaunchFailure(operation: "fcntl(F_DUPFD_CLOEXEC)", code: errno)
+    }
+    Darwin.close(descriptor)
+    return duplicated
 }
 
 private func terminateAndReap(_ processID: pid_t) throws {

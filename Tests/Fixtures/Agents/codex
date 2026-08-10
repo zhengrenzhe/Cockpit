@@ -1,0 +1,16 @@
+#!/bin/zsh
+set -euo pipefail
+output=${1:?output path required}
+shift
+{
+  print -r -- "agent=codex"
+  print -r -- "cwd=$PWD"
+  print -r -- "pid=$$ pgid=$(/bin/ps -o pgid= -p $$ | /usr/bin/tr -d ' ') sid=$(/bin/ps -o sess= -p $$ | /usr/bin/tr -d ' ')"
+  print -r -- "args=$*"
+} > "$output"
+if [[ "${1:-}" == --wait-with-child ]]; then
+  /bin/sleep 30 &
+  child=$!
+  print -r -- "child=$child" >> "$output"
+  wait "$child"
+fi

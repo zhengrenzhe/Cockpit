@@ -96,6 +96,8 @@ targets:
       - target: CockpitGhosttyArtifacts
       - package: CockpitKit
         product: CockpitTerminalCore
+      - package: CockpitKit
+        product: CockpitLocalTransport
   Cockpit:
     type: application
     platform: macOS
