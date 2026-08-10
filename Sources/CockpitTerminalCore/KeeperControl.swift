@@ -271,6 +271,34 @@ public enum KeeperAuthentication {
         )
     }
 
+    public static func supervisorProof(
+        secret: Data,
+        endpoint: KeeperEndpoint,
+        nonce: Data
+    ) -> Data {
+        proof(
+            secret: secret,
+            domain: "cockpit-keeper-supervisor-v1",
+            endpoint: endpoint,
+            sessionID: endpoint.sessionID,
+            workerID: endpoint.workerID,
+            payload: nonce
+        )
+    }
+
+    public static func verifySupervisorProof(
+        _ candidate: Data,
+        secret: Data,
+        endpoint: KeeperEndpoint,
+        nonce: Data
+    ) -> Bool {
+        verify(
+            candidate,
+            secret: secret,
+            expected: supervisorProof(secret: secret, endpoint: endpoint, nonce: nonce)
+        )
+    }
+
     private static func proof(
         secret: Data,
         domain: String,

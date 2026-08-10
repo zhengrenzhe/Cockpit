@@ -12,6 +12,11 @@ enum KeeperControlEnvelope: Hashable, Codable, Sendable {
     case identity(KeeperIdentity)
     case started(CLIProcessIdentity)
     case acknowledged
+    case registerAttachTicket(TerminalAttachTicketRegistration)
+    case registerInputLease(InputLeaseGrant)
+    case revokeInputLease(InputLeaseID)
+    case takeLeaseRevocations
+    case leaseRevocations([InputLeaseID])
     case failure(KeeperControlWireError)
 }
 
@@ -271,23 +276,107 @@ public actor KeeperControlClient: KeeperControlling {
         }
     }
 
+    public func registerAttachTicket(
+        _ registration: TerminalAttachTicketRegistration,
+        at endpoint: KeeperEndpoint
+    ) async throws {
+        try validate(endpoint: endpoint)
+        _ = try await requestOverUDS(
+            endpoint: endpoint,
+            request: .registerAttachTicket(registration)
+        ) { envelope -> Bool in
+            if case .acknowledged = envelope { return true }
+            throw Self.responseError(envelope)
+        }
+    }
+
+    public func registerInputLease(
+        _ grant: InputLeaseGrant,
+        at endpoint: KeeperEndpoint
+    ) async throws {
+        try validate(endpoint: endpoint)
+        _ = try await requestOverUDS(
+            endpoint: endpoint,
+            request: .registerInputLease(grant)
+        ) { envelope -> Bool in
+            if case .acknowledged = envelope { return true }
+            throw Self.responseError(envelope)
+        }
+    }
+
+    public func revokeInputLease(
+        _ leaseID: InputLeaseID,
+        at endpoint: KeeperEndpoint
+    ) async throws {
+        try validate(endpoint: endpoint)
+        _ = try await requestOverUDS(
+            endpoint: endpoint,
+            request: .revokeInputLease(leaseID)
+        ) { envelope -> Bool in
+            if case .acknowledged = envelope { return true }
+            throw Self.responseError(envelope)
+        }
+    }
+
+    public func takeLeaseRevocations(at endpoint: KeeperEndpoint) async throws -> [InputLeaseID] {
+        try validate(endpoint: endpoint)
+        return try await requestOverUDS(
+            endpoint: endpoint,
+            request: .takeLeaseRevocations
+        ) { envelope in
+            if case let .leaseRevocations(values) = envelope { return values }
+            throw Self.responseError(envelope)
+        }
+    }
+
     private func requestOverUDS<Result: Sendable>(
         endpoint: KeeperEndpoint,
         request: KeeperControlEnvelope,
         response: @escaping @Sendable (KeeperControlEnvelope) throws -> Result
     ) async throws -> Result {
-        try await blocking {
+        let secret = try await secretProvider(endpoint.sessionID, endpoint.workerID)
+        let nonce = try randomNonce()
+        return try await blocking {
             let calls = DarwinUnixDomainSocketSystemCalls()
             let descriptor = try calls.createStreamSocket()
             defer { calls.close(descriptor) }
             try calls.setCloseOnExec(descriptor)
             try calls.setNoSigPipe(descriptor)
             try calls.connect(descriptor, to: UnixDomainSocketAddress(path: endpoint.path))
-            try KeeperControlFraming.write(request, to: descriptor)
+            let stream = KeeperStreamConnection(descriptor: descriptor)
+            try stream.performClientHandshake(role: .supervisorControl)
+            try stream.write(
+                KeeperSupervisorAuthentication(
+                    endpoint: endpoint,
+                    nonce: nonce,
+                    proofMAC: KeeperAuthentication.supervisorProof(
+                        secret: secret,
+                        endpoint: endpoint,
+                        nonce: nonce
+                    )
+                ),
+                channel: .control
+            )
+            let authenticated = try stream.read(
+                KeeperSupervisorAuthenticated.self,
+                expectedChannel: .control
+            )
+            guard authenticated.endpoint == endpoint else {
+                throw KeeperControlError.identityMismatch
+            }
+            try stream.write(request, channel: .control)
             return try response(
-                KeeperControlFraming.read(KeeperControlEnvelope.self, from: descriptor)
+                stream.read(KeeperControlEnvelope.self, expectedChannel: .control)
             )
         }
+    }
+
+    private func validate(endpoint: KeeperEndpoint) throws {
+        _ = try KeeperEndpoint(
+            path: endpoint.path,
+            sessionID: endpoint.sessionID,
+            workerID: endpoint.workerID
+        )
     }
 
     private static func startedIdentity(_ envelope: KeeperControlEnvelope) throws -> CLIProcessIdentity {

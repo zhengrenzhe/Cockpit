@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import CockpitProtocol
 import CockpitTerminalCore
 import CockpitTypes
 
@@ -12,27 +13,40 @@ public final class KeeperUDSServer: @unchecked Sendable {
 
     private let endpoint: KeeperEndpoint
     private let workerSecret: Data
+    private let streamCoordinator: TerminalStreamCoordinator?
+    private let leaseRevocations: InputLeaseRevocationBuffer?
     private let startHandler: StartHandler
     private let terminateHandler: TerminateHandler
     private let calls: any UnixDomainSocketSystemCalls
     private let peerCredentials: any PeerCredentialReading
     private let stateLock = NSLock()
     private let worker = DispatchQueue(label: "dev.cockpit.keeper-control")
+    private let connections = DispatchQueue(
+        label: "dev.cockpit.keeper-connections",
+        attributes: .concurrent
+    )
     private let workerGroup = DispatchGroup()
     private var listener: Int32?
     private var socketIdentity: UnixSocketPathStatus?
     private var stopped = false
     private var acceptedStart: AuthenticatedStartRequest?
     private var processIdentity: CLIProcessIdentity?
+    private var acceptedDescriptors: Set<Int32> = []
+    private var viewerByDescriptor: [Int32: ViewerID] = [:]
+    private var waitingOutputViewers: Set<ViewerID> = []
 
     public init(
         endpoint: KeeperEndpoint,
         workerSecret: Data,
+        streamCoordinator: TerminalStreamCoordinator? = nil,
+        leaseRevocations: InputLeaseRevocationBuffer? = nil,
         startHandler: @escaping StartHandler,
         terminateHandler: @escaping TerminateHandler
     ) {
         self.endpoint = endpoint
         self.workerSecret = workerSecret
+        self.streamCoordinator = streamCoordinator
+        self.leaseRevocations = leaseRevocations
         self.startHandler = startHandler
         self.terminateHandler = terminateHandler
         calls = DarwinUnixDomainSocketSystemCalls()
@@ -42,6 +56,8 @@ public final class KeeperUDSServer: @unchecked Sendable {
     init(
         endpoint: KeeperEndpoint,
         workerSecret: Data,
+        streamCoordinator: TerminalStreamCoordinator? = nil,
+        leaseRevocations: InputLeaseRevocationBuffer? = nil,
         startHandler: @escaping StartHandler,
         terminateHandler: @escaping TerminateHandler,
         calls: any UnixDomainSocketSystemCalls,
@@ -49,6 +65,8 @@ public final class KeeperUDSServer: @unchecked Sendable {
     ) {
         self.endpoint = endpoint
         self.workerSecret = workerSecret
+        self.streamCoordinator = streamCoordinator
+        self.leaseRevocations = leaseRevocations
         self.startHandler = startHandler
         self.terminateHandler = terminateHandler
         self.calls = calls
@@ -71,29 +89,69 @@ public final class KeeperUDSServer: @unchecked Sendable {
             }
             if let existing = try calls.pathStatus(endpoint.path) {
                 guard existing.kind == .socket,
-                      existing.owner == calls.effectiveUserID() else {
+                      existing.owner == calls.effectiveUserID(),
+                      existing.permissions & 0o777 == 0o600 else {
                     throw UnixDomainSocketError.unsafeSocket
                 }
-                try calls.unlink(endpoint.path)
+                let probe = try calls.createStreamSocket()
+                defer { calls.close(probe) }
+                try calls.setCloseOnExec(probe)
+                try calls.setNoSigPipe(probe)
+                let connectFailure: Int32
+                do {
+                    try calls.connect(
+                        probe,
+                        to: UnixDomainSocketAddress(path: endpoint.path)
+                    )
+                    throw UnixDomainSocketError.serverAlreadyRunning
+                } catch let error as UnixDomainSocketError {
+                    guard case let .systemCall(function, value) = error,
+                          function == "connect",
+                          value == ECONNREFUSED || value == ENOENT else {
+                        throw error
+                    }
+                    connectFailure = value
+                }
+                let rechecked = try calls.pathStatus(endpoint.path)
+                if rechecked == nil,
+                   connectFailure == ECONNREFUSED || connectFailure == ENOENT {
+                    // The stale path vanished. bind below remains the atomic arbiter.
+                } else if rechecked == existing {
+                    try calls.unlink(endpoint.path)
+                } else {
+                    throw UnixDomainSocketError.staleSocketRace
+                }
             }
             let descriptor = try calls.createStreamSocket()
+            var cleanupIdentity: UnixSocketPathStatus?
             do {
                 try calls.setCloseOnExec(descriptor)
                 try calls.setNoSigPipe(descriptor)
                 try calls.bind(descriptor, to: UnixDomainSocketAddress(path: endpoint.path))
+                if let identity = try calls.pathStatus(endpoint.path),
+                   identity.kind == .socket,
+                   identity.owner == calls.effectiveUserID() {
+                    cleanupIdentity = identity
+                }
                 try calls.setPermissions(endpoint.path, permissions: 0o600)
                 try calls.listen(descriptor, backlog: 16)
                 guard let identity = try calls.pathStatus(endpoint.path),
                       identity.kind == .socket,
                       identity.owner == calls.effectiveUserID(),
-                      identity.permissions & 0o777 == 0o600 else {
+                      identity.permissions & 0o777 == 0o600,
+                      cleanupIdentity?.device == identity.device,
+                      cleanupIdentity?.inode == identity.inode else {
                     throw UnixDomainSocketError.permissionMismatch
                 }
                 listener = descriptor
                 socketIdentity = identity
             } catch {
                 calls.close(descriptor)
-                try? calls.unlink(endpoint.path)
+                if let cleanupIdentity,
+                   let current = try? calls.pathStatus(endpoint.path),
+                   current == cleanupIdentity {
+                    try? calls.unlink(endpoint.path)
+                }
                 throw error
             }
             workerGroup.enter()
@@ -105,17 +163,27 @@ public final class KeeperUDSServer: @unchecked Sendable {
     }
 
     public func stop() {
-        let descriptor = stateLock.withLock { () -> Int32? in
-            guard !stopped else { return nil }
+        let state = stateLock.withLock { () -> (Int32?, [Int32], Set<ViewerID>) in
+            guard !stopped else { return (nil, [], []) }
             stopped = true
-            return listener
+            return (listener, Array(acceptedDescriptors), Set(viewerByDescriptor.values))
         }
-        guard let descriptor else { return }
+        guard let descriptor = state.0 else { return }
+        for accepted in state.1 { _ = Darwin.shutdown(accepted, SHUT_RDWR) }
+        if let streamCoordinator {
+            for viewerID in state.2 {
+                waitForVoid { await streamCoordinator.detach(viewerID: viewerID) }
+            }
+        }
         wakeAcceptLoop()
         workerGroup.wait()
         calls.close(descriptor)
         stateLock.withLock { listener = nil }
         removeOwnedSocket()
+    }
+
+    func pendingOutputWaiterCount() -> Int {
+        stateLock.withLock { waitingOutputViewers.count }
     }
 
     private func acceptLoop(_ descriptor: Int32) {
@@ -130,25 +198,221 @@ public final class KeeperUDSServer: @unchecked Sendable {
                 calls.close(accepted)
                 return
             }
-            do {
-                try calls.setCloseOnExec(accepted)
-                try calls.setNoSigPipe(accepted)
-                let peer = try peerCredentials.peerCredentials(for: accepted)
-                guard peer.uid == calls.effectiveUserID() else {
+            let admitted = stateLock.withLock { () -> Bool in
+                guard !stopped else { return false }
+                acceptedDescriptors.insert(accepted)
+                return true
+            }
+            guard admitted else {
+                calls.close(accepted)
+                return
+            }
+            workerGroup.enter()
+            connections.async { [self] in
+                defer {
+                    stateLock.withLock {
+                        acceptedDescriptors.remove(accepted)
+                        viewerByDescriptor.removeValue(forKey: accepted)
+                    }
+                    calls.close(accepted)
+                    workerGroup.leave()
+                }
+                handleConnection(accepted)
+            }
+        }
+    }
+
+    private func handleConnection(_ accepted: Int32) {
+        do {
+            try calls.setCloseOnExec(accepted)
+            try calls.setNoSigPipe(accepted)
+            let peer = try peerCredentials.peerCredentials(for: accepted)
+            guard peer.uid == calls.effectiveUserID() else {
+                throw KeeperControlError.authenticationFailed
+            }
+            let stream = KeeperStreamConnection(descriptor: accepted, ownsDescriptor: false)
+            switch try stream.performServerHandshake() {
+            case .supervisorControl:
+                let authentication = try stream.read(
+                    KeeperSupervisorAuthentication.self,
+                    expectedChannel: .control
+                )
+                guard authentication.endpoint == endpoint,
+                      authentication.nonce.count == 16,
+                      KeeperAuthentication.verifySupervisorProof(
+                        authentication.proofMAC,
+                        secret: workerSecret,
+                        endpoint: endpoint,
+                        nonce: authentication.nonce
+                      ) else {
                     throw KeeperControlError.authenticationFailed
                 }
-                let request = try KeeperControlFraming.read(
-                    KeeperControlEnvelope.self,
-                    from: accepted
+                try stream.write(
+                    KeeperSupervisorAuthenticated(endpoint: endpoint),
+                    channel: .control
                 )
-                try KeeperControlFraming.write(handle(request), to: accepted)
+                let request = try stream.read(
+                    KeeperControlEnvelope.self,
+                    expectedChannel: .control
+                )
+                do {
+                    try stream.write(handle(request), channel: .control)
+                } catch {
+                    try? stream.write(
+                        KeeperControlEnvelope.failure(Self.wireError(error)),
+                        channel: .control
+                    )
+                }
+            case .viewer:
+                try handleViewer(stream, descriptor: accepted)
+            }
+        } catch {
+            _ = error
+        }
+    }
+
+    private func handleViewer(_ stream: KeeperStreamConnection, descriptor: Int32) throws {
+        guard let streamCoordinator else { throw TerminalStreamError.authenticationFailed }
+        let first = try stream.read(
+            KeeperViewerRequest.self,
+            expectedChannel: .control
+        )
+        guard case let .attach(request) = first else {
+            throw TerminalStreamError.authenticationFailed
+        }
+        let viewerID = request.viewerID
+        let attachment: Attachment
+        do {
+            attachment = try waitForAsync { try await streamCoordinator.attach(request) }
+        } catch {
+            try stream.write(
+                KeeperViewerResponse.failure(KeeperStreamFailure.map(error)),
+                channel: .control
+            )
+            return
+        }
+        var outputPump: Task<Void, Never>?
+        defer {
+            _ = stateLock.withLock { viewerByDescriptor.removeValue(forKey: descriptor) }
+            waitForVoid { await streamCoordinator.detach(viewerID: viewerID) }
+            if let outputPump { waitForVoid { _ = await outputPump.result } }
+        }
+        let admitted = stateLock.withLock { () -> Bool in
+            guard !stopped else { return false }
+            viewerByDescriptor[descriptor] = viewerID
+            return true
+        }
+        guard admitted else { return }
+        do {
+            try stream.write(
+                KeeperViewerResponse.attached(attachment.capabilities),
+                channel: .control
+            )
+        } catch {
+            return
+        }
+        outputPump = Task.detached { [self, streamCoordinator, stream] in
+            await pumpOutput(
+                viewerID: viewerID,
+                coordinator: streamCoordinator,
+                stream: stream
+            )
+        }
+
+        while !stateLock.withLock({ stopped }) {
+            let message: (ChannelID, KeeperViewerRequest)
+            do { message = try stream.read(KeeperViewerRequest.self) }
+            catch { return }
+            let responseChannel: ChannelID
+            do {
+                switch message.1 {
+                case .attach:
+                    throw TerminalStreamError.malformedMessage
+                case .nextOutput:
+                    throw TerminalStreamError.malformedMessage
+                case let .input(payload):
+                    guard message.0 == .terminalInput else { throw TerminalStreamError.wrongChannel }
+                    let proto = try CPTerminalInput(serializedBytes: payload)
+                    let input = try TerminalMessages.decode(
+                        proto,
+                        channelID: .terminalInput,
+                        negotiatedVersion: .current
+                    )
+                    guard input.context.clientInstanceID.rawValue == viewerID.rawValue else {
+                        throw TerminalStreamError.inputLeaseRequired
+                    }
+                    let required: TerminalAttachCapabilities = switch input.payload {
+                    case .text, .key, .paste, .mouse: .input
+                    case .resize: .resize
+                    case .signal: .signal
+                    }
+                    guard attachment.capabilities.contains(required) else {
+                        throw TerminalStreamError.capabilityDenied
+                    }
+                    let ack = try waitForAsync { try await streamCoordinator.acceptInput(input) }
+                    responseChannel = .terminalInput
+                    try stream.write(
+                        KeeperViewerResponse.inputAcknowledged(ack),
+                        channel: responseChannel
+                    )
+                case .visible:
+                    guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
+                    responseChannel = .control
+                    try stream.write(KeeperViewerResponse.acknowledged, channel: responseChannel)
+                case let .signal(signal):
+                    guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
+                    let group = try waitForAsync {
+                        try await streamCoordinator.signal(signal, viewerID: viewerID)
+                    }
+                    responseChannel = .control
+                    try stream.write(KeeperViewerResponse.signalDelivered(group), channel: responseChannel)
+                case let .terminate(force):
+                    guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
+                    try waitForAsync {
+                        try await streamCoordinator.terminate(force: force, viewerID: viewerID)
+                    }
+                    responseChannel = .control
+                    try stream.write(KeeperViewerResponse.acknowledged, channel: responseChannel)
+                case .detach:
+                    guard message.0 == .control else { throw TerminalStreamError.wrongChannel }
+                    try stream.write(KeeperViewerResponse.acknowledged, channel: .control)
+                    return
+                }
             } catch {
-                try? KeeperControlFraming.write(
-                    KeeperControlEnvelope.failure(Self.wireError(error)),
-                    to: accepted
+                let channel: ChannelID = message.0 == .terminalInput ? .terminalInput : .control
+                try? stream.write(
+                    KeeperViewerResponse.failure(KeeperStreamFailure.map(error)),
+                    channel: channel
                 )
             }
-            calls.close(accepted)
+        }
+    }
+
+    private func pumpOutput(
+        viewerID: ViewerID,
+        coordinator: TerminalStreamCoordinator,
+        stream: KeeperStreamConnection
+    ) async {
+        while !Task.isCancelled {
+            _ = stateLock.withLock { waitingOutputViewers.insert(viewerID) }
+            let output: TerminalOutputFrame?
+            do { output = try await coordinator.nextOutput(viewerID: viewerID) }
+            catch {
+                _ = stateLock.withLock { waitingOutputViewers.remove(viewerID) }
+                return
+            }
+            _ = stateLock.withLock { waitingOutputViewers.remove(viewerID) }
+            guard let output else { return }
+            do {
+                for page in KeeperOutputPage.pages(for: output) {
+                    try stream.write(
+                        KeeperViewerResponse.outputPage(page),
+                        channel: .terminalOutput
+                    )
+                }
+            } catch {
+                return
+            }
         }
     }
 
@@ -223,6 +487,31 @@ public final class KeeperUDSServer: @unchecked Sendable {
             }
             return .acknowledged
 
+        case let .registerAttachTicket(registration):
+            guard registration.binding.sessionID == endpoint.sessionID,
+                  registration.binding.workerID == endpoint.workerID,
+                  let streamCoordinator else {
+                throw KeeperControlError.identityMismatch
+            }
+            try waitForAsync {
+                try await streamCoordinator.registerAttachTicket(registration)
+            }
+            return .acknowledged
+
+        case let .registerInputLease(grant):
+            guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
+            try waitForAsync { try await streamCoordinator.registerInputLease(grant) }
+            return .acknowledged
+
+        case let .revokeInputLease(leaseID):
+            guard let streamCoordinator else { throw KeeperControlError.noRunningProcess }
+            waitForVoid { await streamCoordinator.revokeInputLease(leaseID) }
+            return .acknowledged
+
+        case .takeLeaseRevocations:
+            guard let leaseRevocations else { return .leaseRevocations([]) }
+            return .leaseRevocations(try waitForAsync { await leaseRevocations.takeAll() })
+
         default:
             throw KeeperControlError.malformedMessage
         }
@@ -273,6 +562,15 @@ private func waitForAsync<Output: Sendable>(
     }
     semaphore.wait()
     return try box.load().get()
+}
+
+private func waitForVoid(_ operation: @escaping @Sendable () async -> Void) {
+    let semaphore = DispatchSemaphore(value: 0)
+    Task.detached {
+        await operation()
+        semaphore.signal()
+    }
+    semaphore.wait()
 }
 
 private final class AsyncResultBox<Output: Sendable>: @unchecked Sendable {

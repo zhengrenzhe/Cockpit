@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 import CockpitLocalTransport
 import CockpitTerminalCore
+import CockpitTypes
 
 if CommandLine.arguments.count >= 4,
    CommandLine.arguments[1] == "--cockpit-pty-child" {
@@ -52,8 +53,11 @@ final class KeeperSessionRuntime: @unchecked Sendable {
     private let frameQueue = DispatchQueue(label: "dev.cockpit.keeper.frame")
     private var acceptedStart: AuthenticatedStartRequest?
     private var session: PTYSession?
+    private var adapter: GhosttyVTAdapter?
+    private var streamCoordinator: TerminalStreamCoordinator?
     private var starting = false
     private var failed = false
+    private var outputSequence: UInt64 = 0
 
     init(
         bootstrap: KeeperBootstrap,
@@ -65,6 +69,12 @@ final class KeeperSessionRuntime: @unchecked Sendable {
         self.endpoint = endpoint
         self.bootstrapDescriptor = bootstrapDescriptor
         self.verifiedRoots = verifiedRoots
+    }
+
+    func installStreamCoordinator(_ coordinator: TerminalStreamCoordinator) {
+        condition.lock()
+        streamCoordinator = coordinator
+        condition.unlock()
     }
 
     func start(_ request: AuthenticatedStartRequest) throws -> CLIProcessIdentity {
@@ -110,6 +120,7 @@ final class KeeperSessionRuntime: @unchecked Sendable {
             )
             condition.lock()
             self.session = session
+            self.adapter = adapter
             starting = false
             condition.broadcast()
             condition.unlock()
@@ -143,6 +154,57 @@ final class KeeperSessionRuntime: @unchecked Sendable {
         return session != nil
     }
 
+    func performInput(_ payload: TerminalInput.Payload) throws {
+        condition.lock()
+        let current = session
+        let terminal = adapter
+        condition.unlock()
+        guard let current, let terminal else { throw KeeperControlError.noRunningProcess }
+        switch payload {
+        case let .text(text):
+            try current.write(Data(text.utf8))
+        case let .key(event):
+            try current.write(terminal.encodeKey(event))
+        case let .paste(text):
+            try current.write(terminal.encodePaste(text))
+        case let .mouse(event):
+            try current.write(terminal.encodeMouse(event))
+        case let .resize(size):
+            try current.resize(size)
+            try terminal.resize(size)
+        case let .signal(signal):
+            _ = try signalForeground(signal)
+        }
+    }
+
+    func resetInputState() {
+        condition.lock()
+        let terminal = adapter
+        condition.unlock()
+        terminal?.resetInputState()
+    }
+
+    func signalForeground(_ signal: TerminalSignal) throws -> Int32 {
+        condition.lock()
+        let current = session
+        condition.unlock()
+        guard let current else { throw KeeperControlError.noRunningProcess }
+        let processGroup = tcgetpgrp(current.masterFileDescriptor)
+        guard processGroup > 0 else {
+            throw PTYSessionFailure(operation: "tcgetpgrp", code: errno)
+        }
+        let darwinSignal: Int32 = switch signal {
+        case .interrupt: SIGINT
+        case .quit: SIGQUIT
+        case .suspend: SIGTSTP
+        case .continue: SIGCONT
+        }
+        guard Darwin.kill(-processGroup, darwinSignal) == 0 || errno == ESRCH else {
+            throw PTYSessionFailure(operation: "killpg(foreground)", code: errno)
+        }
+        return processGroup
+    }
+
     private func beginReading(session: PTYSession, adapter: GhosttyVTAdapter) {
         readQueue.async { [frameQueue] in
             var buffer = [UInt8](repeating: 0, count: 16_384)
@@ -154,8 +216,28 @@ final class KeeperSessionRuntime: @unchecked Sendable {
                 )
                 if count > 0 {
                     let data = Data(buffer.prefix(count))
-                    guard (try? adapter.feed(data)) != nil else { return }
-                    frameQueue.async { _ = try? adapter.snapshot() }
+                    frameQueue.async { [weak self] in
+                        guard let self else { return }
+                        do {
+                            try adapter.feed(data)
+                            let snapshot = try adapter.snapshot()
+                            let coordinator: TerminalStreamCoordinator?
+                            condition.lock()
+                            guard outputSequence < UInt64.max else {
+                                condition.unlock()
+                                return
+                            }
+                            outputSequence += 1
+                            let sequence = outputSequence
+                            coordinator = streamCoordinator
+                            condition.unlock()
+                            if let coordinator {
+                                Task { await coordinator.publish(outputSequence: sequence, frame: snapshot) }
+                            }
+                        } catch {
+                            return
+                        }
+                    }
                     continue
                 }
                 if count < 0, errno == EINTR { continue }
@@ -204,9 +286,27 @@ let runtime = KeeperSessionRuntime(
     bootstrapDescriptor: bootstrapDescriptor,
     verifiedRoots: roots
 )
+let attachTickets = TerminalAttachTicketStore(
+    clock: SystemTerminalSecurityClock(),
+    randomBytes: SecurityTerminalRandomBytes()
+)
+let leaseRevocations = InputLeaseRevocationBuffer()
+let streamCoordinator = TerminalStreamCoordinator(
+    sessionID: validatedBootstrap.sessionID,
+    workerID: validatedBootstrap.workerInstanceID,
+    attachTicketPolicy: attachTickets,
+    performInput: { payload in try runtime.performInput(payload) },
+    resetInputState: { runtime.resetInputState() },
+    reportLeaseRevoked: { leaseID in await leaseRevocations.record(leaseID) },
+    signalForeground: { signal in try runtime.signalForeground(signal) },
+    terminateSession: { force in try runtime.terminate(force: force) }
+)
+runtime.installStreamCoordinator(streamCoordinator)
 let server = KeeperUDSServer(
     endpoint: endpoint,
     workerSecret: validatedBootstrap.workerSecret,
+    streamCoordinator: streamCoordinator,
+    leaseRevocations: leaseRevocations,
     startHandler: { request in try runtime.start(request) },
     terminateHandler: { force in try runtime.terminate(force: force) }
 )

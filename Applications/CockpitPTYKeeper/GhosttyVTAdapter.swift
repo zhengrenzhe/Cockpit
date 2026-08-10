@@ -1,5 +1,6 @@
 import Foundation
 import CockpitTerminalCore
+import CockpitTypes
 
 #if COCKPIT_GHOSTTY_LINKED
 import CockpitGhostty
@@ -10,6 +11,8 @@ enum GhosttyVTAdapterError: Error, Equatable {
     case createFailed
     case feedFailed
     case snapshotFailed
+    case resizeFailed
+    case encodeFailed
 }
 
 final class GhosttyVTAdapter: @unchecked Sendable {
@@ -68,6 +71,85 @@ final class GhosttyVTAdapter: @unchecked Sendable {
             return Data(bytes: base, count: bytes.length)
         }
     }
+
+    func resize(_ size: TerminalResize) throws {
+        try lock.withLock {
+            guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            guard cockpit_ghostty_vt_resize(
+                terminal,
+                UInt32(size.columns),
+                UInt32(size.rows)
+            ) == 0 else {
+                throw GhosttyVTAdapterError.resizeFailed
+            }
+        }
+    }
+
+    func encodeKey(_ event: TerminalKeyEvent) throws -> Data {
+        try lock.withLock {
+            guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            var input = cockpit_ghostty_key_event_t()
+            input.logical_key = event.logicalKey
+            input.physical_key = event.physicalKey
+            input.modifiers = event.modifiers
+            input.action = event.action.rawValue
+            return try encodedBytes { output in
+                cockpit_ghostty_vt_encode_key(terminal, &input, output)
+            }
+        }
+    }
+
+    func encodePaste(_ text: String) throws -> Data {
+        try lock.withLock {
+            guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            let data = Data(text.utf8)
+            return try data.withUnsafeBytes { bytes in
+                try encodedBytes { output in
+                    cockpit_ghostty_vt_encode_paste(
+                        terminal,
+                        bytes.bindMemory(to: UInt8.self).baseAddress,
+                        bytes.count,
+                        output
+                    )
+                }
+            }
+        }
+    }
+
+    func encodeMouse(_ event: TerminalMouseEvent) throws -> Data {
+        try lock.withLock {
+            guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            var input = cockpit_ghostty_mouse_event_t()
+            input.cell_x = event.cellX
+            input.cell_y = event.cellY
+            input.buttons = event.buttons
+            input.wheel_x = event.wheelX
+            input.wheel_y = event.wheelY
+            input.modifiers = event.modifiers
+            input.action = event.action.rawValue
+            return try encodedBytes { output in
+                cockpit_ghostty_vt_encode_mouse(terminal, &input, output)
+            }
+        }
+    }
+
+    func resetInputState() {
+        lock.withLock {
+            if let terminal { cockpit_ghostty_vt_reset_input_state(terminal) }
+        }
+    }
+
+    private func encodedBytes(
+        _ operation: (UnsafeMutablePointer<cockpit_ghostty_bytes_t>) -> Int32
+    ) throws -> Data {
+        var bytes = cockpit_ghostty_bytes_t(bytes: nil, length: 0)
+        guard operation(&bytes) == 0 else { throw GhosttyVTAdapterError.encodeFailed }
+        defer { cockpit_ghostty_bytes_free(bytes) }
+        guard bytes.length == 0 || bytes.bytes != nil else {
+            throw GhosttyVTAdapterError.encodeFailed
+        }
+        return bytes.length == 0 ? Data() : Data(bytes: bytes.bytes!, count: bytes.length)
+    }
 #else
     init(launchSpec: LaunchSpec) throws {
         _ = launchSpec
@@ -82,5 +164,27 @@ final class GhosttyVTAdapter: @unchecked Sendable {
     func snapshot() throws -> Data {
         throw GhosttyVTAdapterError.unavailable
     }
+
+    func resize(_ size: TerminalResize) throws {
+        _ = size
+        throw GhosttyVTAdapterError.unavailable
+    }
+
+    func encodeKey(_ event: TerminalKeyEvent) throws -> Data {
+        _ = event
+        throw GhosttyVTAdapterError.unavailable
+    }
+
+    func encodePaste(_ text: String) throws -> Data {
+        _ = text
+        throw GhosttyVTAdapterError.unavailable
+    }
+
+    func encodeMouse(_ event: TerminalMouseEvent) throws -> Data {
+        _ = event
+        throw GhosttyVTAdapterError.unavailable
+    }
+
+    func resetInputState() {}
 #endif
 }
