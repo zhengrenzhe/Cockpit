@@ -154,6 +154,23 @@ public actor TerminalSupervisor {
         return try await requireActive(record.sessionID)
     }
 
+    public func reconcile() async throws {
+        let archiveStore = try TerminalArchiveStore(
+            applicationSupportRoot: configuration.applicationSupportRoot,
+            terminalArchivesRoot: configuration.terminalArchivesRoot
+        )
+        let reconciler = TerminalReconciler(
+            repository: repository,
+            controller: controller,
+            workerSecretDeriver: workerSecretDeriver,
+            archiveStore: archiveStore,
+            descriptorReader: TerminalRuntimeDescriptorStore(
+                runtimeDirectory: configuration.runtimeDirectory
+            )
+        )
+        try await reconciler.reconcile()
+    }
+
     public func startCommittedSession(
         _ id: TerminalSessionID
     ) async throws -> TerminalSessionRecord {

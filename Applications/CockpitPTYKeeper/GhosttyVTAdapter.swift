@@ -72,6 +72,21 @@ final class GhosttyVTAdapter: @unchecked Sendable {
         }
     }
 
+    func scrollback(start: UInt64, count: UInt32) throws -> Data {
+        try lock.withLock {
+            guard let terminal else { throw GhosttyVTAdapterError.unavailable }
+            var bytes = cockpit_ghostty_bytes_t(bytes: nil, length: 0)
+            guard cockpit_ghostty_vt_scrollback(terminal, start, count, &bytes) == 0 else {
+                throw GhosttyVTAdapterError.snapshotFailed
+            }
+            defer { cockpit_ghostty_bytes_free(bytes) }
+            guard bytes.length == 0 || bytes.bytes != nil else {
+                throw GhosttyVTAdapterError.snapshotFailed
+            }
+            return bytes.length == 0 ? Data() : Data(bytes: bytes.bytes!, count: bytes.length)
+        }
+    }
+
     func resize(_ size: TerminalResize) throws {
         try lock.withLock {
             guard let terminal else { throw GhosttyVTAdapterError.unavailable }
@@ -162,6 +177,12 @@ final class GhosttyVTAdapter: @unchecked Sendable {
     }
 
     func snapshot() throws -> Data {
+        throw GhosttyVTAdapterError.unavailable
+    }
+
+    func scrollback(start: UInt64, count: UInt32) throws -> Data {
+        _ = start
+        _ = count
         throw GhosttyVTAdapterError.unavailable
     }
 

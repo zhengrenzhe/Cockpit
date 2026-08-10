@@ -7,6 +7,96 @@ import CockpitTypes
 
 @Suite("KeeperControlTests")
 struct KeeperControlTests {
+    @Test func keeperNaturalExitPublishesVerifiedArchiveAfterBootstrapControlCloses() async throws {
+        guard let executable = ProcessInfo.processInfo.environment["COCKPIT_KEEPER_EXECUTABLE"] else {
+            return
+        }
+        let root = try secureTemporaryDirectory(prefix: "cockpit-keeper-archive")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let applicationSupport = root.appendingPathComponent("ApplicationSupport")
+        let archives = applicationSupport.appendingPathComponent("TerminalArchives")
+        let runtime = root.appendingPathComponent("runtime")
+        let workspace = root.appendingPathComponent("workspace")
+        try FileManager.default.createDirectory(at: archives, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: false)
+        for url in [applicationSupport, archives, runtime, workspace] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+        }
+
+        let archiveProbeSource = root.appendingPathComponent("archive-probe.c")
+        let archiveProbe = root.appendingPathComponent("archive-probe")
+        try """
+        #include <unistd.h>
+        int main(void) {
+          static const char output[] = "archive-line\\r\\n";
+          (void)write(STDOUT_FILENO, output, sizeof(output) - 1);
+          usleep(200000);
+          return 7;
+        }
+        """.write(to: archiveProbeSource, atomically: true, encoding: .utf8)
+        try runProcess("/usr/bin/clang", [archiveProbeSource.path, "-o", archiveProbe.path])
+
+        let secret = Data(repeating: 0x81, count: 32)
+        let nonce = Data(repeating: 0x82, count: 16)
+        let sessionID = TerminalSessionID()
+        let workerID = WorkerInstanceID()
+        let bootstrap = try KeeperBootstrap(
+            sessionID: sessionID,
+            workerInstanceID: workerID,
+            launchSpec: try LaunchSpec(
+                kind: .agent(.codex),
+                loginShellPath: "/bin/zsh",
+                executablePath: archiveProbe.path,
+                arguments: [],
+                workspaceRoot: workspace.path,
+                terminalSize: TerminalResize(validatingColumns: 80, rows: 24),
+                environmentOverrides: ["TERM": "xterm-256color"]
+            ),
+            startNonce: nonce,
+            applicationSupportRoot: applicationSupport.path,
+            terminalArchivesRoot: archives.path,
+            runtimeDirectory: runtime.path,
+            workerSecret: secret
+        )
+        let launched = try await KeeperProcessLauncher(executablePath: executable).launch(bootstrap)
+        var reaped = false
+        defer { if !reaped { reapProcess(launched.processID) } }
+        let client = KeeperControlClient(secretProvider: { _, _ in secret })
+        let ready = try await client.awaitReady(launched)
+        let request = AuthenticatedStartRequest(
+            endpoint: ready.endpoint,
+            sessionID: sessionID,
+            workerID: workerID,
+            startNonce: nonce,
+            proofMAC: KeeperAuthentication.startProof(
+                secret: secret,
+                endpoint: ready.endpoint,
+                sessionID: sessionID,
+                workerID: workerID,
+                startNonce: nonce
+            )
+        )
+        _ = try await client.authenticatedStart(request)
+        let keeperStatus = try await waitForOwnedProcessExit(launched.processID, timeout: 5)
+        reaped = true
+        #expect(keeperStatus & 0x7f == 0)
+        #expect((keeperStatus >> 8) & 0xff == 0)
+
+        let store = try TerminalArchiveStore(
+            applicationSupportRoot: applicationSupport.path,
+            terminalArchivesRoot: archives.path
+        )
+        let manifest = try #require(try store.verifiedManifest(sessionID: sessionID))
+        #expect(manifest.workerInstanceID == workerID)
+        #expect(manifest.exitStatus == .exited(7))
+        #expect(manifest.firstOutputSequence == 1)
+        #expect(manifest.latestOutputSequence >= 1)
+        #expect(manifest.chunks.count == 1)
+        #expect(try store.openFinalSnapshot(sessionID: sessionID).readAll().isEmpty == false)
+        #expect(FileManager.default.fileExists(atPath: ready.endpoint.path) == false)
+    }
+
     @Test func keeperExecutableProcessIntegration() async throws {
         guard let executable = ProcessInfo.processInfo.environment["COCKPIT_KEEPER_EXECUTABLE"] else {
             return
@@ -368,6 +458,19 @@ private func waitForProcessExit(_ processID: pid_t, timeout: TimeInterval) async
         try await Task.sleep(for: .milliseconds(10))
     }
     guard errno == ESRCH else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+}
+
+private func waitForOwnedProcessExit(_ processID: pid_t, timeout: TimeInterval) async throws -> Int32 {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        var status: Int32 = 0
+        let result = waitpid(processID, &status, WNOHANG)
+        if result == processID { return status }
+        if result < 0, errno == EINTR { continue }
+        if result < 0 { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    throw CocoaError(.executableRuntimeMismatch)
 }
 
 private func reapProcess(_ processID: pid_t) {

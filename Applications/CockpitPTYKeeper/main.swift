@@ -48,6 +48,7 @@ final class KeeperSessionRuntime: @unchecked Sendable {
     private let endpoint: KeeperEndpoint
     private let bootstrapDescriptor: BootstrapDescriptorOwner
     private let verifiedRoots: KeeperVerifiedRoots
+    private let archiveStore: TerminalArchiveStore
     private let condition = NSCondition()
     private let readQueue = DispatchQueue(label: "dev.cockpit.keeper.pty-read")
     private let frameQueue = DispatchQueue(label: "dev.cockpit.keeper.frame")
@@ -57,23 +58,35 @@ final class KeeperSessionRuntime: @unchecked Sendable {
     private var streamCoordinator: TerminalStreamCoordinator?
     private var starting = false
     private var failed = false
+    private var finishing = false
     private var outputSequence: UInt64 = 0
+    private var completionHandler: (@Sendable (Int32) -> Void)?
 
     init(
         bootstrap: KeeperBootstrap,
         endpoint: KeeperEndpoint,
         bootstrapDescriptor: BootstrapDescriptorOwner,
         verifiedRoots: KeeperVerifiedRoots
-    ) {
+    ) throws {
         self.bootstrap = bootstrap
         self.endpoint = endpoint
         self.bootstrapDescriptor = bootstrapDescriptor
         self.verifiedRoots = verifiedRoots
+        archiveStore = try TerminalArchiveStore(
+            applicationSupportRoot: bootstrap.applicationSupportRoot,
+            terminalArchivesRoot: bootstrap.terminalArchivesRoot
+        )
     }
 
     func installStreamCoordinator(_ coordinator: TerminalStreamCoordinator) {
         condition.lock()
         streamCoordinator = coordinator
+        condition.unlock()
+    }
+
+    func installCompletionHandler(_ handler: @escaping @Sendable (Int32) -> Void) {
+        condition.lock()
+        completionHandler = handler
         condition.unlock()
     }
 
@@ -242,12 +255,89 @@ final class KeeperSessionRuntime: @unchecked Sendable {
                 }
                 if count < 0, errno == EINTR { continue }
                 if count == 0 || (count < 0 && errno == EIO) {
-                    _ = try? session.waitForExit(timeout: 5)
+                    let status: Int32
+                    do { status = try session.waitForExit(timeout: 5) }
+                    catch {
+                        self.finish(code: EIO)
+                        return
+                    }
+                    frameQueue.async { [weak self] in
+                        self?.publishArchiveAndFinish(
+                            waitStatus: status,
+                            adapter: adapter
+                        )
+                    }
                     return
                 }
+                self.finish(code: EIO)
                 return
             }
         }
+    }
+
+    private func publishArchiveAndFinish(
+        waitStatus: Int32,
+        adapter: GhosttyVTAdapter
+    ) {
+        condition.lock()
+        guard !finishing else {
+            condition.unlock()
+            return
+        }
+        finishing = true
+        let latestSequence = outputSequence
+        condition.unlock()
+
+        do {
+            let finalSnapshot = try adapter.snapshot()
+            let chunks: [TerminalArchiveChunkData]
+            let firstSequence: UInt64
+            if latestSequence == 0 {
+                chunks = []
+                firstSequence = 0
+            } else {
+                chunks = [
+                    try TerminalArchiveChunkData(
+                        firstOutputSequence: 1,
+                        lastOutputSequence: latestSequence,
+                        data: try adapter.scrollback(start: 0, count: 100_000)
+                    ),
+                ]
+                firstSequence = 1
+            }
+            _ = try archiveStore.publish(
+                sessionID: bootstrap.sessionID,
+                workerID: bootstrap.workerInstanceID,
+                chunks: chunks,
+                firstOutputSequence: firstSequence,
+                latestOutputSequence: latestSequence,
+                finalSnapshot: finalSnapshot,
+                exitStatus: try Self.exitStatus(from: waitStatus),
+                completedAt: Date()
+            )
+            finish(code: 0)
+        } catch {
+            finish(code: EIO)
+        }
+    }
+
+    private func finish(code: Int32) {
+        condition.lock()
+        let handler = completionHandler
+        condition.unlock()
+        if let handler { handler(code) }
+        else { Darwin._exit(code) }
+    }
+
+    private static func exitStatus(from waitStatus: Int32) throws -> TerminalExitStatus {
+        let signal = waitStatus & 0x7f
+        if signal == 0 {
+            return .exited(UInt8(truncatingIfNeeded: waitStatus >> 8))
+        }
+        guard (1...31).contains(signal) else {
+            throw KeeperRuntimeError.startFailed
+        }
+        return .signaled(signal)
     }
 }
 
@@ -280,7 +370,7 @@ let endpoint = try KeeperEndpoint.runtime(
     sessionID: validatedBootstrap.sessionID,
     workerID: validatedBootstrap.workerInstanceID
 )
-let runtime = KeeperSessionRuntime(
+let runtime = try KeeperSessionRuntime(
     bootstrap: validatedBootstrap,
     endpoint: endpoint,
     bootstrapDescriptor: bootstrapDescriptor,
@@ -311,6 +401,10 @@ let server = KeeperUDSServer(
     terminateHandler: { force in try runtime.terminate(force: force) }
 )
 try server.start()
+runtime.installCompletionHandler { [weak server] code in
+    server?.stop()
+    Darwin._exit(code)
+}
 
 let descriptor = KeeperRuntimeDescriptor(
     sessionID: validatedBootstrap.sessionID,

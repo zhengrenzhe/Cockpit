@@ -52,6 +52,7 @@ let supervisor = TerminalSupervisor(
         runtimeDirectory: runtimeDirectory
     )
 )
+try await supervisor.reconcile()
 let exported = TerminalSupervisorXPCExport(
     handshakeHandler: { try TerminalSupervisorHandshakeHandler().handle($0) },
     spawnHandler: { request in
