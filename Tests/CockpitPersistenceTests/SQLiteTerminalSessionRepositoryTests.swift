@@ -255,6 +255,16 @@ struct SQLiteTerminalSessionRepositoryTests {
                     "UPDATE terminal_sessions SET process_id = 404, process_group_id = 405 WHERE session_id = '\(record.sessionID.description)'"
                 )
             }
+            await #expect(throws: (any Error).self) {
+                try await inspection.execute(
+                    "UPDATE terminal_sessions SET process_id = 404, process_group_id = NULL WHERE session_id = '\(record.sessionID.description)'"
+                )
+            }
+            await #expect(throws: (any Error).self) {
+                try await inspection.execute(
+                    "UPDATE terminal_sessions SET process_id = NULL, process_group_id = 405 WHERE session_id = '\(record.sessionID.description)'"
+                )
+            }
             #expect(await inspection.close() == SQLITE_OK)
             #expect(await repository.close() == SQLITE_OK)
         }

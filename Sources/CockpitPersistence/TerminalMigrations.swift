@@ -34,7 +34,9 @@ enum TerminalMigrations {
                 CHECK (
                     (process_id IS NULL AND process_group_id IS NULL)
                     OR (
-                        process_id > 0
+                        process_id IS NOT NULL
+                        AND process_group_id IS NOT NULL
+                        AND process_id > 0
                         AND process_group_id > 0
                         AND process_id = process_group_id
                     )
