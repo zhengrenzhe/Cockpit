@@ -21,10 +21,8 @@ import CockpitTypes
     defer { try? FileManager.default.removeItem(at: root) }
 
     let executable = root.appendingPathComponent("close-bootstrap-and-wait.zsh")
-    let processIDFile = URL(fileURLWithPath: executable.path + ".pid")
     try """
     #!/bin/zsh
-    print -r -- "$$" > "${0}.pid"
     exec 3<&-
     /bin/sleep 30
     """.write(to: executable, atomically: true, encoding: .utf8)
@@ -40,6 +38,30 @@ import CockpitTypes
     try #require(pthread_sigmask(SIG_BLOCK, &blockedSignals, &previousSignals) == 0)
     defer { _ = pthread_sigmask(SIG_SETMASK, &previousSignals, nil) }
 
+    var unrelatedProcessID: pid_t = 0
+    let trueExecutable = "/usr/bin/true"
+    let spawnResult = trueExecutable.withCString { executablePath in
+        var arguments: [UnsafeMutablePointer<CChar>?] = [
+            UnsafeMutablePointer(mutating: executablePath),
+            nil,
+        ]
+        return arguments.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(
+                &unrelatedProcessID,
+                executablePath,
+                nil,
+                nil,
+                buffer.baseAddress,
+                environ
+            )
+        }
+    }
+    try #require(spawnResult == 0)
+    var unrelatedExit = siginfo_t()
+    try #require(
+        waitid(P_PID, id_t(unrelatedProcessID), &unrelatedExit, WEXITED | WNOWAIT) == 0
+    )
+
     let bootstrap = KeeperBootstrap(
         sessionID: TerminalSessionID(),
         workerInstanceID: WorkerInstanceID(),
@@ -52,31 +74,23 @@ import CockpitTypes
         // The real broken-pipe error is the behavior under test.
     }
 
-    for _ in 0..<200 where !FileManager.default.fileExists(atPath: processIDFile.path) {
-        usleep(5_000)
-    }
-    let processIDText = try String(contentsOf: processIDFile, encoding: .utf8)
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    let processID = try #require(pid_t(processIDText))
-    defer { reapIfNeeded(processID) }
+    let processList = Process()
+    let processOutput = Pipe()
+    processList.executableURL = URL(fileURLWithPath: "/bin/ps")
+    processList.arguments = ["-axo", "command="]
+    processList.standardOutput = processOutput
+    try processList.run()
+    let processOutputData = processOutput.fileHandleForReading.readDataToEndOfFile()
+    processList.waitUntilExit()
+    #expect(processList.terminationStatus == 0)
+    let audit = String(
+        data: processOutputData,
+        encoding: .utf8
+    ) ?? ""
+    #expect(!audit.contains(executable.path))
 
+    var unrelatedStatus: Int32 = 0
     errno = 0
-    let probeResult = kill(processID, 0)
-    let probeCode = errno
-    #expect(probeResult == -1)
-    #expect(probeCode == ESRCH)
-
-    var status: Int32 = 0
-    errno = 0
-    let waitResult = waitpid(processID, &status, WNOHANG)
-    #expect(waitResult == -1)
-    #expect(errno == ECHILD)
-}
-
-private func reapIfNeeded(_ processID: pid_t) {
-    if kill(processID, 0) == 0 {
-        _ = kill(processID, SIGKILL)
-    }
-    var status: Int32 = 0
-    while waitpid(processID, &status, 0) < 0, errno == EINTR {}
+    let unrelatedWaitResult = waitpid(unrelatedProcessID, &unrelatedStatus, 0)
+    #expect(unrelatedWaitResult == unrelatedProcessID)
 }

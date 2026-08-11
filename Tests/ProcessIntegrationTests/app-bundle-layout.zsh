@@ -57,6 +57,8 @@ test "$(/usr/bin/plutil -extract BundleProgram raw -o - "$host_plist")" = \
     "Contents/Resources/CockpitHost"
 host_services=$(/usr/bin/plutil -extract MachServices json -o - "$host_plist")
 test "$host_services" = '{"dev.cockpit.host":true}'
+! /usr/bin/plutil -extract EnvironmentVariables.COCKPIT_SERVICE_NAMESPACE raw -o - \
+    "$host_plist" >/dev/null 2>&1
 
 test "$(/usr/bin/plutil -extract Label raw -o - "$terminal_plist")" = \
     "dev.cockpit.terminal"
@@ -64,6 +66,8 @@ test "$(/usr/bin/plutil -extract BundleProgram raw -o - "$terminal_plist")" = \
     "Contents/Resources/CockpitTerminalSupervisor"
 terminal_services=$(/usr/bin/plutil -extract MachServices json -o - "$terminal_plist")
 test "$terminal_services" = '{"dev.cockpit.terminal":true}'
+! /usr/bin/plutil -extract EnvironmentVariables.COCKPIT_SERVICE_NAMESPACE raw -o - \
+    "$terminal_plist" >/dev/null 2>&1
 test "$(/usr/bin/plutil -extract KeepAlive raw -o - "$terminal_plist")" = "true"
 [[ "$host_services$terminal_services" != *dev.cockpit.keeper* ]]
 

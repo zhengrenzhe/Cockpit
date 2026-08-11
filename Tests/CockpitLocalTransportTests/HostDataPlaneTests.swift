@@ -964,13 +964,19 @@ import CockpitTypes
             order.withValue { $0.append("second") }
         }
     }
+    try await eventuallyAsync {
+        await hostDataPlaneIssuerState(in: issuer).admittedIssues == 2
+    }
     let stopReturned = LockedHostDataPlaneBox(false)
     let stop = Task {
         await issuer.stopIssuingTickets()
         order.withValue { $0.append("stop") }
         stopReturned.withValue { $0 = true }
     }
-    try await Task.sleep(for: .milliseconds(50))
+    try await eventuallyAsync {
+        let state = await hostDataPlaneIssuerState(in: issuer)
+        return !state.accepting && state.stopWaiterCount == 1
+    }
     #expect(random.callCount == 1)
     #expect(order.value.isEmpty)
     #expect(!stopReturned.value)
@@ -4588,6 +4594,38 @@ private func eventually(
         guard clock.now < deadline else { throw CocoaError(.coderReadCorrupt) }
         try await Task.sleep(for: .milliseconds(10))
     }
+}
+
+private func eventuallyAsync(
+    timeout: Duration = .seconds(2),
+    _ condition: @escaping @Sendable () async -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !(await condition()) {
+        guard clock.now < deadline else { throw CocoaError(.coderReadCorrupt) }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+}
+
+private struct HostDataPlaneIssuerTestState: Sendable {
+    let accepting: Bool
+    let admittedIssues: Int
+    let stopWaiterCount: Int
+}
+
+private func hostDataPlaneIssuerState(
+    in issuer: isolated HostDataPlaneTicketIssuer
+) -> HostDataPlaneIssuerTestState {
+    let children = Mirror(reflecting: issuer).children
+    let accepting = children.first(where: { $0.label == "accepting" })?.value as? Bool
+    let admittedIssues = children.first(where: { $0.label == "admittedIssues" })?.value as? Int
+    let stopWaiters = children.first(where: { $0.label == "stopWaiters" })
+    return HostDataPlaneIssuerTestState(
+        accepting: accepting ?? true,
+        admittedIssues: admittedIssues ?? -1,
+        stopWaiterCount: stopWaiters.map { Mirror(reflecting: $0.value).children.count } ?? -1
+    )
 }
 
 private func hostDataPlaneWaitUntilNotReady(

@@ -114,18 +114,44 @@ struct PTYSessionTests {
     @Test func forceTerminationKillsFixtureAgentDescendant() throws {
         let root = try temporaryDirectory(prefix: "cockpit-agent-group")
         defer { try? FileManager.default.removeItem(at: root) }
-        let executable = fixturesRoot().appendingPathComponent("codex")
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let source = root.appendingPathComponent("blocking-agent.c")
+        let executable = root.appendingPathComponent("blocking-agent")
+        try Data(#"""
+        #include <fcntl.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+
+        int main(int argc, char **argv) {
+            if (argc != 2) return 2;
+            int output = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (output < 0) return 3;
+            pid_t child = fork();
+            if (child < 0) return 4;
+            if (child == 0) {
+                for (;;) pause();
+            }
+            dprintf(output, "child=%d\n", child);
+            fsync(output);
+            close(output);
+            for (;;) pause();
+        }
+        """#.utf8).write(to: source)
+        try run("/usr/bin/clang", [source.path, "-o", executable.path])
         let output = root.appendingPathComponent("codex.txt")
         let session = try PTYSession.start(LaunchSpec(
             kind: .agent(.codex),
             loginShellPath: "/bin/zsh",
             executablePath: executable.path,
-            arguments: [output.path, "--wait-with-child"],
+            arguments: [output.path],
             workspaceRoot: root.path,
             terminalSize: try TerminalResize(validatingColumns: 80, rows: 24),
             environmentOverrides: ["TERM": "xterm-256color"]
         ))
+        defer {
+            try? session.terminate(force: true)
+            _ = try? session.waitForExit(timeout: 5)
+        }
         let child = try waitForChildProcess(in: output, timeout: 5)
         #expect(getpgid(child) == session.identity.processGroupID)
         try session.terminate(force: true)

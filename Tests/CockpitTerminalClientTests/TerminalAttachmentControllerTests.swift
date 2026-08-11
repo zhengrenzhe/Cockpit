@@ -60,7 +60,11 @@ import CockpitTypes
     }
 
     try await controller.attach(sessionID: TerminalSessionID(), lastAcknowledgedSequence: 7)
-    try await eventually { await first.didDrain }
+    try await eventually {
+        let didDrain = await first.didDrain
+        let isWaitingForOutput = await first.isWaitingForOutput
+        return didDrain && isWaitingForOutput
+    }
     try await controller.attach(sessionID: TerminalSessionID(), lastAcknowledgedSequence: 1)
     let received = try await withTimeout { await collector.value }
 
@@ -1191,8 +1195,10 @@ private actor InputAckBarrierConnection: TerminalDataConnection {
 private actor RecordingTerminalDataConnection: TerminalDataConnection {
     private var frames: [TerminalOutputFrame]
     private var waiter: CheckedContinuation<TerminalOutputFrame?, Never>?
+    private var isDetached = false
     private(set) var detachCount = 0
     private(set) var didDrain = false
+    private(set) var isWaitingForOutput = false
     private(set) var deliveredFrameCount: UInt64 = 0
     private(set) var sentInputs: [TerminalInput] = []
     private(set) var visibility: [Bool] = []
@@ -1207,18 +1213,22 @@ private actor RecordingTerminalDataConnection: TerminalDataConnection {
     var visibleIsBlocked: Bool { visibleContinuation != nil }
 
     func nextOutput() async throws -> TerminalOutputFrame? {
+        guard !isDetached else { return nil }
         if !frames.isEmpty {
             let value = frames.removeFirst()
             didDrain = true
             deliveredFrameCount += 1
             return value
         }
+        isWaitingForOutput = true
         let value = await withCheckedContinuation { waiter = $0 }
+        isWaitingForOutput = false
         if value != nil { deliveredFrameCount += 1 }
         return value
     }
 
     func push(_ frame: TerminalOutputFrame) {
+        guard !isDetached else { return }
         if let waiter {
             self.waiter = nil
             waiter.resume(returning: frame)
@@ -1243,6 +1253,7 @@ private actor RecordingTerminalDataConnection: TerminalDataConnection {
     }
     func detach() async {
         detachCount += 1
+        isDetached = true
         waiter?.resume(returning: nil)
         waiter = nil
     }

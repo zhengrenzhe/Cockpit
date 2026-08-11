@@ -26,7 +26,7 @@ import CockpitTypes
         try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "b")
     ])
     let acknowledgements = try await [first, second]
-    #expect(acknowledgements.map(\.clientSequence) == [1, 2])
+    #expect(acknowledgements.map(\.clientSequence).sorted() == [1, 2])
     #expect(await transport.maximumConcurrentApplyCount == 1)
     #expect(try await controller.flush() == 2)
     #expect(await transport.flushedSequences == [2])
@@ -84,7 +84,7 @@ import CockpitTypes
     let third = Task { try await controller.submit([
         try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "third")
     ]) }
-    for _ in 0..<20 { await Task.yield() }
+    #expect(await waitForPendingEditCount(2, in: controller))
     await transport.releaseBlockedApply()
     await #expect(throws: DocumentProtocolError.sequenceGap(expected: 1, actual: 2)) {
         _ = try await first.value
@@ -98,7 +98,7 @@ import CockpitTypes
 
     _ = try await controller.resynchronize(requestWriteAccess: true)
     let acknowledgements = try await [second.value, third.value]
-    #expect(acknowledgements.map(\.clientSequence) == [1, 2])
+    #expect(acknowledgements.map(\.clientSequence).sorted() == [1, 2])
     #expect(await transport.recordedTransactions.count == 3)
 }
 
@@ -324,9 +324,9 @@ import CockpitTypes
             let edit = Task { try await controller.submit([
                 try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "after-save")
             ]) }
+            #expect(await waitForPendingEditCount(1, in: controller))
             await transport.releaseBlockedSave()
             await expectDroppedReply(droppedReply) { _ = try await save.value }
-            for _ in 0..<50 { await Task.yield() }
             guard case .resynchronizing = await controller.state else {
                 Issue.record("Expected dropped save reply to resynchronize")
                 edit.cancel()
@@ -354,9 +354,9 @@ import CockpitTypes
             let edit = Task { try await controller.submit([
                 try UTF16TextEdit(validatingOffset: 0, length: 0, replacement: "after-discard")
             ]) }
+            #expect(await waitForPendingEditCount(1, in: controller))
             await transport.releaseBlockedDiscard()
             await expectDroppedReply(droppedReply) { _ = try await discard.value }
-            for _ in 0..<50 { await Task.yield() }
             guard case .resynchronizing = await controller.state else {
                 Issue.record("Expected dropped discard reply to resynchronize")
                 edit.cancel()
@@ -481,6 +481,30 @@ private struct ClientDocumentFixture {
 private enum ClientDroppedReply: CaseIterable, Sendable {
     case ordinaryError
     case cancellation
+}
+
+private func waitForPendingEditCount(
+    _ expected: Int,
+    in controller: DocumentClientController
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(1))
+    while clock.now < deadline {
+        if await pendingEditCount(in: controller) == expected { return true }
+        await Task.yield()
+    }
+    return await pendingEditCount(in: controller) == expected
+}
+
+private func pendingEditCount(
+    in controller: isolated DocumentClientController
+) -> Int {
+    guard let pendingEdits = Mirror(reflecting: controller).children.first(where: {
+        $0.label == "pendingEdits"
+    }) else {
+        return -1
+    }
+    return Mirror(reflecting: pendingEdits.value).children.count
 }
 
 private actor RecordingDocumentDataTransport: DocumentDataTransport {

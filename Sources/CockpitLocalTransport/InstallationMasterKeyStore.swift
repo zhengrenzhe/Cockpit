@@ -32,16 +32,19 @@ public actor InstallationMasterKeyStore: InstallationMasterKeyProviding {
     private let service: String
     private let account: String
     private let randomBytes: any TerminalSecurityRandomBytes
+    private let explicitKeychainPath: String?
     private var cachedMasterKey: Data?
 
     public init(
         service: String = InstallationMasterKeyStore.productionService,
         account: String = InstallationMasterKeyStore.productionAccount,
-        randomBytes: any TerminalSecurityRandomBytes = SecurityTerminalRandomBytes()
+        randomBytes: any TerminalSecurityRandomBytes = SecurityTerminalRandomBytes(),
+        explicitKeychainPath: String? = nil
     ) {
         self.service = service
         self.account = account
         self.randomBytes = randomBytes
+        self.explicitKeychainPath = explicitKeychainPath
     }
 
     public func masterKey() throws -> Data {
@@ -64,7 +67,7 @@ public actor InstallationMasterKeyStore: InstallationMasterKeyProviding {
             throw InstallationMasterKeyStoreError.randomGenerationFailed
         }
         let key = Data(generated)
-        let status = SecItemAdd(Self.addQuery(service: service, account: account, data: key) as CFDictionary, nil)
+        let status = SecItemAdd(try addQuery(data: key) as CFDictionary, nil)
         switch status {
         case errSecSuccess:
             cachedMasterKey = key
@@ -81,7 +84,10 @@ public actor InstallationMasterKeyStore: InstallationMasterKeyProviding {
     }
 
     private func load() throws -> Data? {
-        var query = Self.baseQuery(service: service, account: account)
+        var query = try baseQuery()
+        if let keychain = try explicitKeychain() {
+            query[kSecMatchSearchList as String] = [keychain]
+        }
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -93,16 +99,30 @@ public actor InstallationMasterKeyStore: InstallationMasterKeyProviding {
         return data
     }
 
-    private static func baseQuery(service: String, account: String) -> [String: Any] {
-        [
+    private func baseQuery() throws -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+        if let keychain = try explicitKeychain() {
+            query[kSecUseKeychain as String] = keychain
+        }
+        return query
     }
 
-    private static func addQuery(service: String, account: String, data: Data) -> [String: Any] {
-        var query = baseQuery(service: service, account: account)
+    private func explicitKeychain() throws -> SecKeychain? {
+        guard let explicitKeychainPath else { return nil }
+        var keychain: SecKeychain?
+        let status = SecKeychainOpen(explicitKeychainPath, &keychain)
+        guard status == errSecSuccess, let keychain else {
+            throw InstallationMasterKeyStoreError.keychain(status)
+        }
+        return keychain
+    }
+
+    private func addQuery(data: Data) throws -> [String: Any] {
+        var query = try baseQuery()
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         return query

@@ -326,7 +326,7 @@ private actor DisconnectBarrierTransport: CockpitTransport {
     let controller = ConnectionController(transport: transport, deviceID: DeviceID())
 
     await #expect(
-        throws: ProtocolNegotiationError.invalidProtocolVersion(major: 65_536, minor: 0)
+        throws: ProtocolNegotiationError.invalidProtocolVersion(major: 65_536, minor: 1)
     ) {
         _ = try await controller.connect(requestedFeatures: [])
     }

@@ -778,6 +778,9 @@ func optionalValue(after flag: String, in arguments: [String]) -> String? {
 }
 
 let arguments = CommandLine.arguments
+let serviceNamespace = try XPCServiceNamespace(
+    ProcessInfo.processInfo.environment["COCKPIT_SERVICE_NAMESPACE"] ?? ""
+)
 let previousSIGCHLDHandler = signal(SIGCHLD, SIG_IGN)
 guard unsafeBitCast(previousSIGCHLDHandler, to: Int.self) != -1 else {
     throw KeeperLaunchFailure(operation: "signal(SIGCHLD)", code: errno)
@@ -794,9 +797,17 @@ try SecureRuntimeDirectory.prepare(at: runtimeDirectory)
 
 let launcher = KeeperProcessLauncher(executablePath: keeperExecutable)
 let storage: CockpitStorageLocations
-if let configuredRoot = ProcessInfo.processInfo.environment[
+let configuredRoot = ProcessInfo.processInfo.environment[
     "COCKPIT_APPLICATION_SUPPORT_ROOT"
-], !configuredRoot.isEmpty {
+]
+if !serviceNamespace.description.isEmpty {
+    guard let configuredRoot, configuredRoot.hasPrefix("/") else {
+        throw CocoaError(.fileReadInvalidFileName)
+    }
+    storage = try CockpitStorageLocations.under(
+        URL(fileURLWithPath: configuredRoot, isDirectory: true)
+    )
+} else if let configuredRoot, !configuredRoot.isEmpty {
     storage = try CockpitStorageLocations.under(
         URL(fileURLWithPath: configuredRoot, isDirectory: true)
     )
@@ -806,6 +817,19 @@ if let configuredRoot = ProcessInfo.processInfo.environment[
 let repository = try await SQLiteTerminalSessionRepository(
     databaseURL: storage.terminalDatabase
 )
+let explicitMasterKeychainPath: String?
+if serviceNamespace.description.isEmpty {
+    explicitMasterKeychainPath = nil
+} else {
+    guard let fixtureHome = ProcessInfo.processInfo.environment["HOME"],
+          fixtureHome.hasPrefix("/") else {
+        throw CocoaError(.fileReadInvalidFileName)
+    }
+    explicitMasterKeychainPath = URL(
+        fileURLWithPath: fixtureHome,
+        isDirectory: true
+    ).appendingPathComponent("Library/Keychains/cockpit-phase1.keychain-db").path
+}
 let masterKeyProvider: any InstallationMasterKeyProviding
 if let encodedMasterKey = ProcessInfo.processInfo.environment[
     "COCKPIT_INTEGRATION_MASTER_KEY"
@@ -820,7 +844,12 @@ if let encodedMasterKey = ProcessInfo.processInfo.environment[
         key: configuredMasterKey
     )
 } else {
-    masterKeyProvider = InstallationMasterKeyStore()
+    masterKeyProvider = InstallationMasterKeyStore(
+        service: serviceNamespace.description.isEmpty
+            ? InstallationMasterKeyStore.productionService
+            : "\(InstallationMasterKeyStore.productionService).\(serviceNamespace)",
+        explicitKeychainPath: explicitMasterKeychainPath
+    )
 }
 let workerSecretDeriver = WorkerSecretDeriver(
     masterKeyProvider: masterKeyProvider
@@ -875,7 +904,11 @@ let delegate = MachServiceListenerDelegate(
     exportedObject: exported,
     exportedInterface: NSXPCInterface(with: TerminalSupervisorXPCProtocol.self)
 )
-let listener = NSXPCListener(machServiceName: "dev.cockpit.terminal")
+let listener = NSXPCListener(
+    machServiceName: XPCServiceEndpoint.terminal.machServiceName(
+        in: serviceNamespace
+    )
+)
 listener.delegate = delegate
 listener.resume()
 parkTerminalSupervisor(

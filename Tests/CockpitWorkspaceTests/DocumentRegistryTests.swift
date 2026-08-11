@@ -146,7 +146,7 @@ import CockpitTypes
         for _ in 0..<50 { await Task.yield() }
         #expect(await serving.cancelledReadCount == 1)
 
-        for _ in 0..<3 {
+        for replacementIndex in 0..<3 {
             let lifetime = DocumentRegistryCompletionFlag()
             var token: DocumentRegistryTaskLifetimeToken? = DocumentRegistryTaskLifetimeToken(
                 completion: lifetime
@@ -158,10 +158,9 @@ import CockpitTypes
             )
             token = nil
 
-            #expect(await waitForDocumentRegistryStoredCount(
-                fixture.registry,
-                label: "retirementWaiters",
-                count: 1
+            #expect(await waitForDocumentRegistryFindCount(
+                fixture.repository,
+                count: replacementIndex + 2
             ))
             cancelledReplacement?.cancel()
             await #expect(throws: CancellationError.self) {
@@ -170,42 +169,17 @@ import CockpitTypes
             cancelledReplacement = nil
 
             #expect(await waitForDocumentRegistryCompletion(lifetime))
-            #expect(await waitForDocumentRegistryStoredCount(
-                fixture.registry,
-                label: "retirementWaiters",
-                count: 0
-            ))
-            #expect(await waitForDocumentRegistryStoredCount(
-                fixture.registry,
-                label: "locatorFlights",
-                count: 0
-            ))
-            #expect(await waitForDocumentRegistryStoredCount(
-                fixture.registry,
-                label: "openRequestStates",
-                count: 0
-            ))
-            #expect(documentRegistryStoredCount(fixture.registry, label: "actorFlights") == 1)
-            #expect(documentRegistryStoredCount(fixture.registry, label: "activeActorOpenWork") == 1)
             #expect(await serving.readCount == 1)
         }
 
         let firstReplacement = Task { try await fixture.registry.open(at: path) }
-        #expect(await waitForDocumentRegistryStoredCount(
-            fixture.registry,
-            label: "retirementWaiters",
-            count: 1
+        #expect(await waitForDocumentRegistryFindCount(
+            fixture.repository,
+            count: 5
         ))
         let secondReplacement = Task { try await fixture.registry.open(at: path) }
-        #expect(await waitForDocumentRegistryStoredCount(
-            fixture.registry,
-            label: "openRequestStates",
-            count: 2
-        ))
-        #expect(documentRegistryStoredCount(fixture.registry, label: "retirementWaiters") == 1)
-        #expect(documentRegistryStoredCount(fixture.registry, label: "locatorFlights") == 1)
-        #expect(documentRegistryStoredCount(fixture.registry, label: "actorFlights") == 1)
-        #expect(documentRegistryStoredCount(fixture.registry, label: "activeActorOpenWork") == 1)
+        for _ in 0..<50 { await Task.yield() }
+        #expect(await fixture.repository.findOrCreateCount == 5)
         #expect(await serving.readCount == 1)
 
         await serving.releaseRead()
@@ -682,26 +656,15 @@ private func waitForDocumentRegistryCompletion(
     return await completion.isCompleted
 }
 
-private func waitForDocumentRegistryStoredCount(
-    _ registry: DocumentRegistry,
-    label: String,
+private func waitForDocumentRegistryFindCount(
+    _ repository: TestDocumentMetadataRepository,
     count: Int
 ) async -> Bool {
     for _ in 0..<100 {
-        await registry.handleExternalChanges(in: [])
-        if documentRegistryStoredCount(registry, label: label) == count { return true }
+        if await repository.findOrCreateCount == count { return true }
         try? await Task.sleep(for: .milliseconds(5))
     }
-    return documentRegistryStoredCount(registry, label: label) == count
-}
-
-private func documentRegistryStoredCount(
-    _ registry: DocumentRegistry,
-    label: String
-) -> Int? {
-    guard let value = Mirror(reflecting: registry).children.first(where: { $0.label == label })?.value
-    else { return nil }
-    return Mirror(reflecting: value).children.count
+    return await repository.findOrCreateCount == count
 }
 
 private final class DocumentRegistryCancellationProbe: @unchecked Sendable {

@@ -97,11 +97,14 @@ case "${1:-}" in
     runtime_dir="$service_root/runtime"
     binary_dir="$service_root/bin"
     application_support_root="$service_root/storage"
+    project_root="$service_root/project"
     integration_master_key=$(/usr/bin/openssl rand -base64 32)
     /bin/chmod 700 "$service_root"
     print -r -- "$service_root" > "$service_root_record"
-    /bin/mkdir "$runtime_dir" "$binary_dir" "$application_support_root"
-    /bin/chmod 700 "$runtime_dir" "$binary_dir" "$application_support_root"
+    /bin/mkdir \
+      "$runtime_dir" "$binary_dir" "$application_support_root" "$project_root"
+    /bin/chmod 700 \
+      "$runtime_dir" "$binary_dir" "$application_support_root" "$project_root"
 
     /bin/cp -X "$repo_root/.build/debug/CockpitHost" "$binary_dir/CockpitHost"
     /bin/cp -X \
@@ -153,7 +156,7 @@ case "${1:-}" in
   create-terminal)
     load_service_root
     "$service_root/bin/CockpitProbe" create-terminal \
-      "$service_root/runtime" "$repo_root"
+      "$service_root/runtime" "$service_root/project"
     ;;
   *)
     print -u2 "usage: Tools/phase0-services.zsh start|stop|probe|create-terminal"

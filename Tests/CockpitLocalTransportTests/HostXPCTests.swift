@@ -457,30 +457,92 @@ import CockpitTerminalCore
 }
 
 @Test func cockpitHostParksWithoutCheckedContinuationMisuse() async throws {
-    let diagnostics = Pipe()
-    let process = Process()
-    process.executableURL = try cockpitHostExecutableURL()
-    process.standardOutput = diagnostics
-    process.standardError = diagnostics
-    try process.run()
+    let executableURL = try cockpitHostExecutableURL()
+    var descriptors: [Int32] = [0, 0]
+    guard pipe(&descriptors) == 0 else {
+        throw POSIXError(.init(rawValue: errno) ?? .EIO)
+    }
+    let diagnostics = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true)
+    var actions: posix_spawn_file_actions_t?
+    guard posix_spawn_file_actions_init(&actions) == 0 else {
+        close(descriptors[0])
+        close(descriptors[1])
+        throw CocoaError(.executableRuntimeMismatch)
+    }
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    guard posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO) == 0,
+          posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDERR_FILENO) == 0,
+          posix_spawn_file_actions_addclose(&actions, descriptors[0]) == 0,
+          posix_spawn_file_actions_addclose(&actions, descriptors[1]) == 0 else {
+        close(descriptors[1])
+        throw CocoaError(.executableRuntimeMismatch)
+    }
+    var processID: pid_t = 0
+    let spawnStatus = executableURL.path.withCString { executable in
+        var arguments: [UnsafeMutablePointer<CChar>?] = [strdup(executable), nil]
+        defer { free(arguments[0]) }
+        return arguments.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(
+                &processID,
+                executable,
+                &actions,
+                nil,
+                buffer.baseAddress,
+                environ
+            )
+        }
+    }
+    close(descriptors[1])
+    guard spawnStatus == 0 else {
+        throw POSIXError(.init(rawValue: spawnStatus) ?? .EIO)
+    }
+    var reaped = false
+    defer {
+        if !reaped {
+            if kill(processID, 0) == 0 || errno == EPERM {
+                _ = kill(processID, SIGKILL)
+            }
+            var status: Int32 = 0
+            while waitpid(processID, &status, 0) < 0, errno == EINTR {}
+        }
+    }
 
     try await Task.sleep(for: .milliseconds(250))
-    let stayedRunning = process.isRunning
+    let stayedRunning = kill(processID, 0) == 0 || errno == EPERM
     if stayedRunning {
-        process.terminate()
+        #expect(kill(processID, SIGTERM) == 0)
     }
-    process.waitUntilExit()
+    let waitStatus = try await waitForOwnedHostProcessExit(processID, timeout: 5)
+    reaped = true
     let output = String(
-        decoding: diagnostics.fileHandleForReading.readDataToEndOfFile(),
+        decoding: diagnostics.readDataToEndOfFile(),
         as: UTF8.self
     )
 
     if !stayedRunning {
         Issue.record(
-            "CockpitHost exited before parking: executable=\(process.executableURL?.path ?? "nil"), reason=\(String(describing: process.terminationReason)), status=\(process.terminationStatus), output=\(output)"
+            "CockpitHost exited before parking: executable=\(executableURL.path), waitStatus=\(waitStatus), output=\(output)"
         )
     }
+    #expect(waitStatus & 0x7f == 0)
+    #expect((waitStatus >> 8) & 0xff == 0)
     #expect(!output.contains("SWIFT TASK CONTINUATION MISUSE"))
+}
+
+private func waitForOwnedHostProcessExit(
+    _ processID: pid_t,
+    timeout: TimeInterval
+) async throws -> Int32 {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        var status: Int32 = 0
+        let result = waitpid(processID, &status, WNOHANG)
+        if result == processID { return status }
+        if result < 0, errno == EINTR { continue }
+        if result < 0 { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    throw CocoaError(.executableRuntimeMismatch)
 }
 
 @Test func hostTerminalCreatePayloadOmitsWorkspaceRootAndHostAddsResolvedRoot() async throws {

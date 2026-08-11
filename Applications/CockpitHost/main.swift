@@ -20,11 +20,63 @@ private func parkHostProcess(retaining graph: [Any]) {
     }
 }
 
+private let testResolvedExecutablePrefix = Data(
+    "cockpit-test-resolved-executable-v1\0".utf8
+)
+
+private func testResolvedExecutablePath(
+    bookmark: Data,
+    serviceNamespace: XPCServiceNamespace,
+    fixtureRootPath: String?
+) throws -> String? {
+    guard !serviceNamespace.description.isEmpty,
+          bookmark.starts(with: testResolvedExecutablePrefix) else {
+        return nil
+    }
+    guard let fixtureRootPath, !fixtureRootPath.isEmpty,
+          let path = String(
+            data: bookmark.dropFirst(testResolvedExecutablePrefix.count),
+            encoding: .utf8
+          ), path.hasPrefix("/") else {
+        throw CocoaError(.fileReadInvalidFileName)
+    }
+    let fixtureRoot = URL(
+        fileURLWithPath: fixtureRootPath,
+        isDirectory: true
+    ).resolvingSymlinksInPath().standardizedFileURL
+    let executable = URL(fileURLWithPath: path, isDirectory: false)
+        .resolvingSymlinksInPath().standardizedFileURL
+    let fixturePrefix = fixtureRoot.path.hasSuffix("/")
+        ? fixtureRoot.path
+        : "\(fixtureRoot.path)/"
+    let values = try executable.resourceValues(forKeys: [
+        .isRegularFileKey, .isSymbolicLinkKey,
+    ])
+    guard executable.path.hasPrefix(fixturePrefix),
+          values.isRegularFile == true,
+          values.isSymbolicLink != true,
+          FileManager.default.isExecutableFile(atPath: executable.path) else {
+        throw CocoaError(.fileReadNoPermission)
+    }
+    return executable.path
+}
+
 signal(SIGTERM, SIG_IGN)
+let serviceNamespace = try XPCServiceNamespace(
+    ProcessInfo.processInfo.environment["COCKPIT_SERVICE_NAMESPACE"] ?? ""
+)
 let storage: CockpitStorageLocations
-if let configuredRoot = ProcessInfo.processInfo.environment[
+let configuredRoot = ProcessInfo.processInfo.environment[
     "COCKPIT_APPLICATION_SUPPORT_ROOT"
-], !configuredRoot.isEmpty {
+]
+if !serviceNamespace.description.isEmpty {
+    guard let configuredRoot, configuredRoot.hasPrefix("/") else {
+        throw CocoaError(.fileReadInvalidFileName)
+    }
+    storage = try CockpitStorageLocations.under(
+        URL(fileURLWithPath: configuredRoot, isDirectory: true)
+    )
+} else if let configuredRoot, !configuredRoot.isEmpty {
     storage = try CockpitStorageLocations.under(
         URL(fileURLWithPath: configuredRoot, isDirectory: true)
     )
@@ -38,7 +90,9 @@ let registry = WorkspaceKernelRegistry(
     documentRecoveryRoot: storage.documentRecoveryRoot
 )
 let projectRootResolver = SecurityScopedProjectRootResolver()
-let terminalSupervisorClient = TerminalSupervisorXPCClient()
+let terminalSupervisorClient = TerminalSupervisorXPCClient(
+    serviceNamespace: serviceNamespace
+)
 let terminalSupervisor = TerminalSupervisorControlTransport(
     client: terminalSupervisorClient
 )
@@ -80,7 +134,18 @@ let terminalService = WorkspaceTerminalService(
         }
         return root.canonicalAbsolutePath
     },
-    resolveAgentExecutableBookmark: agentExecutableBookmarkResolver.resolve,
+    resolveAgentExecutableBookmark: { bookmark in
+        if let resolved = try testResolvedExecutablePath(
+            bookmark: bookmark,
+            serviceNamespace: serviceNamespace,
+            fixtureRootPath: ProcessInfo.processInfo.environment[
+                "COCKPIT_PHASE1_EXECUTABLE_FIXTURE_ROOT"
+            ]
+        ) {
+            return resolved
+        }
+        return try agentExecutableBookmarkResolver.resolve(bookmark: bookmark)
+    },
     supervisor: terminalSupervisor
 )
 let exported = HostXPCExport(
@@ -93,7 +158,9 @@ let delegate = MachServiceListenerDelegate(
     exportedObject: exported,
     exportedInterface: NSXPCInterface(with: HostXPCProtocol.self)
 )
-let listener = NSXPCListener(machServiceName: "dev.cockpit.host")
+let listener = NSXPCListener(
+    machServiceName: XPCServiceEndpoint.host.machServiceName(in: serviceNamespace)
+)
 listener.delegate = delegate
 listener.resume()
 
