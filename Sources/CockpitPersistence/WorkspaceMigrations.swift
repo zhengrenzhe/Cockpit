@@ -1,5 +1,5 @@
 enum WorkspaceMigrations {
-    static let all = [version1, version2]
+    static let all = [version1, version2, version3]
 
     private static let version1 = SQLiteMigration(
         version: 1,
@@ -94,6 +94,36 @@ enum WorkspaceMigrations {
                 PRIMARY KEY (device_id, window_id, context_kind, context_id)
             )
             """,
+        ]
+    )
+
+    private static let version3 = SQLiteMigration(
+        version: 3,
+        statements: [
+            """
+            CREATE TABLE conversation_deletions_v3 (
+                operation_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL UNIQUE,
+                project_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (
+                    phase IN (
+                        'deleting', 'terminatingSessions', 'purgingTerminalRecords',
+                        'removingClientState', 'deleted'
+                    )
+                )
+            )
+            """,
+            """
+            INSERT INTO conversation_deletions_v3 (
+                operation_id, conversation_id, project_id, environment_id, phase
+            )
+            SELECT d.operation_id, d.conversation_id, c.project_id, c.environment_id, d.phase
+            FROM conversation_deletions AS d
+            JOIN conversations AS c ON c.id = d.conversation_id
+            """,
+            "DROP TABLE conversation_deletions",
+            "ALTER TABLE conversation_deletions_v3 RENAME TO conversation_deletions",
         ]
     )
 }

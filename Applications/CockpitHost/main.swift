@@ -38,10 +38,18 @@ let registry = WorkspaceKernelRegistry(
     documentRecoveryRoot: storage.documentRecoveryRoot
 )
 let projectRootResolver = SecurityScopedProjectRootResolver()
+let terminalSupervisorClient = TerminalSupervisorXPCClient()
+let terminalSupervisor = TerminalSupervisorControlTransport(
+    client: terminalSupervisorClient
+)
+let terminalDeletion = ContextTerminalDeletionTransport(
+    client: terminalSupervisorClient
+)
 let service = WorkspaceService(
     repository: repository,
     rootResolver: projectRootResolver,
-    kernelRegistry: registry
+    kernelRegistry: registry,
+    terminalDeletion: terminalDeletion
 )
 let agentExecutableBookmarkResolver = SecurityScopedExecutableBookmarkResolver()
 let router = WorkspaceCommandRouter(service: service)
@@ -60,7 +68,6 @@ let ticketIssuer = HostDataPlaneTicketIssuer(
     store: ticketStore,
     effectiveUserID: geteuid()
 )
-let terminalSupervisor = TerminalSupervisorControlTransport()
 let terminalService = WorkspaceTerminalService(
     resolveContext: { try await service.resolveContext($0) },
     resolveWorkspaceRoot: { context in
@@ -108,7 +115,8 @@ terminationSignal.resume()
 parkHostProcess(
     retaining: [
         repository, registry, service, router, ticketStore, dataPlaneService,
-        dataPlaneServer, ticketIssuer, terminalSupervisor, terminalService,
+        dataPlaneServer, ticketIssuer, terminalSupervisorClient,
+        terminalSupervisor, terminalDeletion, terminalService,
         exported, delegate, listener,
         shutdownCoordinator, terminationSignal,
     ]

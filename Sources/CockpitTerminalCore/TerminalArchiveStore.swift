@@ -204,6 +204,27 @@ public final class TerminalArchiveStore: @unchecked Sendable {
         try RelativeArchivePath(validating: "\(sessionID)/\(Self.manifestName)")
     }
 
+    public func deleteArchive(sessionID: TerminalSessionID) throws {
+        try withArchiveRoot { root in
+            let name = sessionID.description
+            guard let session = try optionalDirectory(parent: root, name: name) else {
+                return
+            }
+            do {
+                try removeDirectoryContents(session)
+                guard Darwin.close(session) == 0 else { throw Self.io("close") }
+            } catch {
+                _ = Darwin.close(session)
+                throw error
+            }
+            let result = name.withCString {
+                unlinkat(root, $0, AT_REMOVEDIR)
+            }
+            guard result == 0 || errno == ENOENT else { throw Self.io("unlinkat") }
+            try synchronize(root, component: name)
+        }
+    }
+
     private func withArchiveRoot<Result>(
         _ body: (Int32) throws -> Result
     ) throws -> Result {
@@ -237,6 +258,75 @@ public final class TerminalArchiveStore: @unchecked Sendable {
             throw TerminalArchiveError.integrityMismatch
         }
         return descriptor
+    }
+
+    private func removeDirectoryContents(_ directory: Int32) throws {
+        let duplicate = fcntl(directory, F_DUPFD_CLOEXEC, 0)
+        guard duplicate >= 0, let stream = fdopendir(duplicate) else {
+            if duplicate >= 0 { _ = Darwin.close(duplicate) }
+            throw Self.io("fdopendir")
+        }
+        var names: [String] = []
+        while let entry = readdir(stream) {
+            let name = withUnsafePointer(to: entry.pointee.d_name) { pointer in
+                pointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: Int(MAXNAMLEN) + 1
+                ) { String(cString: $0) }
+            }
+            if name != ".", name != ".." { names.append(name) }
+        }
+        guard closedir(stream) == 0 else { throw Self.io("closedir") }
+
+        for name in names.sorted() {
+            guard Self.validComponent(name) else {
+                throw TerminalArchiveError.invalidLayout
+            }
+            var metadata = stat()
+            let inspected = name.withCString {
+                fstatat(directory, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+            }
+            if inspected != 0, errno == ENOENT { continue }
+            guard inspected == 0, metadata.st_uid == effectiveUserID else {
+                throw TerminalArchiveError.invalidLayout
+            }
+            switch metadata.st_mode & mode_t(S_IFMT) {
+            case mode_t(S_IFDIR):
+                let child = name.withCString {
+                    openat(
+                        directory,
+                        $0,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    )
+                }
+                guard child >= 0 else { throw Self.io("openat") }
+                do {
+                    try validateDirectory(child, component: name)
+                    try removeDirectoryContents(child)
+                    guard Darwin.close(child) == 0 else { throw Self.io("close") }
+                } catch {
+                    _ = Darwin.close(child)
+                    throw error
+                }
+                let removed = name.withCString {
+                    unlinkat(directory, $0, AT_REMOVEDIR)
+                }
+                guard removed == 0 || errno == ENOENT else {
+                    throw Self.io("unlinkat")
+                }
+            case mode_t(S_IFREG):
+                guard metadata.st_mode & 0o777 == 0o600 else {
+                    throw TerminalArchiveError.invalidLayout
+                }
+                let removed = name.withCString { unlinkat(directory, $0, 0) }
+                guard removed == 0 || errno == ENOENT else {
+                    throw Self.io("unlinkat")
+                }
+            default:
+                throw TerminalArchiveError.invalidLayout
+            }
+        }
+        try synchronize(directory, component: "archive")
     }
 
     private func optionalDirectory(parent: Int32, name: String) throws -> Int32? {

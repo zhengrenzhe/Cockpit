@@ -230,6 +230,23 @@ public enum TerminalSupervisorCommandRequest: Hashable, Codable, Sendable {
     )
     case purgeFinishedRecords
     case reconcile
+    case beginContextDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    )
+    case terminateContextSessions(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID,
+        force: Bool
+    )
+    case contextTerminationStatus(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    )
+    case purgeDeletedContext(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    )
 }
 
 public enum TerminalSupervisorCommandResponse: Hashable, Codable, Sendable {
@@ -239,6 +256,7 @@ public enum TerminalSupervisorCommandResponse: Hashable, Codable, Sendable {
     case inputLease(InputLeaseGrant)
     case processGroup(Int32)
     case purged(Int)
+    case contextTermination(ContextTerminationResult)
     case agentExecutableSelectionRequired(AgentProfileID)
     case empty
 }

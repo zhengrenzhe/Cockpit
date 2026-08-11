@@ -17,6 +17,73 @@ import Testing
             "projects",
             "schema_migrations",
         ])
+        #expect(
+            try await connection.integerValue(for: "SELECT MAX(version) FROM schema_migrations") == 3
+        )
+    }
+}
+
+@Test func workspaceMigrationV3PreservesDeletionIdentityAfterConversationRemoval() async throws {
+    try await withMigrationDatabase { databaseURL in
+        let connection = try SQLiteConnection(databaseURL: databaseURL)
+        try await connection.applyMigrations(Array(WorkspaceMigrations.all.prefix(2)))
+        try await connection.withImmediateTransaction { connection in
+            try connection.execute(
+                """
+                INSERT INTO projects (
+                    id, display_name, root_bookmark, canonical_root_identity,
+                    base_environment_id, created_at
+                ) VALUES ('00000000-0000-4000-8000-000000000001', 'Persisted', X'01',
+                          'root-v3', '00000000-0000-4000-8000-000000000002', 1)
+                """
+            )
+            try connection.execute(
+                """
+                INSERT INTO environments (
+                    id, project_id, kind, workspace_root, workspace_root_identity,
+                    git_common_directory, worktree_branch
+                ) VALUES ('00000000-0000-4000-8000-000000000002',
+                          '00000000-0000-4000-8000-000000000001', 'direct', '/tmp/project',
+                          'root-v3', NULL, NULL)
+                """
+            )
+            try connection.execute(
+                """
+                INSERT INTO conversations (
+                    id, project_id, environment_id, title, lifecycle_state,
+                    deletion_phase, deletion_operation_id, created_at
+                ) VALUES ('00000000-0000-4000-8000-000000000003',
+                          '00000000-0000-4000-8000-000000000001',
+                          '00000000-0000-4000-8000-000000000002', 'Deleting', 'deleting',
+                          'terminatingSessions', '00000000-0000-4000-8000-000000000004', 2)
+                """
+            )
+            try connection.execute(
+                """
+                INSERT INTO conversation_deletions (operation_id, conversation_id, phase)
+                VALUES ('00000000-0000-4000-8000-000000000004',
+                        '00000000-0000-4000-8000-000000000003', 'terminatingSessions')
+                """
+            )
+        }
+
+        try await connection.applyMigrations(WorkspaceMigrations.all)
+        try await connection.execute(
+            "DELETE FROM conversations WHERE id = '00000000-0000-4000-8000-000000000003'"
+        )
+
+        let rows = try await connection.query(
+            """
+            SELECT conversation_id, project_id, environment_id, phase
+            FROM conversation_deletions
+            WHERE operation_id = '00000000-0000-4000-8000-000000000004'
+            """
+        )
+        #expect(rows.count == 1)
+        #expect(text(in: rows[0], at: 0) == "00000000-0000-4000-8000-000000000003")
+        #expect(text(in: rows[0], at: 1) == "00000000-0000-4000-8000-000000000001")
+        #expect(text(in: rows[0], at: 2) == "00000000-0000-4000-8000-000000000002")
+        #expect(text(in: rows[0], at: 3) == "terminatingSessions")
     }
 }
 
@@ -46,7 +113,7 @@ import Testing
         try await connection.applyMigrations(WorkspaceMigrations.all)
 
         #expect(try await connection.textValue(for: "SELECT display_name FROM projects") == "Persisted")
-        #expect(try await connection.query("SELECT version FROM schema_migrations ORDER BY version").compactMap { integer(in: $0, at: 0) } == [1, 2])
+        #expect(try await connection.query("SELECT version FROM schema_migrations ORDER BY version").compactMap { integer(in: $0, at: 0) } == [1, 2, 3])
         let tableInfo = try await connection.query("PRAGMA table_info(client_workspace_states)")
         #expect(tableInfo.compactMap { text(in: $0, at: 1) } == [
             "device_id", "window_id", "context_kind", "context_id", "state_json",

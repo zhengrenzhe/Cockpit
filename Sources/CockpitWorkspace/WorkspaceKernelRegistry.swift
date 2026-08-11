@@ -1,5 +1,6 @@
 import Foundation
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 
 public final class WorkspaceKernel: @unchecked Sendable {
@@ -114,10 +115,143 @@ public actor WorkspaceKernelRegistry: WorkspaceKernelRegistering {
         _ operation: FileOperation,
         in environmentID: EnvironmentID
     ) async throws -> FileOperationResult {
+        guard let kernel = kernels[environmentID] else {
+            throw FileOperationError.environmentNotRegistered
+        }
+        guard let registry = kernel.documentRegistry else {
+            return try await kernel.fileOperationCoordinator.perform(operation)
+        }
+        let lease = try await registry.acquireOperation(contextID: nil)
+        do {
+            let result = try await kernel.fileOperationCoordinator.perform(operation)
+            await registry.releaseOperation(lease)
+            return result
+        } catch {
+            await registry.releaseOperation(lease)
+            throw error
+        }
+    }
+
+    public func perform(
+        _ operation: FileOperation,
+        in environmentID: EnvironmentID,
+        contextID: WorkspaceContextID
+    ) async throws -> FileOperationResult {
         guard let coordinator = kernels[environmentID]?.fileOperationCoordinator else {
             throw FileOperationError.environmentNotRegistered
         }
-        return try await coordinator.perform(operation)
+        guard let registry = kernels[environmentID]?.documentRegistry else {
+            return try await coordinator.perform(operation)
+        }
+        let lease = try await registry.acquireOperation(contextID: contextID)
+        do {
+            let result = try await coordinator.perform(operation)
+            await registry.releaseOperation(lease)
+            return result
+        } catch {
+            await registry.releaseOperation(lease)
+            throw error
+        }
+    }
+
+    public func documentDeletionStates(
+        in environmentID: EnvironmentID,
+        documentIDs: Set<DocumentID>
+    ) async throws -> [DocumentDeletionState] {
+        guard let registry = kernels[environmentID]?.documentRegistry else { return [] }
+        let lease = try await registry.acquireOperation(contextID: nil)
+        do {
+            let states = try await registry.deletionStates(documentIDs: documentIDs)
+            await registry.releaseOperation(lease)
+            return states
+        } catch {
+            await registry.releaseOperation(lease)
+            throw error
+        }
+    }
+
+    public func documentDeletionStates(
+        in environmentID: EnvironmentID,
+        documentIDs: Set<DocumentID>,
+        includingViewerContext contextID: WorkspaceContextID
+    ) async throws -> [DocumentDeletionState] {
+        guard let registry = kernels[environmentID]?.documentRegistry else { return [] }
+        let lease = try await registry.acquireOperation(contextID: nil)
+        do {
+            let states = try await registry.deletionStates(
+                documentIDs: documentIDs,
+                includingViewerContext: contextID
+            )
+            await registry.releaseOperation(lease)
+            return states
+        } catch {
+            await registry.releaseOperation(lease)
+            throw error
+        }
+    }
+
+    public func reserveConversationDeletion(
+        in environmentID: EnvironmentID,
+        preparationID: UUID,
+        targetContextID: WorkspaceContextID,
+        expectedDocumentStates: [DocumentDeletionState]
+    ) async throws -> ConversationDeletionDocumentReservation {
+        guard let registry = kernels[environmentID]?.documentRegistry else {
+            throw HostDataPlaneServiceError.documentNotOpen
+        }
+        return try await registry.reserveConversationDeletion(
+            preparationID: preparationID,
+            targetContextID: targetContextID,
+            expectedDocumentStates: expectedDocumentStates
+        )
+    }
+
+    public func commitConversationDeletion(
+        _ reservation: ConversationDeletionDocumentReservation,
+        blocking targetContextID: WorkspaceContextID
+    ) async {
+        await kernels[reservation.environmentID]?.documentRegistry?
+            .commitConversationDeletion(reservation, blocking: targetContextID)
+    }
+
+    public func cancelConversationDeletion(
+        _ reservation: ConversationDeletionDocumentReservation
+    ) async {
+        await kernels[reservation.environmentID]?.documentRegistry?
+            .cancelConversationDeletion(reservation)
+    }
+
+    func registerDocumentViewer(
+        connectionID: UUID,
+        binding: HostDataPlaneBinding,
+        documentID: DocumentID
+    ) async throws {
+        guard let registry = kernels[binding.environmentID]?.documentRegistry else {
+            throw HostDataPlaneServiceError.documentNotOpen
+        }
+        try await registry.registerViewer(
+            connectionID: connectionID,
+            contextID: binding.workspaceContextID,
+            documentID: documentID
+        )
+    }
+
+    func removeDocumentViewers(connectionID: UUID) async {
+        for kernel in kernels.values {
+            await kernel.documentRegistry?.removeViewers(connectionID: connectionID)
+        }
+    }
+
+    func removeDocumentViewer(
+        connectionID: UUID,
+        documentID: DocumentID
+    ) async {
+        for kernel in kernels.values {
+            await kernel.documentRegistry?.removeViewer(
+                connectionID: connectionID,
+                documentID: documentID
+            )
+        }
     }
 }
 

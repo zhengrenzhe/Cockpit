@@ -9,6 +9,7 @@ shift
   print -r -- "args=$*"
 } > "$output"
 if [[ "${1:-}" == --wait-with-child ]]; then
+  trap '' TERM
   /bin/sleep 30 &
   child=$!
   print -r -- "child=$child" >> "$output"

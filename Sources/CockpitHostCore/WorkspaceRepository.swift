@@ -189,6 +189,7 @@ public enum WorkspaceRepositoryError: Error, Equatable, Sendable {
     case projectNotFound
     case conversationNotFound
     case invalidStoredValue
+    case conversationDeletionUnsupported
 }
 
 public protocol DocumentLocatorUpdating: Sendable {
@@ -221,4 +222,67 @@ public protocol WorkspaceRepository: DocumentLocatorUpdating, Sendable {
     func resolve(_ contextID: WorkspaceContextID) async throws -> ResolvedWorkspaceContext
     func loadClientState(_ key: ClientWorkspaceStateKey) async throws -> ClientWorkspaceState?
     func saveClientState(_ state: ClientWorkspaceState) async throws
+    func allClientStates() async throws -> [ClientWorkspaceState]
+    func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID
+    ) async throws -> ConversationDeletionOperation
+    func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        targetContextID: WorkspaceContextID,
+        relevantDocumentIDs: Set<DocumentID>,
+        expectedPersistedViewers: Set<ConversationDeletionPersistedViewer>
+    ) async throws -> ConversationDeletionOperation
+    func conversationDeletion(
+        operationID: DeletionOperationID
+    ) async throws -> ConversationDeletionOperation?
+    func advanceConversationDeletion(
+        operationID: DeletionOperationID,
+        from expected: ConversationDeletionPhase,
+        to phase: ConversationDeletionPhase
+    ) async throws -> ConversationDeletionOperation
+    func finishConversationDeletion(operationID: DeletionOperationID) async throws
+}
+
+public extension WorkspaceRepository {
+    func allClientStates() async throws -> [ClientWorkspaceState] { [] }
+
+    func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID
+    ) async throws -> ConversationDeletionOperation {
+        throw WorkspaceRepositoryError.conversationDeletionUnsupported
+    }
+
+    func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        targetContextID: WorkspaceContextID,
+        relevantDocumentIDs: Set<DocumentID>,
+        expectedPersistedViewers: Set<ConversationDeletionPersistedViewer>
+    ) async throws -> ConversationDeletionOperation {
+        try await beginConversationDeletion(
+            conversationID: conversationID,
+            operationID: operationID
+        )
+    }
+
+    func conversationDeletion(
+        operationID: DeletionOperationID
+    ) async throws -> ConversationDeletionOperation? {
+        nil
+    }
+
+    func advanceConversationDeletion(
+        operationID: DeletionOperationID,
+        from expected: ConversationDeletionPhase,
+        to phase: ConversationDeletionPhase
+    ) async throws -> ConversationDeletionOperation {
+        throw WorkspaceRepositoryError.conversationDeletionUnsupported
+    }
+
+    func finishConversationDeletion(operationID: DeletionOperationID) async throws {
+        throw WorkspaceRepositoryError.conversationDeletionUnsupported
+    }
 }

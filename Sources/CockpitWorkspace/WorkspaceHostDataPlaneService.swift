@@ -1,3 +1,4 @@
+import Foundation
 import CockpitHostCore
 import CockpitProtocol
 import CockpitTypes
@@ -18,28 +19,54 @@ public struct WorkspaceHostDataPlaneService: HostDataPlaneServing {
         binding: HostDataPlaneBinding,
         at path: RelativePath
     ) async throws -> DocumentSnapshot {
-        let kernel = try await resolveKernel(for: binding)
-        guard let registry = kernel.documentRegistry else {
-            throw HostDataPlaneServiceError.documentNotOpen
+        try await withDocumentOperation(binding: binding) { registry in
+            let document = try await registry.open(at: path)
+            return await document.snapshot()
         }
-        let document = try await registry.open(at: path)
-        return await document.snapshot()
+    }
+
+    public func registerDocumentViewer(
+        connectionID: UUID,
+        binding: HostDataPlaneBinding,
+        documentID: DocumentID
+    ) async throws {
+        try await kernelRegistry.registerDocumentViewer(
+            connectionID: connectionID,
+            binding: binding,
+            documentID: documentID
+        )
+    }
+
+    public func removeDocumentViewers(connectionID: UUID) async {
+        await kernelRegistry.removeDocumentViewers(connectionID: connectionID)
+    }
+
+    public func removeDocumentViewer(
+        connectionID: UUID,
+        documentID: DocumentID
+    ) async {
+        await kernelRegistry.removeDocumentViewer(
+            connectionID: connectionID,
+            documentID: documentID
+        )
     }
 
     public func snapshot(
         binding: HostDataPlaneBinding,
         documentID: DocumentID
     ) async throws -> DocumentSnapshot {
-        let document = try await openDocument(id: documentID, binding: binding)
-        return await document.snapshot()
+        try await withOpenDocument(binding: binding, documentID: documentID) {
+            await $0.snapshot()
+        }
     }
 
     public func acquireEditLease(
         binding: HostDataPlaneBinding,
         documentID: DocumentID
     ) async throws -> EditLease {
-        let document = try await openDocument(id: documentID, binding: binding)
-        return try await document.acquireEditLease(client: binding.clientInstanceID)
+        try await withOpenDocument(binding: binding, documentID: documentID) {
+            try await $0.acquireEditLease(client: binding.clientInstanceID)
+        }
     }
 
     public func transferEditLease(
@@ -48,28 +75,30 @@ public struct WorkspaceHostDataPlaneService: HostDataPlaneServing {
         from leaseID: EditLeaseID,
         to client: ClientInstanceID
     ) async throws -> EditLease {
-        let document = try await openDocument(id: documentID, binding: binding)
-        return try await document.transferEditLease(
-            from: leaseID,
-            to: client,
-            authorizedClient: binding.clientInstanceID
-        )
+        try await withOpenDocument(binding: binding, documentID: documentID) {
+            try await $0.transferEditLease(
+                from: leaseID,
+                to: client,
+                authorizedClient: binding.clientInstanceID
+            )
+        }
     }
 
     public func apply(
         binding: HostDataPlaneBinding,
         transaction: EditTransaction
     ) async throws -> EditAcknowledgement {
-        let document = try await openDocument(id: transaction.documentID, binding: binding)
-        do {
-            return try await document.apply(
-                transaction,
-                authorizedClient: binding.clientInstanceID
-            )
-        } catch let error as DocumentCommitRecoveryRequiredError {
-            throw HostDataPlaneDocumentError.committedRecoveryRequired(
-                error.committedAcknowledgement
-            )
+        try await withOpenDocument(binding: binding, documentID: transaction.documentID) {
+            do {
+                return try await $0.apply(
+                    transaction,
+                    authorizedClient: binding.clientInstanceID
+                )
+            } catch let error as DocumentCommitRecoveryRequiredError {
+                throw HostDataPlaneDocumentError.committedRecoveryRequired(
+                    error.committedAcknowledgement
+                )
+            }
         }
     }
 
@@ -78,11 +107,12 @@ public struct WorkspaceHostDataPlaneService: HostDataPlaneServing {
         documentID: DocumentID,
         through clientSequence: UInt64
     ) async throws -> UInt64 {
-        let document = try await openDocument(id: documentID, binding: binding)
-        return try await document.flush(
-            through: clientSequence,
-            authorizedClient: binding.clientInstanceID
-        )
+        try await withOpenDocument(binding: binding, documentID: documentID) {
+            try await $0.flush(
+                through: clientSequence,
+                authorizedClient: binding.clientInstanceID
+            )
+        }
     }
 
     public func save(
@@ -90,19 +120,21 @@ public struct WorkspaceHostDataPlaneService: HostDataPlaneServing {
         documentID: DocumentID,
         expectedFingerprint: DiskFingerprint
     ) async throws -> DocumentSnapshot {
-        let document = try await openDocument(id: documentID, binding: binding)
-        return try await document.save(
-            expectedFingerprint: expectedFingerprint,
-            authorizedClient: binding.clientInstanceID
-        )
+        try await withOpenDocument(binding: binding, documentID: documentID) {
+            try await $0.save(
+                expectedFingerprint: expectedFingerprint,
+                authorizedClient: binding.clientInstanceID
+            )
+        }
     }
 
     public func discard(
         binding: HostDataPlaneBinding,
         documentID: DocumentID
     ) async throws -> DocumentSnapshot {
-        let document = try await openDocument(id: documentID, binding: binding)
-        return try await document.discard(authorizedClient: binding.clientInstanceID)
+        try await withOpenDocument(binding: binding, documentID: documentID) {
+            try await $0.discard(authorizedClient: binding.clientInstanceID)
+        }
     }
 
     public func fileTreeChildren(
@@ -143,17 +175,38 @@ public struct WorkspaceHostDataPlaneService: HostDataPlaneServing {
         }
     }
 
-    private func openDocument(
-        id documentID: DocumentID,
-        binding: HostDataPlaneBinding
-    ) async throws -> DocumentActor {
+    private func withDocumentOperation<T: Sendable>(
+        binding: HostDataPlaneBinding,
+        _ operation: @Sendable (DocumentRegistry) async throws -> T
+    ) async throws -> T {
         let kernel = try await resolveKernel(for: binding)
-        guard let registry = kernel.documentRegistry,
-              let document = await registry.document(id: documentID)
-        else {
+        guard let registry = kernel.documentRegistry else {
             throw HostDataPlaneServiceError.documentNotOpen
         }
-        return document
+        let lease = try await registry.acquireOperation(
+            contextID: binding.workspaceContextID
+        )
+        do {
+            let result = try await operation(registry)
+            await registry.releaseOperation(lease)
+            return result
+        } catch {
+            await registry.releaseOperation(lease)
+            throw error
+        }
+    }
+
+    private func withOpenDocument<T: Sendable>(
+        binding: HostDataPlaneBinding,
+        documentID: DocumentID,
+        _ operation: @Sendable (DocumentActor) async throws -> T
+    ) async throws -> T {
+        try await withDocumentOperation(binding: binding) { registry in
+            guard let document = await registry.document(id: documentID) else {
+                throw HostDataPlaneServiceError.documentNotOpen
+            }
+            return try await operation(document)
+        }
     }
 
     private func resolveKernel(

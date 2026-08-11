@@ -186,7 +186,7 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository, DocumentMetadataRep
                 SELECT c.project_id, c.environment_id, e.workspace_root_identity
                 FROM conversations AS c
                 JOIN environments AS e ON e.id = c.environment_id AND e.project_id = c.project_id
-                WHERE c.id = ?
+                WHERE c.id = ? AND c.lifecycle_state = 'active'
                 """,
                 bindings: [.text(conversationID.description)]
             )
@@ -259,6 +259,15 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository, DocumentMetadataRep
         }
         let context = Self.storageContext(valid.key.workspaceContextID)
         try await connection.withImmediateTransaction { connection in
+            if case let .conversation(conversationID) = valid.key.workspaceContextID {
+                let active = try connection.query(
+                    "SELECT 1 FROM conversations WHERE id = ? AND lifecycle_state = 'active'",
+                    bindings: [.text(conversationID.description)]
+                )
+                guard active.count == 1 else {
+                    throw WorkspaceRepositoryError.conversationNotFound
+                }
+            }
             try connection.execute(
                 """
                 INSERT INTO client_workspace_states (
@@ -274,6 +283,238 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository, DocumentMetadataRep
                     .text(context.id),
                     .text(json),
                 ]
+            )
+        }
+    }
+
+    public func allClientStates() async throws -> [ClientWorkspaceState] {
+        let rows = try await connection.query(
+            """
+            SELECT s.device_id, s.window_id, s.context_kind, s.context_id,
+                   CAST(s.state_json AS BLOB)
+            FROM client_workspace_states AS s
+            WHERE s.context_kind != 'conversation'
+               OR EXISTS (
+                    SELECT 1 FROM conversations AS c
+                    WHERE c.id = s.context_id AND c.lifecycle_state = 'active'
+               )
+            ORDER BY s.device_id, s.window_id, s.context_kind, s.context_id
+            """
+        )
+        return try rows.map(Self.clientState(from:))
+    }
+
+    public func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID
+    ) async throws -> ConversationDeletionOperation {
+        try await beginConversationDeletion(
+            conversationID: conversationID,
+            operationID: operationID,
+            persistedViewerExpectation: nil
+        )
+    }
+
+    public func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        targetContextID: WorkspaceContextID,
+        relevantDocumentIDs: Set<DocumentID>,
+        expectedPersistedViewers: Set<ConversationDeletionPersistedViewer>
+    ) async throws -> ConversationDeletionOperation {
+        try await beginConversationDeletion(
+            conversationID: conversationID,
+            operationID: operationID,
+            persistedViewerExpectation: (
+                targetContextID,
+                relevantDocumentIDs,
+                expectedPersistedViewers
+            )
+        )
+    }
+
+    private func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        persistedViewerExpectation: (
+            targetContextID: WorkspaceContextID,
+            relevantDocumentIDs: Set<DocumentID>,
+            viewers: Set<ConversationDeletionPersistedViewer>
+        )?
+    ) async throws -> ConversationDeletionOperation {
+        try await connection.withImmediateTransaction { connection in
+            if let existing = try Self.loadDeletion(
+                connection: connection,
+                operationID: operationID
+            ) {
+                guard existing.conversationID == conversationID else {
+                    throw ConversationDeletionError.operationMismatch
+                }
+                return existing
+            }
+            if try !connection.query(
+                "SELECT 1 FROM conversation_deletions WHERE conversation_id = ?",
+                bindings: [.text(conversationID.description)]
+            ).isEmpty {
+                throw ConversationDeletionError.operationMismatch
+            }
+            let rows = try connection.query(
+                """
+                SELECT project_id, environment_id, lifecycle_state
+                FROM conversations WHERE id = ?
+                """,
+                bindings: [.text(conversationID.description)]
+            )
+            guard rows.count == 1,
+                  let projectID = Self.projectID(rows[0][safe: 0]),
+                  let environmentID = Self.environmentID(rows[0][safe: 1]),
+                  rows[0][safe: 2]?.text == "active" else {
+                throw WorkspaceRepositoryError.conversationNotFound
+            }
+            if let expectation = persistedViewerExpectation {
+                let stateRows = try connection.query(
+                    """
+                    SELECT s.device_id, s.window_id, s.context_kind, s.context_id,
+                           CAST(s.state_json AS BLOB)
+                    FROM client_workspace_states AS s
+                    WHERE s.context_kind != 'conversation'
+                       OR EXISTS (
+                            SELECT 1 FROM conversations AS c
+                            WHERE c.id = s.context_id AND c.lifecycle_state = 'active'
+                       )
+                    ORDER BY s.device_id, s.window_id, s.context_kind, s.context_id
+                    """
+                )
+                let states = try stateRows.map(Self.clientState(from:))
+                let actual = Set(states.flatMap { state in
+                    state.tabs.compactMap { tab -> ConversationDeletionPersistedViewer? in
+                        guard case let .file(documentID) = tab.resource,
+                              state.key.workspaceContextID == expectation.targetContextID
+                                || expectation.relevantDocumentIDs.contains(documentID) else {
+                            return nil
+                        }
+                        return ConversationDeletionPersistedViewer(
+                            documentID: documentID,
+                            contextID: state.key.workspaceContextID
+                        )
+                    }
+                })
+                guard actual == expectation.viewers else {
+                    throw ConversationDeletionError.stalePreparation
+                }
+            }
+            let operation = ConversationDeletionOperation(
+                operationID: operationID,
+                conversationID: conversationID,
+                projectID: projectID,
+                environmentID: environmentID,
+                phase: .deleting
+            )
+            try connection.execute(
+                """
+                INSERT INTO conversation_deletions (
+                    operation_id, conversation_id, project_id, environment_id, phase
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                bindings: [
+                    .text(operationID.description),
+                    .text(conversationID.description),
+                    .text(projectID.description),
+                    .text(environmentID.description),
+                    .text(Self.storagePhase(.deleting)),
+                ]
+            )
+            try connection.execute(
+                """
+                UPDATE conversations
+                SET lifecycle_state = 'deleting', deletion_phase = ?, deletion_operation_id = ?
+                WHERE id = ?
+                """,
+                bindings: [
+                    .text(Self.storagePhase(.deleting)),
+                    .text(operationID.description),
+                    .text(conversationID.description),
+                ]
+            )
+            return operation
+        }
+    }
+
+    public func conversationDeletion(
+        operationID: DeletionOperationID
+    ) async throws -> ConversationDeletionOperation? {
+        try await connection.withImmediateTransaction { connection in
+            try Self.loadDeletion(connection: connection, operationID: operationID)
+        }
+    }
+
+    public func advanceConversationDeletion(
+        operationID: DeletionOperationID,
+        from expected: ConversationDeletionPhase,
+        to phase: ConversationDeletionPhase
+    ) async throws -> ConversationDeletionOperation {
+        try await connection.withImmediateTransaction { connection in
+            guard let current = try Self.loadDeletion(
+                connection: connection,
+                operationID: operationID
+            ) else {
+                throw ConversationDeletionError.operationMismatch
+            }
+            if current.phase == phase { return current }
+            guard current.phase == expected, phase.rawValue == expected.rawValue + 1 else {
+                throw ConversationDeletionError.operationMismatch
+            }
+            try connection.execute(
+                "UPDATE conversation_deletions SET phase = ? WHERE operation_id = ?",
+                bindings: [.text(Self.storagePhase(phase)), .text(operationID.description)]
+            )
+            try connection.execute(
+                "UPDATE conversations SET deletion_phase = ? WHERE id = ? AND deletion_operation_id = ?",
+                bindings: [
+                    .text(Self.storagePhase(phase)),
+                    .text(current.conversationID.description),
+                    .text(operationID.description),
+                ]
+            )
+            return ConversationDeletionOperation(
+                operationID: current.operationID,
+                conversationID: current.conversationID,
+                projectID: current.projectID,
+                environmentID: current.environmentID,
+                phase: phase
+            )
+        }
+    }
+
+    public func finishConversationDeletion(
+        operationID: DeletionOperationID
+    ) async throws {
+        try await connection.withImmediateTransaction { connection in
+            guard let current = try Self.loadDeletion(
+                connection: connection,
+                operationID: operationID
+            ) else {
+                throw ConversationDeletionError.operationMismatch
+            }
+            if current.phase == .deleted { return }
+            guard current.phase == .removingClientState else {
+                throw ConversationDeletionError.operationMismatch
+            }
+            let context = Self.storageContext(.conversation(current.conversationID))
+            try connection.execute(
+                "DELETE FROM client_workspace_states WHERE context_kind = ? AND context_id = ?",
+                bindings: [.text(context.kind), .text(context.id)]
+            )
+            try connection.execute(
+                "DELETE FROM conversations WHERE id = ? AND deletion_operation_id = ?",
+                bindings: [
+                    .text(current.conversationID.description),
+                    .text(operationID.description),
+                ]
+            )
+            try connection.execute(
+                "UPDATE conversation_deletions SET phase = ? WHERE operation_id = ?",
+                bindings: [.text(Self.storagePhase(.deleted)), .text(operationID.description)]
             )
         }
     }
@@ -547,6 +788,94 @@ public actor SQLiteWorkspaceRepository: WorkspaceRepository, DocumentMetadataRep
             deletionOperationID: deletionOperationID,
             createdAt: Date(timeIntervalSince1970: createdAt)
         )
+    }
+
+    private static func clientState(from row: [SQLiteColumn]) throws -> ClientWorkspaceState {
+        guard row.count == 5,
+              let deviceText = row[safe: 0]?.text,
+              let deviceUUID = UUID(uuidString: deviceText),
+              let windowText = row[safe: 1]?.text,
+              let windowUUID = UUID(uuidString: windowText),
+              let contextKind = row[safe: 2]?.text,
+              let contextUUIDText = row[safe: 3]?.text,
+              let contextUUID = UUID(uuidString: contextUUIDText),
+              let data = row[safe: 4]?.blob else {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+        let contextID: WorkspaceContextID
+        switch contextKind {
+        case "project": contextID = .project(ProjectID(contextUUID))
+        case "conversation": contextID = .conversation(ConversationID(contextUUID))
+        default: throw WorkspaceRepositoryError.invalidStoredValue
+        }
+        do {
+            let state = try JSONDecoder().decode(ClientWorkspaceState.self, from: data)
+            let valid = try state.validated()
+            let expected = ClientWorkspaceStateKey(
+                deviceID: DeviceID(deviceUUID),
+                windowID: WindowID(windowUUID),
+                workspaceContextID: contextID
+            )
+            guard valid.key == expected else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            return valid
+        } catch let error as WorkspaceRepositoryError {
+            throw error
+        } catch {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+    }
+
+    private static func loadDeletion(
+        connection: isolated SQLiteConnection,
+        operationID: DeletionOperationID
+    ) throws -> ConversationDeletionOperation? {
+        let rows = try connection.query(
+            """
+            SELECT operation_id, conversation_id, project_id, environment_id, phase
+            FROM conversation_deletions WHERE operation_id = ?
+            """,
+            bindings: [.text(operationID.description)]
+        )
+        guard let row = rows.first else { return nil }
+        guard rows.count == 1,
+              Self.deletionOperationID(row[safe: 0]) == operationID,
+              let conversationID = Self.conversationID(row[safe: 1]),
+              let projectID = Self.projectID(row[safe: 2]),
+              let environmentID = Self.environmentID(row[safe: 3]),
+              let phaseText = row[safe: 4]?.text,
+              let phase = Self.deletionPhase(phaseText) else {
+            throw WorkspaceRepositoryError.invalidStoredValue
+        }
+        return ConversationDeletionOperation(
+            operationID: operationID,
+            conversationID: conversationID,
+            projectID: projectID,
+            environmentID: environmentID,
+            phase: phase
+        )
+    }
+
+    private static func storagePhase(_ phase: ConversationDeletionPhase) -> String {
+        switch phase {
+        case .deleting: "deleting"
+        case .terminatingSessions: "terminatingSessions"
+        case .purgingTerminalRecords: "purgingTerminalRecords"
+        case .removingClientState: "removingClientState"
+        case .deleted: "deleted"
+        }
+    }
+
+    private static func deletionPhase(_ text: String) -> ConversationDeletionPhase? {
+        switch text {
+        case "deleting": .deleting
+        case "terminatingSessions": .terminatingSessions
+        case "purgingTerminalRecords": .purgingTerminalRecords
+        case "removingClientState": .removingClientState
+        case "deleted": .deleted
+        default: nil
+        }
     }
 
     private static func documentMetadata(from row: [SQLiteColumn]) throws -> DocumentMetadata {

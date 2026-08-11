@@ -122,7 +122,7 @@ public final class HostXPCExport: NSObject, HostXPCProtocol, @unchecked Sendable
             do {
                 reply.complete(data: try await workspaceRouter.route(request), error: nil)
             } catch {
-                reply.complete(data: nil, error: error as NSError)
+                reply.complete(data: nil, error: workspaceError(code: 1))
             }
         }
     }
@@ -197,6 +197,10 @@ private final class XPCFileReply: @unchecked Sendable {
 
 private func ticketError(code: Int) -> NSError {
     NSError(domain: "dev.cockpit.host-data-plane-ticket", code: code, userInfo: [:])
+}
+
+private func workspaceError(code: Int) -> NSError {
+    NSError(domain: "dev.cockpit.host-workspace", code: code, userInfo: [:])
 }
 
 private func terminalError(code: Int) -> NSError {

@@ -242,6 +242,93 @@ public actor TerminalSupervisor {
         )
     }
 
+    public func beginContextDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        try await repository.beginContextDeletion(
+            contextID: contextID,
+            operationID: operationID
+        )
+    }
+
+    public func terminateSessions(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID,
+        force: Bool
+    ) async throws -> ContextTerminationResult {
+        try await requireDeletion(contextID: contextID, operationID: operationID)
+        let records = try await repository.records(contextID: contextID)
+        let active = records.filter { Self.activeStates.contains($0.lifecycleState) }
+        for record in active {
+            if record.lifecycleState == .preparing, record.workerID == nil {
+                try await repository.finish(
+                    sessionID: record.sessionID,
+                    state: .interrupted,
+                    exitStatus: nil,
+                    latestSequence: record.latestSequence,
+                    archiveManifest: record.archiveManifest
+                )
+                continue
+            }
+            guard let workerID = record.workerID else { continue }
+            let endpoint = try configuration.endpoint(
+                sessionID: record.sessionID,
+                workerID: workerID
+            )
+            try await controller.terminate(endpoint, force: force)
+        }
+        let remaining = try await repository.records(contextID: contextID)
+            .filter { Self.activeStates.contains($0.lifecycleState) }
+            .map(\.sessionID)
+            .sorted { $0.description < $1.description }
+        return remaining.isEmpty
+            ? .complete
+            : .forceConfirmationRequired(activeSessionIDs: remaining)
+    }
+
+    public func contextTerminationStatus(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws -> ContextTerminationResult {
+        try await requireDeletion(contextID: contextID, operationID: operationID)
+        let remaining = try await repository.records(contextID: contextID)
+            .filter { Self.activeStates.contains($0.lifecycleState) }
+            .map(\.sessionID)
+            .sorted { $0.description < $1.description }
+        return remaining.isEmpty
+            ? .complete
+            : .forceConfirmationRequired(activeSessionIDs: remaining)
+    }
+
+    public func purgeDeletedContext(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        try await requireDeletion(contextID: contextID, operationID: operationID)
+        let active = try await repository.records(contextID: contextID)
+            .contains { Self.activeStates.contains($0.lifecycleState) }
+        guard !active else { throw TerminalSessionRepositoryError.activeSessionsRemain }
+        try await repository.purgeDeletedContext(
+            contextID: contextID,
+            operationID: operationID
+        )
+    }
+
+    private func requireDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        guard let deletion = try await repository.contextDeletion(contextID: contextID),
+              deletion.operationID == operationID else {
+            throw TerminalSessionRepositoryError.deletionOperationMismatch
+        }
+    }
+
+    private static let activeStates: Set<TerminalLifecycleState> = [
+        .preparing, .committed, .running,
+    ]
+
     private func startRequest(
         endpoint: KeeperEndpoint,
         record: TerminalSessionRecord,

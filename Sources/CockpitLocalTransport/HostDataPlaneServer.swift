@@ -296,6 +296,7 @@ public final class HostDataPlaneServer: @unchecked Sendable {
             }
             let id = UUID()
             let connection = HostDataPlaneServerConnection(
+                connectionID: id,
                 descriptor: accepted,
                 systemCalls: systemCalls,
                 service: service,
@@ -313,12 +314,11 @@ public final class HostDataPlaneServer: @unchecked Sendable {
                 return
             }
             Task.detached { [self] in
-                defer {
-                    connection.closeAfterWorkerExit()
-                    self.lock.withLock { _ = self.connections.removeValue(forKey: id) }
-                    self.workers.leave()
-                }
                 await connection.run()
+                await self.service.removeDocumentViewers(connectionID: id)
+                connection.closeAfterWorkerExit()
+                self.lock.withLock { _ = self.connections.removeValue(forKey: id) }
+                self.workers.leave()
             }
         }
     }
@@ -364,6 +364,7 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
         var lastAcknowledged: UInt64 = 0
         var lastOutgoingAcknowledgement: UInt64 = 0
     }
+    private let connectionID: UUID
     private let descriptorOwner: HostDataPlaneDescriptorOwner
     private let calls: any UnixDomainSocketSystemCalls
     private let service: any HostDataPlaneServing
@@ -385,7 +386,8 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
     }
     private var acknowledgementWaiters: [String: AcknowledgementWaiter] = [:]
 
-    init(descriptor: Int32, systemCalls: any UnixDomainSocketSystemCalls, service: any HostDataPlaneServing, ticketStore: HostDataPlaneTicketStore, peerUID: uid_t) {
+    init(connectionID: UUID, descriptor: Int32, systemCalls: any UnixDomainSocketSystemCalls, service: any HostDataPlaneServing, ticketStore: HostDataPlaneTicketStore, peerUID: uid_t) {
+        self.connectionID = connectionID
         descriptorOwner = HostDataPlaneDescriptorOwner(descriptor, calls: systemCalls)
         calls = systemCalls; self.service = service; self.ticketStore = ticketStore; self.peerUID = peerUID
     }
@@ -634,7 +636,12 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
             let binding = try validate(envelope.binding)
             var response = CPDocumentEnvelope(); response.requestID = envelope.requestID; response.binding = envelope.binding
             switch envelope.payload {
-            case let .openRequest(value): response.snapshotResult = try HostDataPlaneMessages.encode(try await service.openDocument(binding: binding, at: RelativePath(value.relativePath)))
+            case let .openRequest(value):
+                let snapshot = try await service.openDocument(
+                    binding: binding,
+                    at: RelativePath(value.relativePath)
+                )
+                response.snapshotResult = try HostDataPlaneMessages.encode(snapshot)
             case let .snapshotRequest(value): response.snapshotResult = try HostDataPlaneMessages.encode(try await service.snapshot(binding: binding, documentID: decodeID(value.documentID)))
             case let .acquireLeaseRequest(value): response.leaseResult = try HostDataPlaneMessages.encode(try await service.acquireEditLease(binding: binding, documentID: decodeID(value.documentID)))
             case let .transferLeaseRequest(value): response.leaseResult = try HostDataPlaneMessages.encode(try await service.transferEditLease(binding: binding, documentID: decodeID(value.documentID), from: decodeID(value.fromEditLeaseID), to: decodeID(value.targetClientInstanceID)))
@@ -642,6 +649,25 @@ private final class HostDataPlaneServerConnection: @unchecked Sendable {
             case let .flushRequest(value): var result = CPDocumentFlushResult(); result.documentVersion = try await service.flush(binding: binding, documentID: decodeID(value.documentID), through: value.throughClientSequence); response.flushResult = result
             case let .saveRequest(value): response.snapshotResult = try HostDataPlaneMessages.encode(try await service.save(binding: binding, documentID: decodeID(value.documentID), expectedFingerprint: HostDataPlaneMessages.decode(value.expectedFingerprint)))
             case let .discardRequest(value): response.snapshotResult = try HostDataPlaneMessages.encode(try await service.discard(binding: binding, documentID: decodeID(value.documentID)))
+            case let .retainViewerRequest(value):
+                let documentID: DocumentID = try decodeID(value.documentID)
+                try await service.registerDocumentViewer(
+                    connectionID: connectionID,
+                    binding: binding,
+                    documentID: documentID
+                )
+                var result = CPDocumentViewerResult()
+                result.documentID = documentID.description
+                response.viewerResult = result
+            case let .releaseViewerRequest(value):
+                let documentID: DocumentID = try decodeID(value.documentID)
+                await service.removeDocumentViewer(
+                    connectionID: connectionID,
+                    documentID: documentID
+                )
+                var result = CPDocumentViewerResult()
+                result.documentID = documentID.description
+                response.viewerResult = result
             default: throw HostDataPlaneServerProtocolError(.malformedMessage)
             }
             try send(channel: .documentEdits, acknowledgement: incomingSequence, payload: response.serializedData())

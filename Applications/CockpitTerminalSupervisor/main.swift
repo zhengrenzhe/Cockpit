@@ -131,6 +131,30 @@ private actor TerminalSupervisorCommandService {
             try await reconcileAllSessions()
             try await start()
             return .empty
+        case let .beginContextDeletion(contextID, operationID):
+            try await beginContextDeletion(contextID: contextID, operationID: operationID)
+            return .empty
+        case let .terminateContextSessions(contextID, operationID, force):
+            return .contextTermination(
+                try await terminateContextSessions(
+                    contextID: contextID,
+                    operationID: operationID,
+                    force: force
+                )
+            )
+        case let .contextTerminationStatus(contextID, operationID):
+            return .contextTermination(
+                try await contextTerminationStatus(
+                    contextID: contextID,
+                    operationID: operationID
+                )
+            )
+        case let .purgeDeletedContext(contextID, operationID):
+            try await purgeDeletedContext(
+                contextID: contextID,
+                operationID: operationID
+            )
+            return .empty
         }
     }
 
@@ -633,6 +657,89 @@ private actor TerminalSupervisorCommandService {
             for sessionID in sessionIDs.reversed() { sessionOperations.release(sessionID) }
             throw error
         }
+    }
+
+    private func beginContextDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        try await supervisor.beginContextDeletion(
+            contextID: contextID,
+            operationID: operationID
+        )
+    }
+
+    private func terminateContextSessions(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID,
+        force: Bool
+    ) async throws -> ContextTerminationResult {
+        let sessionIDs = try await repository.records(contextID: contextID)
+            .map(\.sessionID)
+            .sorted { $0.description < $1.description }
+        for sessionID in sessionIDs { await sessionOperations.acquire(sessionID) }
+        defer {
+            for sessionID in sessionIDs.reversed() {
+                sessionOperations.release(sessionID)
+            }
+        }
+        return try await supervisor.terminateSessions(
+            contextID: contextID,
+            operationID: operationID,
+            force: force
+        )
+    }
+
+    private func purgeDeletedContext(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        let records = try await repository.records(contextID: contextID)
+            .sorted { $0.sessionID.description < $1.sessionID.description }
+        for record in records { await sessionOperations.acquire(record.sessionID) }
+        do {
+            let activeStates: Set<TerminalLifecycleState> = [
+                .preparing, .committed, .running,
+            ]
+            guard !records.contains(where: { activeStates.contains($0.lifecycleState) }) else {
+                throw TerminalSessionRepositoryError.activeSessionsRemain
+            }
+            for record in records {
+                try archiveStore.deleteArchive(sessionID: record.sessionID)
+            }
+            try await supervisor.purgeDeletedContext(
+                contextID: contextID,
+                operationID: operationID
+            )
+            for record in records { retireSessionState(record.sessionID) }
+            for record in records.reversed() {
+                sessionOperations.release(record.sessionID)
+            }
+        } catch {
+            for record in records.reversed() {
+                sessionOperations.release(record.sessionID)
+            }
+            throw error
+        }
+    }
+
+    private func contextTerminationStatus(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws -> ContextTerminationResult {
+        let sessionIDs = try await repository.records(contextID: contextID)
+            .map(\.sessionID)
+            .sorted { $0.description < $1.description }
+        for sessionID in sessionIDs { await sessionOperations.acquire(sessionID) }
+        defer {
+            for sessionID in sessionIDs.reversed() {
+                sessionOperations.release(sessionID)
+            }
+        }
+        return try await supervisor.contextTerminationStatus(
+            contextID: contextID,
+            operationID: operationID
+        )
     }
 
     private func retireSessionState(

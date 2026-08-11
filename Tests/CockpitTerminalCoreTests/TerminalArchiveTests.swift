@@ -213,6 +213,43 @@ struct TerminalArchiveTests {
         )
         #expect(try fixture.store.openFinalSnapshot(record: finalized).readAll() == snapshot)
     }
+
+    @Test func terminalArchiveDeletionIsTargetedAndIdempotent() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.cleanup() }
+        let deletedSessionID = TerminalSessionID()
+        let retainedSessionID = TerminalSessionID()
+        for sessionID in [deletedSessionID, retainedSessionID] {
+            _ = try fixture.store.publish(
+                sessionID: sessionID,
+                workerID: WorkerInstanceID(),
+                chunks: [
+                    try TerminalArchiveChunkData(
+                        firstOutputSequence: 1,
+                        lastOutputSequence: 1,
+                        data: Data("chunk-\(sessionID)".utf8)
+                    ),
+                ],
+                firstOutputSequence: 1,
+                latestOutputSequence: 1,
+                finalSnapshot: Data("snapshot-\(sessionID)".utf8),
+                exitStatus: .exited(0),
+                completedAt: Date(timeIntervalSince1970: 20_000)
+            )
+        }
+
+        try fixture.store.deleteArchive(sessionID: deletedSessionID)
+        try fixture.store.deleteArchive(sessionID: deletedSessionID)
+
+        #expect(try fixture.store.verifiedManifest(sessionID: deletedSessionID) == nil)
+        #expect(try fixture.store.verifiedManifest(sessionID: retainedSessionID) != nil)
+        #expect(!FileManager.default.fileExists(
+            atPath: fixture.archives.appendingPathComponent(deletedSessionID.description).path
+        ))
+        #expect(FileManager.default.fileExists(
+            atPath: fixture.archives.appendingPathComponent(retainedSessionID.description).path
+        ))
+    }
 }
 
 private func terminalArchiveRecord(

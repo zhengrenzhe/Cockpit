@@ -1120,6 +1120,30 @@ import CockpitTypes
     ])
 }
 
+@Test func hostDataPlaneConnectionRetainsAndReleasesExactViewerWithDisconnectFallback() async throws {
+    let stack = try await HostDataPlaneTestStack.make(prefix: "viewer-lifecycle")
+    defer { Task { await stack.shutdown() } }
+    try await stack.client.connect()
+    _ = try await stack.client.openDocument(
+        in: stack.fixture.binding.environmentID,
+        at: RelativePath("file.txt")
+    )
+    #expect(stack.fixture.service.viewerRegistrationCount == 0)
+    try await stack.client.retainViewer(documentID: stack.fixture.documentID)
+    try await eventually { stack.fixture.service.viewerRegistrationCount == 1 }
+
+    await stack.client.releaseViewer(documentID: stack.fixture.documentID)
+    try await eventually { stack.fixture.service.viewerRemovalCount == 1 }
+    #expect(stack.fixture.service.liveViewerConnectionCount == 0)
+
+    try await stack.client.retainViewer(documentID: stack.fixture.documentID)
+    try await eventually { stack.fixture.service.viewerRegistrationCount == 2 }
+
+    await stack.client.disconnect()
+    try await eventually { stack.fixture.service.viewerRemovalCount == 2 }
+    #expect(stack.fixture.service.liveViewerConnectionCount == 0)
+}
+
 @Test func hostDataPlaneClientSingleReadPumpDispatchesReorderedConcurrentUnaryReplies() async throws {
     let fixture = try HostDataPlaneFixture()
     let harness = try await ScriptedHostDataPlaneClientHarness.make(fixture: fixture)
@@ -3046,6 +3070,9 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
     private var cancelledSubscriptions = 0
     private var directories: [WorkspaceDirectory] = []
     private var afterRevisions: [UInt64] = []
+    private var viewerConnections: Set<UUID> = []
+    private var viewerRegistrations = 0
+    private var viewerRemovals = 0
 
     init(
         snapshot: DocumentSnapshot,
@@ -3067,6 +3094,9 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
     var activeTreeSubscriptions: Int { lock.withLock { treeContinuations.count } }
     var childrenDirectories: [WorkspaceDirectory] { lock.withLock { directories } }
     var treeAfterRevisions: [UInt64] { lock.withLock { afterRevisions } }
+    var viewerRegistrationCount: Int { lock.withLock { viewerRegistrations } }
+    var viewerRemovalCount: Int { lock.withLock { viewerRemovals } }
+    var liveViewerConnectionCount: Int { lock.withLock { viewerConnections.count } }
     var nextError: (any Error)? {
         get { lock.withLock { pendingError } }
         set { lock.withLock { pendingError = newValue } }
@@ -3074,6 +3104,26 @@ private final class RecordingHostDataPlaneService: HostDataPlaneServing, @unchec
 
     func openDocument(binding: HostDataPlaneBinding, at path: RelativePath) async throws -> DocumentSnapshot {
         try take("open"); return snapshotValue
+    }
+    func registerDocumentViewer(
+        connectionID: UUID,
+        binding: HostDataPlaneBinding,
+        documentID: DocumentID
+    ) async throws {
+        lock.withLock {
+            viewerConnections.insert(connectionID)
+            viewerRegistrations += 1
+        }
+    }
+    func removeDocumentViewers(connectionID: UUID) async {
+        lock.withLock {
+            if viewerConnections.remove(connectionID) != nil { viewerRemovals += 1 }
+        }
+    }
+    func removeDocumentViewer(connectionID: UUID, documentID: DocumentID) async {
+        lock.withLock {
+            if viewerConnections.remove(connectionID) != nil { viewerRemovals += 1 }
+        }
     }
     func snapshot(binding: HostDataPlaneBinding, documentID: DocumentID) async throws -> DocumentSnapshot {
         try take("snapshot"); return snapshotValue

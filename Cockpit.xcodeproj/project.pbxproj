@@ -26,6 +26,7 @@
 		00F2CE09C916763801CA9F85 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 521FA9CA3D31F33E20B0CC22 /* main.swift */; };
 		072B27985D56CF0B48E847DE /* MonacoRuntime.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */; };
 		07FECF87EDC303623C2C031A /* TerminalTabViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */; };
+		147E86D04E3990D13FB285BF /* ConversationDeletionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0C98BDF4F40288231C6311 /* ConversationDeletionController.swift */; };
 		17E1FAF124AB3699D39183E8 /* FileTreeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72199350E653181BD3EB3C4 /* FileTreeViewController.swift */; };
 		212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
 		22EA011AF83B130CF389F9D3 /* ConversationCommandController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */; };
@@ -47,6 +48,7 @@
 		69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3A65312477EAD5232A52B0 /* main.swift */; };
 		6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */ = {isa = PBXBuildFile; productRef = 805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */; };
 		717C660DB30DD27E152966D1 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A9306517642B4E50E65EE7C /* Metal.framework */; };
+		72E5AA0CAC1FCF86D0811CB6 /* ConversationDeletionControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C896509ED3B6739751194E83 /* ConversationDeletionControllerTests.swift */; };
 		739F84561841F69B335B8581 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		75C6C1CD346F5630A004DC72 /* WorkspaceViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66551CF10D010C7EAD2F7ECF /* WorkspaceViewModel.swift */; };
 		7F13BCE3D62D913A6C051792 /* ContentHostController.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFD547040C5A1D676AFBC840 /* ContentHostController.swift */; };
@@ -127,6 +129,7 @@
 		03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridgeTests.swift; sourceTree = "<group>"; };
 		1183768045AE445F258A4859 /* TabCommandControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabCommandControllerTests.swift; sourceTree = "<group>"; };
 		1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTabViewController.swift; sourceTree = "<group>"; };
+		1F0C98BDF4F40288231C6311 /* ConversationDeletionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationDeletionController.swift; sourceTree = "<group>"; };
 		23AAD691375B8C8DC385B733 /* GhosttyTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalView.swift; sourceTree = "<group>"; };
 		263DA7B80F345C7A4A093699 /* MonacoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridge.swift; sourceTree = "<group>"; };
 		2BF59ED429382282C6713FC1 /* WorkspaceHierarchyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceHierarchyTests.swift; sourceTree = "<group>"; };
@@ -163,6 +166,7 @@
 		C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceStatusViewModel.swift; sourceTree = "<group>"; };
 		C4FA2BE19C1AAE871BA1097F /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		C5C87AF4E75B23201A214E82 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		C896509ED3B6739751194E83 /* ConversationDeletionControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationDeletionControllerTests.swift; sourceTree = "<group>"; };
 		C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationCommandController.swift; sourceTree = "<group>"; };
 		CA5E864EDF8F667F282B715A /* WorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceWindowController.swift; sourceTree = "<group>"; };
 		CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabCommandController.swift; sourceTree = "<group>"; };
@@ -245,6 +249,7 @@
 				A0BFB39C38A17E2083706555 /* AppDelegate.swift */,
 				DFD547040C5A1D676AFBC840 /* ContentHostController.swift */,
 				C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */,
+				1F0C98BDF4F40288231C6311 /* ConversationDeletionController.swift */,
 				B72199350E653181BD3EB3C4 /* FileTreeViewController.swift */,
 				38288D3FCC85DFAAB98E11CB /* NewTabPickerController.swift */,
 				4DFCC4C543B9F5B3D87D2E1F /* ProjectCommandController.swift */,
@@ -363,6 +368,7 @@
 			children = (
 				6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */,
 				345DA9F403FADE69A83C8512 /* ConversationCommandControllerTests.swift */,
+				C896509ED3B6739751194E83 /* ConversationDeletionControllerTests.swift */,
 				B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */,
 				03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */,
 				587C19468BF073BA4E77E04F /* ProjectCommandControllerTests.swift */,
@@ -636,6 +642,7 @@
 				995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */,
 				7F13BCE3D62D913A6C051792 /* ContentHostController.swift in Sources */,
 				22EA011AF83B130CF389F9D3 /* ConversationCommandController.swift in Sources */,
+				147E86D04E3990D13FB285BF /* ConversationDeletionController.swift in Sources */,
 				17E1FAF124AB3699D39183E8 /* FileTreeViewController.swift in Sources */,
 				FA281D4C5CEED0F7CDA552A8 /* GhosttyTerminalView.swift in Sources */,
 				BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */,
@@ -678,6 +685,7 @@
 			files = (
 				67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */,
 				68E85917A1DEAC817192DAF1 /* ConversationCommandControllerTests.swift in Sources */,
+				72E5AA0CAC1FCF86D0811CB6 /* ConversationDeletionControllerTests.swift in Sources */,
 				38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */,
 				D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */,
 				463C67C9A8A5E45E198415C1 /* ProjectCommandControllerTests.swift in Sources */,

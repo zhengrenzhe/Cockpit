@@ -3,7 +3,11 @@ import CockpitHostCore
 import CockpitProtocol
 import CockpitTypes
 
-public actor HostXPCClient: WorkspaceServing, ClientWorkspaceStateServing {
+public actor HostXPCClient:
+    WorkspaceServing,
+    ClientWorkspaceStateServing,
+    ConversationDeletionServing
+{
     private struct ActiveConnection: Sendable {
         let value: any XPCConnectionBoundary
         let generation: UInt64
@@ -111,6 +115,46 @@ public actor HostXPCClient: WorkspaceServing, ClientWorkspaceStateServing {
         guard case .empty = try await send(.saveClientState(state)) else {
             throw CocoaError(.coderInvalidValue)
         }
+    }
+
+    public func deletionImpact(
+        conversationID: ConversationID
+    ) async throws -> ConversationDeletionImpact {
+        guard case let .conversationDeletionImpact(value) = try await send(
+            .deletionImpact(conversationID: conversationID)
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return value
+    }
+
+    public func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        preparationID: UUID
+    ) async throws -> ConversationDeletionProgress {
+        guard case let .conversationDeletionProgress(value) = try await send(
+            .beginConversationDeletion(
+                conversationID: conversationID,
+                operationID: operationID,
+                preparationID: preparationID
+            )
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return value
+    }
+
+    public func resumeConversationDeletion(
+        operationID: DeletionOperationID,
+        force: Bool
+    ) async throws -> ConversationDeletionProgress {
+        guard case let .conversationDeletionProgress(value) = try await send(
+            .resumeConversationDeletion(operationID: operationID, force: force)
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return value
     }
 
     public func issueHostDataPlaneTicket(

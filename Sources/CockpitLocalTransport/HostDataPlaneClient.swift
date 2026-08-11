@@ -270,6 +270,10 @@ public actor HostDataPlaneClient: DocumentDataTransport, FileTreeDataTransport {
         await current?.shutdown()
     }
 
+    public func closeDocument(documentID: DocumentID) async {
+        await disconnect()
+    }
+
     public nonisolated func documentDiagnostics() -> AsyncStream<DocumentDataPlaneDiagnostic> { diagnostics.stream() }
 
     public func openDocument(in environmentID: EnvironmentID, at path: RelativePath) async throws -> DocumentSnapshot {
@@ -352,6 +356,38 @@ public actor HostDataPlaneClient: DocumentDataTransport, FileTreeDataTransport {
             expectation: .snapshot(documentID),
             expecting: snapshotResult
         )
+    }
+
+    public func retainViewer(documentID: DocumentID) async throws {
+        var request = CPDocumentViewerRetainRequest()
+        request.documentID = documentID.description
+        _ = try await document(
+            .retainViewerRequest(request),
+            expectation: .viewer(documentID)
+        ) { payload in
+            guard case let .viewerResult(value) = payload else {
+                throw DocumentProtocolError.invalidValue
+            }
+            return value.documentID
+        }
+    }
+
+    public func releaseViewer(documentID: DocumentID) async {
+        do {
+            var request = CPDocumentViewerReleaseRequest()
+            request.documentID = documentID.description
+            _ = try await document(
+                .releaseViewerRequest(request),
+                expectation: .viewer(documentID)
+            ) { payload in
+                guard case let .viewerResult(value) = payload else {
+                    throw DocumentProtocolError.invalidValue
+                }
+                return value.documentID
+            }
+        } catch {
+            await disconnect()
+        }
     }
 
     public func children(at directory: WorkspaceDirectory) async throws -> FileTreeSnapshot {
@@ -586,6 +622,7 @@ private enum HostDataPlaneDocumentExpectation {
     case lease(documentID: DocumentID, client: ClientInstanceID)
     case acknowledgement(documentID: DocumentID, clientSequence: UInt64)
     case flush
+    case viewer(DocumentID)
 
     func validate(_ payload: CPDocumentEnvelope.OneOf_Payload) throws {
         switch self {
@@ -617,6 +654,11 @@ private enum HostDataPlaneDocumentExpectation {
             }
         case .flush:
             guard case .flushResult = payload else { throw HostDataPlaneResponseValidationError() }
+        case let .viewer(documentID):
+            guard case let .viewerResult(value) = payload,
+                  value.documentID == documentID.description else {
+                throw HostDataPlaneResponseValidationError()
+            }
         }
     }
 

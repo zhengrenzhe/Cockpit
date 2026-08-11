@@ -1,9 +1,11 @@
+import Foundation
 import CockpitProtocol
 import CockpitTypes
 
 public enum HostDataPlaneServiceError: Error, Hashable, Sendable {
     case contextMismatch
     case environmentMismatch
+    case contextUnavailable
     case documentNotOpen
 }
 
@@ -56,4 +58,29 @@ public protocol HostDataPlaneServing: Sendable {
         binding: HostDataPlaneBinding,
         after revision: UInt64
     ) -> AsyncThrowingStream<FileTreeDelta, Error>
+    func registerDocumentViewer(
+        connectionID: UUID,
+        binding: HostDataPlaneBinding,
+        documentID: DocumentID
+    ) async throws
+    func removeDocumentViewer(
+        connectionID: UUID,
+        documentID: DocumentID
+    ) async
+    func removeDocumentViewers(connectionID: UUID) async
+}
+
+public extension HostDataPlaneServing {
+    func registerDocumentViewer(
+        connectionID: UUID,
+        binding: HostDataPlaneBinding,
+        documentID: DocumentID
+    ) async throws {}
+
+    func removeDocumentViewer(
+        connectionID: UUID,
+        documentID: DocumentID
+    ) async {}
+
+    func removeDocumentViewers(connectionID: UUID) async {}
 }

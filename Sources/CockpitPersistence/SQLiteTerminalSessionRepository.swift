@@ -82,6 +82,23 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository, AgentEx
                 return try Self.decodeRecord(row)
             }
 
+            let deletionRows = try connection.query(
+                """
+                SELECT state FROM terminal_context_deletions
+                WHERE context_kind = ? AND context_id = ?
+                """,
+                bindings: [.text(context.kind), .text(context.id)]
+            )
+            if !deletionRows.isEmpty {
+                guard deletionRows.count == 1,
+                      deletionRows[0].count == 1,
+                      let state = Self.text(deletionRows[0][0]),
+                      TerminalContextDeletionState(rawValue: state) != nil else {
+                    throw TerminalSessionRepositoryError.corruptRecord
+                }
+                throw TerminalSessionRepositoryError.contextDeleting
+            }
+
             try connection.execute(
                 """
                 INSERT INTO terminal_sessions (
@@ -305,6 +322,129 @@ public actor SQLiteTerminalSessionRepository: TerminalSessionRepository, AgentEx
                 """
             )
             return count
+        }
+    }
+
+    public func beginContextDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        let context = Self.contextParts(contextID)
+        try await connection.withImmediateTransaction { connection in
+            let contextRows = try connection.query(
+                """
+                SELECT operation_id, state FROM terminal_context_deletions
+                WHERE context_kind = ? AND context_id = ?
+                """,
+                bindings: [.text(context.kind), .text(context.id)]
+            )
+            if let row = contextRows.first {
+                guard contextRows.count == 1,
+                      row.count == 2,
+                      Self.text(row[0]) == operationID.description else {
+                    throw TerminalSessionRepositoryError.deletionOperationMismatch
+                }
+                return
+            }
+            let operationRows = try connection.query(
+                "SELECT 1 FROM terminal_context_deletions WHERE operation_id = ?",
+                bindings: [.text(operationID.description)]
+            )
+            guard operationRows.isEmpty else {
+                throw TerminalSessionRepositoryError.deletionOperationMismatch
+            }
+            try connection.execute(
+                """
+                INSERT INTO terminal_context_deletions (
+                    context_kind, context_id, operation_id, state
+                ) VALUES (?, ?, ?, ?)
+                """,
+                bindings: [
+                    .text(context.kind),
+                    .text(context.id),
+                    .text(operationID.description),
+                    .text(TerminalContextDeletionState.deleting.rawValue),
+                ]
+            )
+        }
+    }
+
+    public func contextDeletion(
+        contextID: WorkspaceContextID
+    ) async throws -> TerminalContextDeletion? {
+        let context = Self.contextParts(contextID)
+        let rows = try await connection.query(
+            """
+            SELECT operation_id, state FROM terminal_context_deletions
+            WHERE context_kind = ? AND context_id = ?
+            """,
+            bindings: [.text(context.kind), .text(context.id)]
+        )
+        guard let row = rows.first else { return nil }
+        guard rows.count == 1,
+              row.count == 2,
+              let operationText = Self.text(row[0]),
+              let operationUUID = UUID(uuidString: operationText),
+              DeletionOperationID(operationUUID).description == operationText,
+              let stateText = Self.text(row[1]),
+              let state = TerminalContextDeletionState(rawValue: stateText) else {
+            throw TerminalSessionRepositoryError.corruptRecord
+        }
+        return TerminalContextDeletion(
+            contextID: contextID,
+            operationID: DeletionOperationID(operationUUID),
+            state: state
+        )
+    }
+
+    public func purgeDeletedContext(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        let context = Self.contextParts(contextID)
+        try await connection.withImmediateTransaction { connection in
+            let rows = try connection.query(
+                """
+                SELECT operation_id, state FROM terminal_context_deletions
+                WHERE context_kind = ? AND context_id = ?
+                """,
+                bindings: [.text(context.kind), .text(context.id)]
+            )
+            guard rows.count == 1,
+                  rows[0].count == 2,
+                  Self.text(rows[0][0]) == operationID.description,
+                  let stateText = Self.text(rows[0][1]),
+                  TerminalContextDeletionState(rawValue: stateText) != nil else {
+                throw TerminalSessionRepositoryError.deletionOperationMismatch
+            }
+            let activeRows = try connection.query(
+                """
+                SELECT 1 FROM terminal_sessions
+                WHERE context_kind = ? AND context_id = ?
+                  AND lifecycle_state IN ('preparing', 'committed', 'running')
+                LIMIT 1
+                """,
+                bindings: [.text(context.kind), .text(context.id)]
+            )
+            guard activeRows.isEmpty else {
+                throw TerminalSessionRepositoryError.activeSessionsRemain
+            }
+            try connection.execute(
+                "DELETE FROM terminal_sessions WHERE context_kind = ? AND context_id = ?",
+                bindings: [.text(context.kind), .text(context.id)]
+            )
+            try connection.execute(
+                """
+                UPDATE terminal_context_deletions SET state = ?
+                WHERE context_kind = ? AND context_id = ? AND operation_id = ?
+                """,
+                bindings: [
+                    .text(TerminalContextDeletionState.purged.rawValue),
+                    .text(context.kind),
+                    .text(context.id),
+                    .text(operationID.description),
+                ]
+            )
         }
     }
 

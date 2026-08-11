@@ -10,6 +10,16 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
     case performFileOperation(context: RequestContext, operation: FileOperation)
     case loadClientState(ClientWorkspaceStateKey)
     case saveClientState(ClientWorkspaceState)
+    case deletionImpact(conversationID: ConversationID)
+    case beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        preparationID: UUID
+    )
+    case resumeConversationDeletion(
+        operationID: DeletionOperationID,
+        force: Bool
+    )
 
     private enum Command: String, Codable {
         case addProject
@@ -20,6 +30,9 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case performFileOperation
         case loadClientState
         case saveClientState
+        case deletionImpact
+        case beginConversationDeletion
+        case resumeConversationDeletion
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -34,6 +47,9 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case fileOperation
         case clientStateKey
         case clientState
+        case operationID
+        case preparationID
+        case force
     }
 
     public init(from decoder: Decoder) throws {
@@ -98,6 +114,42 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
             self = .saveClientState(
                 try container.decode(ClientWorkspaceState.self, forKey: .clientState).validated()
             )
+        case .deletionImpact:
+            try requireExactKeys(decoder, required: ["command", "conversationID"])
+            self = .deletionImpact(
+                conversationID: try container.decode(
+                    ConversationID.self,
+                    forKey: .conversationID
+                )
+            )
+        case .beginConversationDeletion:
+            try requireExactKeys(
+                decoder,
+                required: ["command", "conversationID", "operationID", "preparationID"]
+            )
+            self = .beginConversationDeletion(
+                conversationID: try container.decode(
+                    ConversationID.self,
+                    forKey: .conversationID
+                ),
+                operationID: try container.decode(
+                    DeletionOperationID.self,
+                    forKey: .operationID
+                ),
+                preparationID: try container.decode(UUID.self, forKey: .preparationID)
+            )
+        case .resumeConversationDeletion:
+            try requireExactKeys(
+                decoder,
+                required: ["command", "operationID", "force"]
+            )
+            self = .resumeConversationDeletion(
+                operationID: try container.decode(
+                    DeletionOperationID.self,
+                    forKey: .operationID
+                ),
+                force: try container.decode(Bool.self, forKey: .force)
+            )
         }
     }
 
@@ -130,6 +182,18 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case let .saveClientState(state):
             try container.encode(Command.saveClientState, forKey: .command)
             try container.encode(try state.validated(), forKey: .clientState)
+        case let .deletionImpact(conversationID):
+            try container.encode(Command.deletionImpact, forKey: .command)
+            try container.encode(conversationID, forKey: .conversationID)
+        case let .beginConversationDeletion(conversationID, operationID, preparationID):
+            try container.encode(Command.beginConversationDeletion, forKey: .command)
+            try container.encode(conversationID, forKey: .conversationID)
+            try container.encode(operationID, forKey: .operationID)
+            try container.encode(preparationID, forKey: .preparationID)
+        case let .resumeConversationDeletion(operationID, force):
+            try container.encode(Command.resumeConversationDeletion, forKey: .command)
+            try container.encode(operationID, forKey: .operationID)
+            try container.encode(force, forKey: .force)
         }
     }
 
@@ -155,6 +219,8 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
     case resolvedContext(ResolvedWorkspaceContext)
     case fileOperationResult(FileOperationResult)
     case clientWorkspaceState(ClientWorkspaceState?)
+    case conversationDeletionImpact(ConversationDeletionImpact)
+    case conversationDeletionProgress(ConversationDeletionProgress)
 
     private enum Result: String, Codable {
         case projectSnapshot
@@ -164,6 +230,8 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case resolvedContext
         case fileOperationResult
         case clientWorkspaceState
+        case conversationDeletionImpact
+        case conversationDeletionProgress
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -174,6 +242,8 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case resolvedContext
         case fileOperationResult
         case clientWorkspaceState
+        case conversationDeletionImpact
+        case conversationDeletionProgress
     }
 
     public init(from decoder: Decoder) throws {
@@ -222,6 +292,28 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
                     forKey: .clientWorkspaceState
                 )?.validated()
             )
+        case .conversationDeletionImpact:
+            try requireExactKeys(
+                decoder,
+                required: ["result", "conversationDeletionImpact"]
+            )
+            self = .conversationDeletionImpact(
+                try container.decode(
+                    ConversationDeletionImpact.self,
+                    forKey: .conversationDeletionImpact
+                )
+            )
+        case .conversationDeletionProgress:
+            try requireExactKeys(
+                decoder,
+                required: ["result", "conversationDeletionProgress"]
+            )
+            self = .conversationDeletionProgress(
+                try container.decode(
+                    ConversationDeletionProgress.self,
+                    forKey: .conversationDeletionProgress
+                )
+            )
         }
     }
 
@@ -252,6 +344,12 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
             } else {
                 try container.encodeNil(forKey: .clientWorkspaceState)
             }
+        case let .conversationDeletionImpact(impact):
+            try container.encode(Result.conversationDeletionImpact, forKey: .result)
+            try container.encode(impact, forKey: .conversationDeletionImpact)
+        case let .conversationDeletionProgress(progress):
+            try container.encode(Result.conversationDeletionProgress, forKey: .result)
+            try container.encode(progress, forKey: .conversationDeletionProgress)
         }
     }
 
@@ -272,14 +370,18 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
 public struct WorkspaceCommandRouter: Sendable {
     private let service: any WorkspaceServing
     private let clientStateService: (any ClientWorkspaceStateServing)?
+    private let deletionService: (any ConversationDeletionServing)?
 
     public init(
         service: any WorkspaceServing,
-        clientStateService: (any ClientWorkspaceStateServing)? = nil
+        clientStateService: (any ClientWorkspaceStateServing)? = nil,
+        deletionService: (any ConversationDeletionServing)? = nil
     ) {
         self.service = service
         self.clientStateService = clientStateService
             ?? (service as? any ClientWorkspaceStateServing)
+        self.deletionService = deletionService
+            ?? (service as? any ConversationDeletionServing)
     }
 
     public func route(_ data: Data) async throws -> Data {
@@ -314,6 +416,28 @@ public struct WorkspaceCommandRouter: Sendable {
             guard let clientStateService else { throw CocoaError(.coderInvalidValue) }
             try await clientStateService.saveClientState(state)
             response = .empty
+        case let .deletionImpact(conversationID):
+            guard let deletionService else { throw CocoaError(.coderInvalidValue) }
+            response = .conversationDeletionImpact(
+                try await deletionService.deletionImpact(conversationID: conversationID)
+            )
+        case let .beginConversationDeletion(conversationID, operationID, preparationID):
+            guard let deletionService else { throw CocoaError(.coderInvalidValue) }
+            response = .conversationDeletionProgress(
+                try await deletionService.beginConversationDeletion(
+                    conversationID: conversationID,
+                    operationID: operationID,
+                    preparationID: preparationID
+                )
+            )
+        case let .resumeConversationDeletion(operationID, force):
+            guard let deletionService else { throw CocoaError(.coderInvalidValue) }
+            response = .conversationDeletionProgress(
+                try await deletionService.resumeConversationDeletion(
+                    operationID: operationID,
+                    force: force
+                )
+            )
         }
         return try JSONEncoder().encode(response)
     }
@@ -840,7 +964,7 @@ private func decodedKeySet(_ decoder: Decoder) throws -> Set<String> {
     )
 }
 
-private func requireExactKeys(
+func requireExactKeys(
     _ decoder: Decoder,
     required: Set<String>,
     optional: Set<String> = []

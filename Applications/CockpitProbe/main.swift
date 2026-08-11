@@ -60,6 +60,14 @@ enum CockpitProbe {
                 claudeExecutablePath: values[3],
                 agentOutputDirectory: values[4]
             )
+        case "conversation-deletion":
+            let values = Array(CommandLine.arguments.dropFirst(2))
+            guard values.count == 3 else { throw ProbeError.invalidCommand }
+            try await conversationDeletion(
+                runtimeDirectory: values[0],
+                projectRoot: values[1],
+                agentExecutablePath: values[2]
+            )
         default:
             throw ProbeError.invalidCommand
         }
@@ -333,18 +341,200 @@ enum CockpitProbe {
         ].joined(separator: "\t"))
     }
 
+    private static func conversationDeletion(
+        runtimeDirectory: String,
+        projectRoot: String,
+        agentExecutablePath: String
+    ) async throws {
+        let host = HostXPCClient()
+        guard try await host.listWorkspace().isEmpty else {
+            throw ProbeError.terminalFailure("workspace fixture is not empty")
+        }
+        let bookmark = try URL(
+            fileURLWithPath: projectRoot,
+            isDirectory: true
+        ).bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        let project = try await host.addProject(
+            bookmark: bookmark,
+            displayName: "Task 19 Project"
+        )
+        let deletedConversation = try await host.createDirectConversation(
+            projectID: project.projectID
+        )
+        let retainedConversation = try await host.createDirectConversation(
+            projectID: project.projectID
+        )
+        let deletedContext = try await host.resolveContext(
+            .conversation(deletedConversation.id)
+        )
+        let retainedContext = try await host.resolveContext(
+            .conversation(retainedConversation.id)
+        )
+        let agentBookmark = try executableBookmark(path: agentExecutablePath)
+        let targetAgentOutput = URL(
+            fileURLWithPath: projectRoot,
+            isDirectory: true
+        ).appendingPathComponent("deletion-target-agent.log").path
+        let retainedAgentOutput = URL(
+            fileURLWithPath: projectRoot,
+            isDirectory: true
+        ).appendingPathComponent("deletion-retained-agent.log").path
+        let deletedTerminals = HostTerminalControlTransport(
+            client: host,
+            contextID: deletedContext.contextID,
+            environmentID: deletedContext.environmentID,
+            runtimeDirectory: runtimeDirectory
+        )
+        let retainedTerminals = HostTerminalControlTransport(
+            client: host,
+            contextID: retainedContext.contextID,
+            environmentID: retainedContext.environmentID,
+            runtimeDirectory: runtimeDirectory
+        )
+        let deletedSession = try await createWorkflowTerminal(
+            transport: deletedTerminals,
+            context: deletedContext,
+            kind: .agent(.codex),
+            executableBookmark: agentBookmark,
+            agentOutputPath: nil,
+            arguments: [targetAgentOutput, "--wait-with-child"]
+        )
+        try await waitForWorkflowAgentMarker(
+            path: targetAgentOutput,
+            prefix: "child="
+        )
+        let retainedSession = try await createWorkflowTerminal(
+            transport: retainedTerminals,
+            context: retainedContext,
+            kind: .agent(.codex),
+            executableBookmark: agentBookmark,
+            agentOutputPath: nil,
+            arguments: [retainedAgentOutput]
+        )
+        _ = try await waitForWorkflowFinalSession(
+            retainedSession.sessionID,
+            transport: retainedTerminals
+        )
+
+        let deviceID = DeviceID()
+        let windowID = WindowID()
+        let projectState = try emptyClientState(
+            deviceID: deviceID,
+            windowID: windowID,
+            contextID: project.resolvedContext.contextID
+        )
+        let deletedState = try emptyClientState(
+            deviceID: deviceID,
+            windowID: windowID,
+            contextID: deletedContext.contextID
+        )
+        try await host.saveClientState(projectState)
+        try await host.saveClientState(deletedState)
+
+        let impact = try await host.deletionImpact(
+            conversationID: deletedConversation.id
+        )
+        guard impact.dirtyDocuments.isEmpty else {
+            throw ProbeError.terminalFailure("unexpected dirty deletion impact")
+        }
+        let operationID = DeletionOperationID()
+        guard let preparationID = impact.preparationID else {
+            throw ProbeError.terminalFailure("missing deletion preparation")
+        }
+        let firstProgress = try await host.beginConversationDeletion(
+            conversationID: deletedConversation.id,
+            operationID: operationID,
+            preparationID: preparationID
+        )
+        guard case let .forceConfirmationRequired(returnedOperation, activeSessions)
+            = firstProgress,
+            returnedOperation == operationID,
+            activeSessions == [deletedSession.sessionID]
+        else {
+            throw ProbeError.terminalFailure("normal termination did not require force")
+        }
+
+        let createBlocked: Bool
+        do {
+            _ = try await createWorkflowTerminal(
+                transport: deletedTerminals,
+                context: deletedContext,
+                kind: .agent(.codex),
+                executableBookmark: agentBookmark,
+                agentOutputPath: nil,
+                arguments: [
+                    URL(
+                        fileURLWithPath: projectRoot,
+                        isDirectory: true
+                    ).appendingPathComponent("deletion-blocked-agent.log").path,
+                ]
+            )
+            createBlocked = false
+        } catch {
+            createBlocked = true
+        }
+
+        let finalProgress = try await host.resumeConversationDeletion(
+            operationID: operationID,
+            force: true
+        )
+        guard finalProgress == .deleted(
+            projectContextID: project.resolvedContext.contextID
+        ) else {
+            throw ProbeError.terminalFailure("forced deletion did not complete")
+        }
+
+        let workspace = try await host.listWorkspace()
+        guard workspace.count == 1,
+              workspace[0].projectID == project.projectID,
+              workspace[0].resolvedContext.environmentID == project.resolvedContext.environmentID,
+              workspace[0].conversations.map(\.id) == [retainedConversation.id]
+        else {
+            throw ProbeError.terminalFailure("workspace deletion scope mismatch")
+        }
+        let supervisor = TerminalSupervisorControlTransport()
+        let deletedRecords = try await supervisor.list(contextID: deletedContext.contextID)
+        let retainedRecords = try await supervisor.list(contextID: retainedContext.contextID)
+        guard deletedRecords.isEmpty,
+              retainedRecords.map(\.sessionID) == [retainedSession.sessionID],
+              try await host.loadClientState(deletedState.key) == nil,
+              try await host.loadClientState(projectState.key) == projectState
+        else {
+            throw ProbeError.terminalFailure("durable deletion scope mismatch")
+        }
+
+        print([
+            project.projectID.description,
+            project.resolvedContext.environmentID.description,
+            deletedConversation.id.description,
+            retainedConversation.id.description,
+            deletedSession.sessionID.description,
+            retainedSession.sessionID.description,
+            operationID.description,
+            createBlocked ? "1" : "0",
+            String(workspace[0].conversations.count),
+            String(deletedRecords.count),
+            String(retainedRecords.count),
+        ].joined(separator: "\t"))
+    }
+
     private static func createWorkflowTerminal(
         transport: HostTerminalControlTransport,
         context: ResolvedWorkspaceContext,
         kind: TerminalKind,
         executableBookmark: Data?,
-        agentOutputPath: String?
+        agentOutputPath: String?,
+        arguments: [String]? = nil
     ) async throws -> ClientTerminalSession {
         let session = try await transport.create(TerminalCreateRequest(
             contextID: context.contextID,
             environmentID: context.environmentID,
             kind: kind,
-            arguments: agentOutputPath.map { [$0] } ?? [],
+            arguments: arguments ?? agentOutputPath.map { [$0] } ?? [],
             terminalSize: try TerminalResize(validatingColumns: 80, rows: 24),
             environmentOverrides: [:],
             idempotencyKey: RequestID(),
@@ -355,6 +545,27 @@ enum CockpitProbe {
               session.kind == kind
         else { throw ProbeError.terminalFailure("created terminal binding mismatch") }
         return session
+    }
+
+    private static func emptyClientState(
+        deviceID: DeviceID,
+        windowID: WindowID,
+        contextID: WorkspaceContextID
+    ) throws -> ClientWorkspaceState {
+        try ClientWorkspaceState(
+            validatingKey: ClientWorkspaceStateKey(
+                deviceID: deviceID,
+                windowID: windowID,
+                workspaceContextID: contextID
+            ),
+            tabs: [],
+            selectedTabID: nil,
+            sidebar: SidebarState(isCollapsed: false),
+            splitView: SplitViewState(
+                validatingLeadingPaneWidth: 240,
+                trailingPaneWidth: 300
+            )
+        )
     }
 
     private static func executableBookmark(path: String) throws -> Data {
@@ -386,6 +597,24 @@ enum CockpitProbe {
         }
         throw ProbeError.terminalFailure(
             "final session timeout: session=\(sessionID) lifecycle=\(String(describing: lastObserved?.lifecycleState)) exit=\(String(describing: lastObserved?.exitStatus))"
+        )
+    }
+
+    private static func waitForWorkflowAgentMarker(
+        path: String,
+        prefix: String
+    ) async throws {
+        for _ in 0..<200 {
+            if let contents = try? String(contentsOfFile: path, encoding: .utf8),
+               contents.split(separator: "\n").contains(where: {
+                   $0.hasPrefix(prefix)
+               }) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw ProbeError.terminalFailure(
+            "agent readiness timeout: path=\(path) prefix=\(prefix)"
         )
     }
 

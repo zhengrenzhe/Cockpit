@@ -527,6 +527,7 @@ import CockpitTypes
 @Test func terminalSupervisorCommandSurfaceRoundTripsEveryFrozenRequestType() throws {
     let session = TerminalSessionID()
     let context = WorkspaceContextID.project(ProjectID())
+    let operation = DeletionOperationID()
     let client = ClientInstanceID()
     let viewer = ViewerID()
     let lease = InputLeaseID()
@@ -570,12 +571,95 @@ import CockpitTypes
         ),
         .purgeFinishedRecords,
         .reconcile,
+        .beginContextDeletion(contextID: context, operationID: operation),
+        .terminateContextSessions(
+            contextID: context,
+            operationID: operation,
+            force: false
+        ),
+        .contextTerminationStatus(contextID: context, operationID: operation),
+        .purgeDeletedContext(contextID: context, operationID: operation),
     ]
 
     for request in requests {
         let data = try JSONEncoder().encode(request)
         #expect(try JSONDecoder().decode(TerminalSupervisorCommandRequest.self, from: data) == request)
     }
+}
+
+@Test func contextTerminalDeletionTransportUsesTypedSupervisorCommands() async throws {
+    let contextID = WorkspaceContextID.conversation(ConversationID())
+    let operationID = DeletionOperationID()
+    let activeSessionID = TerminalSessionID()
+    let recorder = TerminalSupervisorCommandRecorder()
+    let exported = TerminalSupervisorXPCExport(
+        handshakeHandler: { try TerminalSupervisorHandshakeHandler().handle($0) },
+        commandHandler: { command in
+            await recorder.append(command)
+            switch command {
+            case .beginContextDeletion:
+                return .empty
+            case let .terminateContextSessions(_, _, force):
+                if !force {
+                    return .contextTermination(
+                        .forceConfirmationRequired(activeSessionIDs: [activeSessionID])
+                    )
+                }
+                return .contextTermination(
+                    .forceConfirmationRequired(activeSessionIDs: [activeSessionID])
+                )
+            case .contextTerminationStatus:
+                return .contextTermination(.complete)
+            case .purgeDeletedContext:
+                return .empty
+            default:
+                throw CocoaError(.coderInvalidValue)
+            }
+        }
+    )
+    let connection = FakeTerminalSupervisorConnection(proxy: exported)
+    let client = TerminalSupervisorXPCClient(connectionFactory: { _ in connection })
+    let transport = ContextTerminalDeletionTransport(client: client)
+
+    try await transport.beginContextDeletion(
+        contextID: contextID,
+        operationID: operationID
+    )
+    #expect(
+        try await transport.terminateSessions(
+            contextID: contextID,
+            operationID: operationID,
+            force: false
+        ) == .forceConfirmationRequired(activeSessionIDs: [activeSessionID])
+    )
+    #expect(
+        try await transport.terminateSessions(
+            contextID: contextID,
+            operationID: operationID,
+            force: true
+        ) == .complete
+    )
+    try await transport.purgeDeletedContext(
+        contextID: contextID,
+        operationID: operationID
+    )
+
+    #expect(await recorder.values == [
+        .beginContextDeletion(contextID: contextID, operationID: operationID),
+        .terminateContextSessions(
+            contextID: contextID,
+            operationID: operationID,
+            force: false
+        ),
+        .terminateContextSessions(
+            contextID: contextID,
+            operationID: operationID,
+            force: true
+        ),
+        .contextTerminationStatus(contextID: contextID, operationID: operationID),
+        .purgeDeletedContext(contextID: contextID, operationID: operationID),
+    ])
+    await client.disconnect()
 }
 
 private func terminalRecord(
@@ -607,6 +691,21 @@ private final class FakeTerminalSupervisorConnection: XPCConnectionBoundary, @un
     func resume() { resumeCount += 1 }
     func invalidate() {}
     func remoteObjectProxy(errorHandler: @escaping @Sendable (any Error) -> Void) -> Any { proxy }
+}
+
+private actor TerminalSupervisorCommandRecorder {
+    private(set) var values: [TerminalSupervisorCommandRequest] = []
+
+    func append(_ value: TerminalSupervisorCommandRequest) {
+        values.append(value)
+    }
+
+    var forceTerminationCount: Int {
+        values.filter {
+            if case let .terminateContextSessions(_, _, force) = $0 { return force }
+            return false
+        }.count
+    }
 }
 
 private final class FakeTerminalIncomingConnection: IncomingXPCConnectionBoundary {
@@ -772,6 +871,10 @@ private actor TerminalIntegrationSupervisorService {
         case .reconcile:
             try await synchronize()
             return .empty
+        case .beginContextDeletion, .purgeDeletedContext:
+            return .empty
+        case .terminateContextSessions, .contextTerminationStatus:
+            return .contextTermination(.complete)
         }
     }
 

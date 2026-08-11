@@ -4,8 +4,11 @@ set -euo pipefail
 repo_root=${0:A:h:h:h}
 cache_root="$HOME/Library/Caches"
 fixture_root=$(/usr/bin/mktemp -d "$cache_root/cockpit-phase1-context-workflows.XXXXXX")
-codex_executable="$repo_root/Tests/Fixtures/Agents/codex"
-claude_executable="$repo_root/Tests/Fixtures/Agents/claude"
+codex_fixture="$repo_root/Tests/Fixtures/Agents/codex"
+claude_fixture="$repo_root/Tests/Fixtures/Agents/claude"
+agent_executable_directory="$fixture_root/agents"
+codex_executable="$agent_executable_directory/codex"
+claude_executable="$agent_executable_directory/claude"
 agent_output_directory="$fixture_root/agent-output"
 service_root=""
 
@@ -33,9 +36,14 @@ cleanup() {
 trap cleanup EXIT
 
 /bin/chmod 700 "$fixture_root"
-[[ -x "$codex_executable" && -x "$claude_executable" ]]
-/bin/mkdir "$agent_output_directory"
-/bin/chmod 700 "$agent_output_directory"
+[[ -x "$codex_fixture" && -x "$claude_fixture" ]]
+/bin/mkdir "$agent_executable_directory" "$agent_output_directory"
+/bin/chmod 700 "$agent_executable_directory" "$agent_output_directory"
+/bin/cp -X "$codex_fixture" "$codex_executable"
+/bin/cp -X "$claude_fixture" "$claude_executable"
+/bin/chmod 700 "$codex_executable" "$claude_executable"
+/usr/bin/cmp -s "$codex_fixture" "$codex_executable"
+/usr/bin/cmp -s "$claude_fixture" "$claude_executable"
 
 "$repo_root/Tools/phase0-services.zsh" start
 IFS= read -r service_root < "$repo_root/.build/phase0-launchagents/service-root.path"

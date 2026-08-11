@@ -14,6 +14,7 @@ struct SQLiteTerminalSessionRepositoryTests {
 
             #expect(try await inspection.tableNames() == [
                 "agent_executables",
+                "terminal_context_deletions",
                 "terminal_idempotency",
                 "terminal_schema_migrations",
                 "terminal_sessions",
@@ -22,16 +23,67 @@ struct SQLiteTerminalSessionRepositoryTests {
             #expect(
                 try await inspection.integerValue(
                     for: "SELECT COUNT(*) FROM terminal_schema_migrations"
-                ) == 2
+                ) == 3
             )
             #expect(
                 try await inspection.integerValue(
                     for: "SELECT MAX(version) FROM terminal_schema_migrations"
-                ) == 2
+                ) == 3
             )
 
             #expect(await inspection.close() == SQLITE_OK)
             #expect(await repository.close() == SQLITE_OK)
+        }
+    }
+
+    @Test func contextDeletionGatePersistsRejectsWrongOperationAndPurgedTombstoneBlocksCreate() async throws {
+        try await withTerminalDatabase { databaseURL in
+            let contextID = WorkspaceContextID.conversation(ConversationID(fixedUUID(0x72)))
+            let operationID = DeletionOperationID(fixedUUID(0x73))
+            let repository = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+
+            try await repository.beginContextDeletion(
+                contextID: contextID,
+                operationID: operationID
+            )
+            await #expect(throws: TerminalSessionRepositoryError.contextDeleting) {
+                _ = try await repository.insertPreparing(
+                    makePreparingRecord(
+                        sessionID: fixedSession(0x74), contextID: contextID, nonceByte: 0x75
+                    ),
+                    idempotencyKey: RequestID(fixedUUID(0x76))
+                )
+            }
+            await #expect(throws: TerminalSessionRepositoryError.deletionOperationMismatch) {
+                try await repository.beginContextDeletion(
+                    contextID: contextID,
+                    operationID: DeletionOperationID(fixedUUID(0x77))
+                )
+            }
+
+            try await repository.purgeDeletedContext(
+                contextID: contextID,
+                operationID: operationID
+            )
+            let postPurge = try makePreparingRecord(
+                sessionID: fixedSession(0x78), contextID: contextID, nonceByte: 0x79
+            )
+            await #expect(throws: TerminalSessionRepositoryError.contextDeleting) {
+                _ = try await repository.insertPreparing(
+                    postPurge,
+                    idempotencyKey: RequestID(fixedUUID(0x7A))
+                )
+            }
+            try await repository.purgeDeletedContext(
+                contextID: contextID,
+                operationID: operationID
+            )
+            #expect(try await repository.contextDeletion(contextID: contextID)?.state == .purged)
+            #expect(await repository.close() == SQLITE_OK)
+
+            let reopened = try await SQLiteTerminalSessionRepository(databaseURL: databaseURL)
+            #expect(try await reopened.contextDeletion(contextID: contextID)?.operationID == operationID)
+            #expect(try await reopened.activeRecords().isEmpty)
         }
     }
 

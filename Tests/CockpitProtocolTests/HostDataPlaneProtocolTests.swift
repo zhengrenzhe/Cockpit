@@ -72,8 +72,9 @@ import CockpitTypes
         CPDocumentEnvelope.OneOf_Payload.openRequest(.init()), .snapshotRequest(.init()),
         .acquireLeaseRequest(.init()), .transferLeaseRequest(.init()), .applyRequest(.init()),
         .flushRequest(.init()), .saveRequest(.init()), .discardRequest(.init()),
+        .retainViewerRequest(.init()), .releaseViewerRequest(.init()),
         .snapshotResult(.init()), .leaseResult(.init()), .acknowledgementResult(.init()),
-        .flushResult(.init()), .error(.init()),
+        .flushResult(.init()), .viewerResult(.init()), .error(.init()),
     ].map { payload -> [UInt8] in
         var value = CPDocumentEnvelope(); value.payload = payload
         return Array(try value.serializedData())
@@ -81,7 +82,8 @@ import CockpitTypes
     #expect(documentTags.map { Array($0.prefix(2)) } == [
         [0x52, 0x00], [0x5A, 0x00], [0x62, 0x00], [0x6A, 0x00],
         [0x72, 0x00], [0x7A, 0x00], [0x82, 0x01], [0x8A, 0x01],
-        [0xF2, 0x01], [0xFA, 0x01], [0x82, 0x02], [0x8A, 0x02], [0xC2, 0x02],
+        [0x92, 0x01], [0x9A, 0x01], [0xF2, 0x01], [0xFA, 0x01],
+        [0x82, 0x02], [0x8A, 0x02], [0x92, 0x02], [0xC2, 0x02],
     ])
 
     let treeTags = try [
@@ -324,17 +326,21 @@ import CockpitTypes
     var flush = CPDocumentFlushRequest(); flush.documentID = values.documentID.description; flush.throughClientSequence = 1
     var save = CPDocumentSaveRequest(); save.documentID = values.documentID.description; save.expectedFingerprint = try HostDataPlaneMessages.encode(values.fingerprint)
     var discard = CPDocumentDiscardRequest(); discard.documentID = values.documentID.description
+    var retainViewer = CPDocumentViewerRetainRequest(); retainViewer.documentID = values.documentID.description
+    var releaseViewer = CPDocumentViewerReleaseRequest(); releaseViewer.documentID = values.documentID.description
     var flushResult = CPDocumentFlushResult(); flushResult.documentVersion = 1
+    var viewerResult = CPDocumentViewerResult(); viewerResult.documentID = values.documentID.description
     var error = CPDataPlaneError(); error.code = .documentInvalidLease
 
     let payloads: [CPDocumentEnvelope.OneOf_Payload] = [
         .openRequest(open), .snapshotRequest(snapshot), .acquireLeaseRequest(acquire),
         .transferLeaseRequest(transfer), .applyRequest(try HostDataPlaneMessages.encode(transaction)),
         .flushRequest(flush), .saveRequest(save), .discardRequest(discard),
+        .retainViewerRequest(retainViewer), .releaseViewerRequest(releaseViewer),
         .snapshotResult(try HostDataPlaneMessages.encode(values.snapshot)),
         .leaseResult(try HostDataPlaneMessages.encode(values.lease)),
         .acknowledgementResult(try HostDataPlaneMessages.encode(values.acknowledgement)),
-        .flushResult(flushResult), .error(error),
+        .flushResult(flushResult), .viewerResult(viewerResult), .error(error),
     ]
 
     for payload in payloads {
@@ -521,7 +527,10 @@ import CockpitTypes
     var flush = CPDocumentFlushRequest(); flush.documentID = values.documentID.description; flush.throughClientSequence = 1
     var save = CPDocumentSaveRequest(); save.documentID = values.documentID.description; save.expectedFingerprint = try HostDataPlaneMessages.encode(values.fingerprint)
     var discard = CPDocumentDiscardRequest(); discard.documentID = values.documentID.description
+    var retainViewer = CPDocumentViewerRetainRequest(); retainViewer.documentID = values.documentID.description
+    var releaseViewer = CPDocumentViewerReleaseRequest(); releaseViewer.documentID = values.documentID.description
     var flushResult = CPDocumentFlushResult(); flushResult.documentVersion = 1
+    var viewerResult = CPDocumentViewerResult(); viewerResult.documentID = values.documentID.description
     let documentUnknownCases: [(String, ProtocolMappingError, CPDocumentEnvelope.OneOf_Payload)] = [
         ("document_open_request", .unknownFields("document_open_request"), .openRequest(try hostDataPlaneProtocolAddingUnknownField(open))),
         ("document_snapshot_request", .unknownFields("document_snapshot_request"), .snapshotRequest(try hostDataPlaneProtocolAddingUnknownField(snapshotRequest))),
@@ -531,10 +540,13 @@ import CockpitTypes
         ("document_flush_request", .unknownFields("document_flush_request"), .flushRequest(try hostDataPlaneProtocolAddingUnknownField(flush))),
         ("document_save_request", .unknownFields("document_save_request"), .saveRequest(try hostDataPlaneProtocolAddingUnknownField(save))),
         ("document_discard_request", .unknownFields("document_discard_request"), .discardRequest(try hostDataPlaneProtocolAddingUnknownField(discard))),
+        ("document_viewer_retain_request", .unknownFields("document_viewer_retain_request"), .retainViewerRequest(try hostDataPlaneProtocolAddingUnknownField(retainViewer))),
+        ("document_viewer_release_request", .unknownFields("document_viewer_release_request"), .releaseViewerRequest(try hostDataPlaneProtocolAddingUnknownField(releaseViewer))),
         ("document_snapshot", .unknownFields("document_snapshot"), .snapshotResult(try hostDataPlaneProtocolAddingUnknownField(HostDataPlaneMessages.encode(values.snapshot)))),
         ("edit_lease", .unknownFields("edit_lease"), .leaseResult(try hostDataPlaneProtocolAddingUnknownField(HostDataPlaneMessages.encode(values.lease)))),
         ("document_acknowledgement", .unknownFields("document_acknowledgement"), .acknowledgementResult(try hostDataPlaneProtocolAddingUnknownField(HostDataPlaneMessages.encode(values.acknowledgement)))),
         ("document_flush_result", .unknownFields("document_flush_result"), .flushResult(try hostDataPlaneProtocolAddingUnknownField(flushResult))),
+        ("document_viewer_result", .unknownFields("document_viewer_result"), .viewerResult(try hostDataPlaneProtocolAddingUnknownField(viewerResult))),
         ("data_plane_error", .unknownFields("data_plane_error"), .error(try hostDataPlaneProtocolAddingUnknownField(error))),
     ]
     for (name, expected, payload) in documentUnknownCases {
@@ -613,7 +625,7 @@ import CockpitTypes
     }
     let documentWithUnknownOneOf = document
     var documentUnknownBytes = try documentWithUnknownOneOf.serializedData()
-    documentUnknownBytes.append(contentsOf: [0x92, 0x01, 0x00])
+    documentUnknownBytes.append(contentsOf: [0xA2, 0x01, 0x00])
     hostDataPlaneProtocolExpectMappingError(.unknownFields("document_envelope"), "unknown document oneof") {
         _ = try HostDataPlaneMessages.decodeDocumentEnvelope(documentUnknownBytes)
     }

@@ -2,6 +2,7 @@ import Foundation
 import SQLite3
 import Testing
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTypes
 @testable import CockpitPersistence
 
@@ -102,6 +103,188 @@ import CockpitTypes
         #expect(second.environmentID == project.baseEnvironmentID)
         #expect(first.lifecycleState == .active)
         #expect(second.lifecycleState == .active)
+    }
+}
+
+@Test func conversationDeletionRemovesOnlyConversationStateAndKeepsDurableTombstone() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let conversation = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "Delete")
+        )
+        let projectState = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: .project(project.id),
+            documentID: DocumentID(), tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 1
+        )
+        let conversationState = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: .conversation(conversation.id),
+            documentID: DocumentID(), tabID: TabID(), cursorLine: 3,
+            collapsed: true, leadingWidth: 210, trailingWidth: 310, scroll: 2
+        )
+        try await repository.saveClientState(projectState)
+        try await repository.saveClientState(conversationState)
+        let operationID = DeletionOperationID()
+
+        _ = try await repository.beginConversationDeletion(
+            conversationID: conversation.id,
+            operationID: operationID
+        )
+        var rejectedState = conversationState
+        rejectedState.sidebar.isCollapsed.toggle()
+        await #expect(throws: WorkspaceRepositoryError.conversationNotFound) {
+            try await repository.saveClientState(rejectedState)
+        }
+        await #expect(throws: WorkspaceRepositoryError.conversationNotFound) {
+            _ = try await repository.resolve(.conversation(conversation.id))
+        }
+        #expect(try await repository.loadClientState(conversationState.key) == conversationState)
+        _ = try await repository.advanceConversationDeletion(
+            operationID: operationID, from: .deleting, to: .terminatingSessions
+        )
+        _ = try await repository.advanceConversationDeletion(
+            operationID: operationID, from: .terminatingSessions, to: .purgingTerminalRecords
+        )
+        _ = try await repository.advanceConversationDeletion(
+            operationID: operationID, from: .purgingTerminalRecords, to: .removingClientState
+        )
+        try await repository.finishConversationDeletion(operationID: operationID)
+        try await repository.finishConversationDeletion(operationID: operationID)
+
+        #expect(try await repository.listProjects() == [project])
+        #expect(try await repository.listConversations(projectID: project.id).isEmpty)
+        #expect(try await repository.loadClientState(projectState.key) == projectState)
+        #expect(try await repository.loadClientState(conversationState.key) == nil)
+        #expect(try await repository.resolve(.project(project.id)).environmentID == project.baseEnvironmentID)
+        let operation = try #require(
+            try await repository.conversationDeletion(operationID: operationID)
+        )
+        #expect(operation.phase == .deleted)
+        #expect(operation.projectID == project.id)
+        #expect(operation.environmentID == project.baseEnvironmentID)
+        #expect(await repository.close() == SQLITE_OK)
+
+        let reopened = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        #expect(try await reopened.conversationDeletion(operationID: operationID) == operation)
+        await #expect(throws: WorkspaceRepositoryError.conversationNotFound) {
+            _ = try await reopened.resolve(.conversation(conversation.id))
+        }
+    }
+}
+
+@Test func conversationDeletionBeginAtomicallyRejectsPersistedViewerChangesAfterImpact() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let conversation = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "Delete")
+        )
+        let documentID = DocumentID()
+        let targetContext = WorkspaceContextID.conversation(conversation.id)
+        let targetState = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: targetContext,
+            documentID: documentID, tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 1
+        )
+        try await repository.saveClientState(targetState)
+        let expected: Set<ConversationDeletionPersistedViewer> = [
+            ConversationDeletionPersistedViewer(
+                documentID: documentID,
+                contextID: targetContext
+            ),
+        ]
+
+        let laterProjectViewer = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: .project(project.id),
+            documentID: documentID, tabID: TabID(), cursorLine: 3,
+            collapsed: false, leadingWidth: 210, trailingWidth: 310, scroll: 2
+        )
+        try await repository.saveClientState(laterProjectViewer)
+        let operationID = DeletionOperationID()
+
+        await #expect(throws: ConversationDeletionError.stalePreparation) {
+            _ = try await repository.beginConversationDeletion(
+                conversationID: conversation.id,
+                operationID: operationID,
+                targetContextID: targetContext,
+                relevantDocumentIDs: [documentID],
+                expectedPersistedViewers: expected
+            )
+        }
+        #expect(try await repository.conversationDeletion(operationID: operationID) == nil)
+        #expect(try await repository.resolve(targetContext).conversationID == conversation.id)
+    }
+}
+
+@Test func conversationDeletionBeginTracksRelevantDocumentWithNoPersistedViewers() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let conversation = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "Delete")
+        )
+        let documentID = DocumentID()
+        let laterViewer = try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: .project(project.id),
+            documentID: documentID, tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 1
+        )
+        try await repository.saveClientState(laterViewer)
+
+        await #expect(throws: ConversationDeletionError.stalePreparation) {
+            _ = try await repository.beginConversationDeletion(
+                conversationID: conversation.id,
+                operationID: DeletionOperationID(),
+                targetContextID: .conversation(conversation.id),
+                relevantDocumentIDs: [documentID],
+                expectedPersistedViewers: []
+            )
+        }
+    }
+}
+
+@Test func conversationDeletionBeginExcludesViewerContextsAlreadyDeleting() async throws {
+    try await withRepositoryDatabase { databaseURL in
+        let repository = try await SQLiteWorkspaceRepository(databaseURL: databaseURL)
+        let project = try await repository.createProjectWithDirectEnvironment(makeProjectInput())
+        let first = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "First")
+        )
+        let second = try await repository.createConversation(
+            NewConversation(projectID: project.id, title: "Second")
+        )
+        let documentID = DocumentID()
+        let firstContext = WorkspaceContextID.conversation(first.id)
+        let secondContext = WorkspaceContextID.conversation(second.id)
+        try await repository.saveClientState(try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: firstContext,
+            documentID: documentID, tabID: TabID(), cursorLine: 2,
+            collapsed: false, leadingWidth: 200, trailingWidth: 300, scroll: 1
+        ))
+        try await repository.saveClientState(try makeWorkspaceState(
+            deviceID: DeviceID(), windowID: WindowID(), contextID: secondContext,
+            documentID: documentID, tabID: TabID(), cursorLine: 3,
+            collapsed: false, leadingWidth: 210, trailingWidth: 310, scroll: 2
+        ))
+        let expected: Set<ConversationDeletionPersistedViewer> = [
+            .init(documentID: documentID, contextID: firstContext),
+            .init(documentID: documentID, contextID: secondContext),
+        ]
+        _ = try await repository.beginConversationDeletion(
+            conversationID: first.id,
+            operationID: DeletionOperationID()
+        )
+
+        await #expect(throws: ConversationDeletionError.stalePreparation) {
+            _ = try await repository.beginConversationDeletion(
+                conversationID: second.id,
+                operationID: DeletionOperationID(),
+                targetContextID: secondContext,
+                relevantDocumentIDs: [documentID],
+                expectedPersistedViewers: expected
+            )
+        }
     }
 }
 

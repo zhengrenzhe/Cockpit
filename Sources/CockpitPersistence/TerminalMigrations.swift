@@ -1,7 +1,7 @@
 import Foundation
 
 enum TerminalMigrations {
-    static let all = [version1, version2]
+    static let all = [version1, version2, version3]
 
     private static let version1 = SQLiteMigration(
         version: 1,
@@ -79,6 +79,21 @@ enum TerminalMigrations {
             )
             """,
             "INSERT INTO terminal_supervisor_epoch (singleton, last_epoch) VALUES (1, 0)",
+        ]
+    )
+
+    private static let version3 = SQLiteMigration(
+        version: 3,
+        statements: [
+            """
+            CREATE TABLE terminal_context_deletions (
+                context_kind TEXT NOT NULL CHECK (context_kind IN ('project', 'conversation')),
+                context_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('deleting', 'purged')),
+                PRIMARY KEY (context_kind, context_id)
+            )
+            """,
         ]
     )
 }

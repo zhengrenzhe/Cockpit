@@ -260,6 +260,90 @@ import CockpitTypes
     #expect(await fixture.repository.findOrCreateCount == 0)
 }
 
+@Test func documentRegistryDeletionStatesMaterializePersistedDirtyDocumentAfterColdStart() async throws {
+    let fixture = try DocumentRegistryFixture()
+    defer { fixture.remove() }
+    let path = try RelativePath("persisted-dirty.txt")
+    try Data("before".utf8).write(
+        to: fixture.root.appendingPathComponent(path.string)
+    )
+    let original = try await fixture.registry.open(at: path)
+    let before = await original.snapshot()
+    let lease = try await original.acquireEditLease(client: ClientInstanceID())
+    _ = try await original.apply(EditTransaction(
+        validatingDocumentID: before.documentID,
+        editLeaseID: lease.id,
+        baseVersion: before.documentVersion,
+        clientSequence: before.lastAcceptedClientSequence + 1,
+        changes: [try UTF16TextEdit(
+            validatingOffset: UInt64(before.text.utf16.count),
+            length: 0,
+            replacement: "!"
+        )]
+    ))
+
+    let restarted = DocumentRegistry(
+        environmentID: fixture.environmentID,
+        documentServing: WorkspaceRootHandle(rootURL: fixture.root),
+        metadataRepository: fixture.repository,
+        recoveryRoot: fixture.recoveryRoot
+    )
+    #expect(await restarted.document(id: before.documentID) == nil)
+
+    let states = try await restarted.deletionStates(
+        documentIDs: [before.documentID]
+    )
+
+    let state = try #require(states.first)
+    #expect(states.count == 1)
+    #expect(state.snapshot.documentID == before.documentID)
+    #expect(state.snapshot.text == "before!")
+    #expect(state.snapshot.dirtyState == .dirty)
+    #expect(state.liveViewerContexts.isEmpty)
+}
+
+@Test func documentRegistryDeletionCommitLogicallyRetiresBlockedViewerContext() async throws {
+    let fixture = try DocumentRegistryFixture()
+    defer { fixture.remove() }
+    let path = try RelativePath("shared-delete.txt")
+    try Data("shared".utf8).write(to: fixture.root.appendingPathComponent(path.string))
+    let document = try await fixture.registry.open(at: path)
+    let snapshot = await document.snapshot()
+    let firstContext = WorkspaceContextID.conversation(ConversationID())
+    let secondContext = WorkspaceContextID.conversation(ConversationID())
+    try await fixture.registry.registerViewer(
+        connectionID: UUID(),
+        contextID: firstContext,
+        documentID: snapshot.documentID
+    )
+    try await fixture.registry.registerViewer(
+        connectionID: UUID(),
+        contextID: secondContext,
+        documentID: snapshot.documentID
+    )
+    let expected = try await fixture.registry.deletionStates(
+        documentIDs: [snapshot.documentID],
+        includingViewerContext: firstContext
+    )
+    let reservation = try await fixture.registry.reserveConversationDeletion(
+        preparationID: UUID(),
+        targetContextID: firstContext,
+        expectedDocumentStates: expected
+    )
+
+    await fixture.registry.commitConversationDeletion(
+        reservation,
+        blocking: firstContext
+    )
+    let current = try await fixture.registry.deletionStates(
+        documentIDs: [snapshot.documentID],
+        includingViewerContext: secondContext
+    )
+
+    #expect(current.count == 1)
+    #expect(current[0].liveViewerContexts == [secondContext])
+}
+
 @Test func documentRegistryMutationScopeDefersDestinationOpenUntilRelocation() async throws {
     let fixture = try DocumentRegistryFixture()
     defer { fixture.remove() }

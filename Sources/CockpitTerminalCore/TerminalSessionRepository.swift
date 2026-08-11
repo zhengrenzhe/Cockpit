@@ -10,6 +10,36 @@ public enum TerminalSessionRepositoryError: Error, Equatable, Sendable {
     case sequenceRegression
     case invalidCanonicalExecutablePath
     case corruptRecord
+    case contextDeleting
+    case deletionOperationMismatch
+    case activeSessionsRemain
+    case contextDeletionUnsupported
+}
+
+public enum TerminalContextDeletionState: String, Codable, Hashable, Sendable {
+    case deleting
+    case purged
+}
+
+public struct TerminalContextDeletion: Hashable, Codable, Sendable {
+    public let contextID: WorkspaceContextID
+    public let operationID: DeletionOperationID
+    public let state: TerminalContextDeletionState
+
+    public init(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID,
+        state: TerminalContextDeletionState
+    ) {
+        self.contextID = contextID
+        self.operationID = operationID
+        self.state = state
+    }
+}
+
+public enum ContextTerminationResult: Hashable, Codable, Sendable {
+    case complete
+    case forceConfirmationRequired(activeSessionIDs: [TerminalSessionID])
 }
 
 public enum AgentProfileID: String, Codable, CaseIterable, Sendable {
@@ -41,4 +71,37 @@ public protocol TerminalSessionRepository: Sendable {
     func record(sessionID: TerminalSessionID) async throws -> TerminalSessionRecord
     func records(contextID: WorkspaceContextID) async throws -> [TerminalSessionRecord]
     func purgeFinishedRecords() async throws -> Int
+    func beginContextDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws
+    func contextDeletion(
+        contextID: WorkspaceContextID
+    ) async throws -> TerminalContextDeletion?
+    func purgeDeletedContext(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws
+}
+
+public extension TerminalSessionRepository {
+    func beginContextDeletion(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        throw TerminalSessionRepositoryError.contextDeletionUnsupported
+    }
+
+    func contextDeletion(
+        contextID: WorkspaceContextID
+    ) async throws -> TerminalContextDeletion? {
+        nil
+    }
+
+    func purgeDeletedContext(
+        contextID: WorkspaceContextID,
+        operationID: DeletionOperationID
+    ) async throws {
+        throw TerminalSessionRepositoryError.contextDeletionUnsupported
+    }
 }

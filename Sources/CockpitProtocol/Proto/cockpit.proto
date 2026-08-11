@@ -313,6 +313,9 @@ message DocumentSaveRequest {
   DiskFingerprintValue expected_fingerprint = 2;
 }
 message DocumentDiscardRequest { string document_id = 1; }
+message DocumentViewerRetainRequest { string document_id = 1; }
+message DocumentViewerReleaseRequest { string document_id = 1; }
+message DocumentViewerResult { string document_id = 1; }
 message DocumentEnvelope {
   string request_id = 1;
   DataPlaneBinding binding = 2;
@@ -325,10 +328,13 @@ message DocumentEnvelope {
     DocumentFlushRequest flush_request = 15;
     DocumentSaveRequest save_request = 16;
     DocumentDiscardRequest discard_request = 17;
+    DocumentViewerRetainRequest retain_viewer_request = 18;
+    DocumentViewerReleaseRequest release_viewer_request = 19;
     DocumentSnapshotValue snapshot_result = 30;
     EditLeaseValue lease_result = 31;
     DocumentAcknowledgement acknowledgement_result = 32;
     DocumentFlushResult flush_result = 33;
+    DocumentViewerResult viewer_result = 34;
     DataPlaneError error = 40;
   }
 }

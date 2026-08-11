@@ -7,6 +7,21 @@ public struct DocumentInternalMutationLease: Hashable, Sendable {
     fileprivate let id: UUID
 }
 
+struct DocumentOperationLease: Hashable, Sendable {
+    fileprivate let id: UUID
+}
+
+private struct DocumentOperationWaiter {
+    let id: UUID
+    let contextID: WorkspaceContextID?
+    let continuation: CheckedContinuation<DocumentOperationLease, Error>
+}
+
+private struct DocumentDeletionWaiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Void, Error>
+}
+
 private enum DocumentMutationScope: Sendable {
     case all
     case relocation(source: RelativePath, destination: RelativePath)
@@ -96,6 +111,14 @@ public actor DocumentRegistry {
     private var openRequestStates: [UUID: OpenRequestState] = [:]
     private var openWaiters: [DocumentOpenWaiter] = []
     private var recoveryRequired = false
+    private var viewerDocumentsByConnection: [
+        UUID: [DocumentID: WorkspaceContextID]
+    ] = [:]
+    private var activeDocumentOperations: [UUID: WorkspaceContextID?] = [:]
+    private var documentOperationWaiters: [DocumentOperationWaiter] = []
+    private var activeDeletionReservationID: UUID?
+    private var deletionWaiters: [DocumentDeletionWaiter] = []
+    private var blockedViewerContexts: Set<WorkspaceContextID> = []
 
     public init(
         environmentID: EnvironmentID,
@@ -131,6 +154,159 @@ public actor DocumentRegistry {
 
     public func document(id: DocumentID) -> DocumentActor? {
         byID[id]
+    }
+
+    var pendingDocumentOperationCount: Int { documentOperationWaiters.count }
+    var pendingDeletionReservationCount: Int { deletionWaiters.count }
+
+    public func registerViewer(
+        connectionID: UUID,
+        contextID: WorkspaceContextID,
+        documentID: DocumentID
+    ) async throws {
+        let lease = try await acquireOperation(contextID: contextID)
+        do {
+            guard byID[documentID] != nil else {
+                throw HostDataPlaneServiceError.documentNotOpen
+            }
+            viewerDocumentsByConnection[connectionID, default: [:]][documentID] = contextID
+            releaseOperation(lease)
+        } catch {
+            releaseOperation(lease)
+            throw error
+        }
+    }
+
+    public func removeViewers(connectionID: UUID) async {
+        let lease = await acquireCleanupOperation()
+        viewerDocumentsByConnection.removeValue(forKey: connectionID)
+        releaseOperation(lease)
+    }
+
+    public func removeViewer(
+        connectionID: UUID,
+        documentID: DocumentID
+    ) async {
+        let lease = await acquireCleanupOperation()
+        viewerDocumentsByConnection[connectionID]?.removeValue(forKey: documentID)
+        if viewerDocumentsByConnection[connectionID]?.isEmpty == true {
+            viewerDocumentsByConnection.removeValue(forKey: connectionID)
+        }
+        releaseOperation(lease)
+    }
+
+    func acquireOperation(
+        contextID: WorkspaceContextID?
+    ) async throws -> DocumentOperationLease {
+        try Task.checkCancellation()
+        let requestID = UUID()
+        let lease = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                registerOperationWaiter(
+                    id: requestID,
+                    contextID: contextID,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { await self.cancelOperationWaiter(requestID) }
+        }
+        do {
+            try Task.checkCancellation()
+            return lease
+        } catch {
+            releaseOperation(lease)
+            throw error
+        }
+    }
+
+    func releaseOperation(_ lease: DocumentOperationLease) {
+        guard activeDocumentOperations.removeValue(forKey: lease.id) != nil else { return }
+        resumeLifecycleWaiters()
+    }
+
+    public func reserveConversationDeletion(
+        preparationID: UUID,
+        targetContextID: WorkspaceContextID,
+        expectedDocumentStates: [DocumentDeletionState]
+    ) async throws -> ConversationDeletionDocumentReservation {
+        do {
+            try await acquireDeletionReservation(preparationID)
+            let currentStates = try await deletionStates(
+                documentIDs: Set(expectedDocumentStates.map { $0.snapshot.documentID }),
+                includingViewerContext: targetContextID
+            )
+            guard Set(currentStates) == Set(expectedDocumentStates) else {
+                releaseDeletionReservation(preparationID, blocking: nil)
+                throw ConversationDeletionError.stalePreparation
+            }
+            return ConversationDeletionDocumentReservation(
+                id: preparationID,
+                environmentID: environmentID
+            )
+        } catch {
+            if activeDeletionReservationID == preparationID {
+                releaseDeletionReservation(preparationID, blocking: nil)
+            }
+            throw error
+        }
+    }
+
+    public func commitConversationDeletion(
+        _ reservation: ConversationDeletionDocumentReservation,
+        blocking targetContextID: WorkspaceContextID
+    ) {
+        guard reservation.environmentID == environmentID else { return }
+        releaseDeletionReservation(reservation.id, blocking: targetContextID)
+    }
+
+    public func cancelConversationDeletion(
+        _ reservation: ConversationDeletionDocumentReservation
+    ) {
+        guard reservation.environmentID == environmentID else { return }
+        releaseDeletionReservation(reservation.id, blocking: nil)
+    }
+
+    public func deletionStates(
+        documentIDs: Set<DocumentID>,
+        includingViewerContext contextID: WorkspaceContextID? = nil
+    ) async throws -> [DocumentDeletionState] {
+        var included = documentIDs
+        if let contextID {
+            for viewers in viewerDocumentsByConnection.values {
+                included.formUnion(viewers.compactMap { documentID, viewerContext in
+                    viewerContext == contextID ? documentID : nil
+                })
+            }
+        }
+        var values: [DocumentDeletionState] = []
+        values.reserveCapacity(included.count)
+        for documentID in included.sorted(by: { $0.description < $1.description }) {
+            let document: DocumentActor
+            if let openDocument = byID[documentID] {
+                document = openDocument
+            } else {
+                guard documentIDs.contains(documentID),
+                      let metadata = try await metadataRepository.loadDocument(id: documentID),
+                      metadata.environmentID == environmentID else {
+                    throw WorkspaceRepositoryError.invalidStoredValue
+                }
+                document = try await open(at: metadata.relativePath)
+            }
+            let snapshot = await document.snapshot()
+            guard snapshot.documentID == documentID,
+                  snapshot.environmentID == environmentID else {
+                throw WorkspaceRepositoryError.invalidStoredValue
+            }
+            let contexts = Set(viewerDocumentsByConnection.values.compactMap {
+                $0[documentID]
+            }).subtracting(blockedViewerContexts)
+            values.append(DocumentDeletionState(
+                snapshot: snapshot,
+                liveViewerContexts: contexts
+            ))
+        }
+        return values
     }
 
     public func acquireInternalMutationLease() async throws -> DocumentInternalMutationLease {
@@ -172,7 +348,15 @@ public actor DocumentRegistry {
             queuedScopes.formUnion(scopes)
             return
         }
+        let lease: DocumentOperationLease
+        do {
+            lease = try await acquireOperation(contextID: nil)
+        } catch {
+            queuedScopes.formUnion(scopes)
+            return
+        }
         await reconcile(scopes: scopes)
+        releaseOperation(lease)
     }
 
     public func relocateOpenDocuments(from source: RelativePath, to destination: RelativePath) async {
@@ -584,7 +768,110 @@ public actor DocumentRegistry {
         else { return }
         let scopes = queuedScopes
         queuedScopes.removeAll()
-        await reconcile(scopes: scopes)
+        await handleExternalChanges(in: scopes)
+    }
+
+    private func registerOperationWaiter(
+        id: UUID,
+        contextID: WorkspaceContextID?,
+        continuation: CheckedContinuation<DocumentOperationLease, Error>
+    ) {
+        if let contextID, blockedViewerContexts.contains(contextID) {
+            continuation.resume(throwing: HostDataPlaneServiceError.contextUnavailable)
+            return
+        }
+        guard activeDeletionReservationID == nil, deletionWaiters.isEmpty else {
+            documentOperationWaiters.append(DocumentOperationWaiter(
+                id: id,
+                contextID: contextID,
+                continuation: continuation
+            ))
+            return
+        }
+        activeDocumentOperations[id] = contextID
+        continuation.resume(returning: DocumentOperationLease(id: id))
+    }
+
+    private func acquireCleanupOperation() async -> DocumentOperationLease {
+        let requestID = UUID()
+        return try! await withCheckedThrowingContinuation { continuation in
+            registerOperationWaiter(
+                id: requestID,
+                contextID: nil,
+                continuation: continuation
+            )
+        }
+    }
+
+    private func cancelOperationWaiter(_ id: UUID) {
+        guard let index = documentOperationWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        documentOperationWaiters.remove(at: index).continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private func acquireDeletionReservation(_ id: UUID) async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard activeDeletionReservationID != id,
+                      !deletionWaiters.contains(where: { $0.id == id }) else {
+                    continuation.resume(throwing: ConversationDeletionError.operationMismatch)
+                    return
+                }
+                deletionWaiters.append(DocumentDeletionWaiter(
+                    id: id,
+                    continuation: continuation
+                ))
+                resumeLifecycleWaiters()
+            }
+        } onCancel: {
+            Task { await self.cancelDeletionWaiter(id) }
+        }
+        try Task.checkCancellation()
+    }
+
+    private func cancelDeletionWaiter(_ id: UUID) {
+        guard let index = deletionWaiters.firstIndex(where: { $0.id == id }) else { return }
+        deletionWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
+        resumeLifecycleWaiters()
+    }
+
+    private func releaseDeletionReservation(
+        _ id: UUID,
+        blocking targetContextID: WorkspaceContextID?
+    ) {
+        guard activeDeletionReservationID == id else { return }
+        if let targetContextID { blockedViewerContexts.insert(targetContextID) }
+        activeDeletionReservationID = nil
+        resumeLifecycleWaiters()
+    }
+
+    private func resumeLifecycleWaiters() {
+        guard activeDeletionReservationID == nil else { return }
+        if activeDocumentOperations.isEmpty, !deletionWaiters.isEmpty {
+            let next = deletionWaiters.removeFirst()
+            activeDeletionReservationID = next.id
+            next.continuation.resume()
+            return
+        }
+        guard deletionWaiters.isEmpty else { return }
+        let waiters = documentOperationWaiters
+        documentOperationWaiters.removeAll()
+        for waiter in waiters {
+            if let contextID = waiter.contextID,
+               blockedViewerContexts.contains(contextID) {
+                waiter.continuation.resume(
+                    throwing: HostDataPlaneServiceError.contextUnavailable
+                )
+            } else {
+                activeDocumentOperations[waiter.id] = waiter.contextID
+                waiter.continuation.resume(returning: DocumentOperationLease(id: waiter.id))
+            }
+        }
     }
 
     private func reconcile(scopes: Set<WorkspaceDirectory>) async {

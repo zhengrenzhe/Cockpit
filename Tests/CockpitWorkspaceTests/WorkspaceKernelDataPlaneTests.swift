@@ -60,6 +60,137 @@ import CockpitTypes
     #expect(await fixture.workspace.resolveCount == 9)
 }
 
+@Test func workspaceKernelDataPlaneTracksViewerContextsUntilEachConnectionCloses() async throws {
+    let fixture = try await WorkspaceDataPlaneFixture()
+    defer { fixture.remove() }
+    let firstConnection = UUID()
+    let secondConnection = UUID()
+    let first = try await fixture.service.openDocument(
+        binding: fixture.binding,
+        at: fixture.path
+    )
+    try await fixture.service.registerDocumentViewer(
+        connectionID: firstConnection,
+        binding: fixture.binding,
+        documentID: first.documentID
+    )
+
+    let conversationID = ConversationID()
+    let secondContext = WorkspaceContextID.conversation(conversationID)
+    let secondBinding = try HostDataPlaneBinding(
+        validatingClientInstanceID: ClientInstanceID(),
+        windowID: WindowID(),
+        workspaceContextID: secondContext,
+        environmentID: fixture.environmentID,
+        activeContextGeneration: 4
+    )
+    await fixture.workspace.setResolvedContext(try ResolvedWorkspaceContext(
+        validating: secondContext,
+        projectID: fixture.resolvedContext.projectID,
+        conversationID: conversationID,
+        environmentID: fixture.environmentID,
+        workspaceRootIdentity: fixture.root.path
+    ))
+    let second = try await fixture.service.openDocument(
+        binding: secondBinding,
+        at: fixture.path
+    )
+    try await fixture.service.registerDocumentViewer(
+        connectionID: secondConnection,
+        binding: secondBinding,
+        documentID: second.documentID
+    )
+
+    var states = try await fixture.registry.documentDeletionStates(
+        in: fixture.environmentID,
+        documentIDs: [first.documentID]
+    )
+    #expect(states.count == 1)
+    #expect(states[0].liveViewerContexts == [fixture.contextID, secondContext])
+
+    await fixture.service.removeDocumentViewer(
+        connectionID: firstConnection,
+        documentID: first.documentID
+    )
+    states = try await fixture.registry.documentDeletionStates(
+        in: fixture.environmentID,
+        documentIDs: [first.documentID]
+    )
+    #expect(states[0].liveViewerContexts == [secondContext])
+
+    await fixture.service.removeDocumentViewers(connectionID: secondConnection)
+    states = try await fixture.registry.documentDeletionStates(
+        in: fixture.environmentID,
+        documentIDs: [first.documentID]
+    )
+    #expect(states[0].liveViewerContexts.isEmpty)
+}
+
+@Test func conversationDeletionReservationDrainsAdmittedEditAndBlocksLaterDataPlaneWork() async throws {
+    let fixture = try await WorkspaceDataPlaneFixture()
+    defer { fixture.remove() }
+    let opened = try await fixture.service.openDocument(
+        binding: fixture.binding,
+        at: fixture.path
+    )
+    let editLease = try await fixture.service.acquireEditLease(
+        binding: fixture.binding,
+        documentID: opened.documentID
+    )
+    let kernel = try #require(await fixture.registry.kernel(for: fixture.environmentID))
+    let registry = try #require(kernel.documentRegistry)
+    let document = try #require(await registry.document(id: opened.documentID))
+    let expectedStates = try await registry.deletionStates(
+        documentIDs: [opened.documentID],
+        includingViewerContext: fixture.contextID
+    )
+    let admitted = try await registry.acquireOperation(contextID: fixture.contextID)
+    let preparationID = UUID()
+    let reservation = Task {
+        try await registry.reserveConversationDeletion(
+            preparationID: preparationID,
+            targetContextID: fixture.contextID,
+            expectedDocumentStates: expectedStates
+        )
+    }
+    for _ in 0..<1_000 where await registry.pendingDeletionReservationCount == 0 {
+        await Task.yield()
+    }
+    #expect(await registry.pendingDeletionReservationCount == 1)
+
+    let laterSnapshot = Task {
+        try await fixture.service.snapshot(
+            binding: fixture.binding,
+            documentID: opened.documentID
+        )
+    }
+    for _ in 0..<1_000 where await registry.pendingDocumentOperationCount == 0 {
+        await Task.yield()
+    }
+    #expect(await registry.pendingDocumentOperationCount == 1)
+
+    _ = try await document.apply(
+        EditTransaction(
+            validatingDocumentID: opened.documentID,
+            editLeaseID: editLease.id,
+            baseVersion: opened.documentVersion,
+            clientSequence: 1,
+            changes: [try UTF16TextEdit(
+                validatingOffset: 3,
+                length: 0,
+                replacement: "d"
+            )]
+        ),
+        authorizedClient: fixture.binding.clientInstanceID
+    )
+    await registry.releaseOperation(admitted)
+
+    await #expect(throws: ConversationDeletionError.stalePreparation) {
+        _ = try await reservation.value
+    }
+    #expect(try await laterSnapshot.value.documentVersion == 1)
+}
+
 @Test func workspaceKernelDataPlaneRejectsContextEnvironmentAndUnopenedDocumentBeforeActorMutation() async throws {
     let fixture = try await WorkspaceDataPlaneFixture()
     defer { fixture.remove() }

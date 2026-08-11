@@ -243,7 +243,7 @@ import CockpitTerminalCore
     #expect(await service.recordedCommands == ["list", "add", "create", "rename:Renamed", "resolve", "file"])
 }
 
-@Test func hostExportRoutesAsynchronouslyRepliesOnceAndPreservesNSError() async throws {
+@Test func hostExportRoutesAsynchronouslyRepliesOnceAndSanitizesNSError() async throws {
     let expected = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)
     let service = ThrowingWorkspaceService(error: expected)
     let exported = HostXPCExport(
@@ -263,8 +263,9 @@ import CockpitTerminalCore
 
     #expect(replies.count == 1)
     #expect(replies.data == nil)
-    #expect(replies.error?.domain == NSCocoaErrorDomain)
-    #expect(replies.error?.code == NSFileReadNoSuchFileError)
+    #expect(replies.error?.domain == "dev.cockpit.host-workspace")
+    #expect(replies.error?.code == 1)
+    #expect(replies.error?.userInfo.isEmpty == true)
 }
 
 @Test func hostProtocolListenerRejectsWrongUIDBeforeConfigurationExportOrResume() {
@@ -300,6 +301,78 @@ import CockpitTerminalCore
         ) == .created(path: RelativePath("created"), kind: .directory)
     )
     #expect(connection.resumeCount == 1)
+    await client.disconnect()
+}
+
+@Test func hostClientRoundTripsConversationDeletionThroughWorkspaceRouter() async throws {
+    let fixture = try WorkspaceFixture()
+    let operationID = DeletionOperationID()
+    let activeSessionID = TerminalSessionID()
+    let dirtyDocument = try DocumentSnapshot(
+        validatingDocumentID: DocumentID(),
+        environmentID: fixture.environmentID,
+        relativePath: RelativePath("dirty.txt"),
+        text: "dirty",
+        documentVersion: 2,
+        persistedVersion: 1,
+        lastAcceptedClientSequence: 1,
+        dirtyState: .dirty,
+        observedDiskFingerprint: nil,
+        currentLease: nil,
+        maintenance: []
+    )
+    let preparationID = UUID(uuidString: "74000000-0000-4000-8000-000000000099")!
+    let expectedImpact = ConversationDeletionImpact(
+        conversationID: fixture.conversation.id,
+        projectID: fixture.projectID,
+        environmentID: fixture.environmentID,
+        dirtyDocuments: [dirtyDocument],
+        preparationID: preparationID
+    )
+    let deletion = RecordingConversationDeletionService(
+        impact: expectedImpact,
+        progress: [
+            .forceConfirmationRequired(
+                operationID: operationID,
+                activeSessionIDs: [activeSessionID]
+            ),
+            .deleted(projectContextID: .project(fixture.projectID)),
+        ]
+    )
+    let exported = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(
+            service: RecordingWorkspaceService(fixture: fixture),
+            deletionService: deletion
+        )
+    )
+    let connection = FakeHostClientConnection(proxy: exported)
+    let client = HostXPCClient(connectionFactory: { _ in connection })
+
+    #expect(try await client.deletionImpact(
+        conversationID: fixture.conversation.id
+    ) == expectedImpact)
+    #expect(
+        try await client.beginConversationDeletion(
+            conversationID: fixture.conversation.id,
+            operationID: operationID,
+            preparationID: preparationID
+        ) == .forceConfirmationRequired(
+            operationID: operationID,
+            activeSessionIDs: [activeSessionID]
+        )
+    )
+    #expect(
+        try await client.resumeConversationDeletion(
+            operationID: operationID,
+            force: true
+        ) == .deleted(projectContextID: .project(fixture.projectID))
+    )
+    #expect(await deletion.calls == [
+        .impact(fixture.conversation.id),
+        .begin(fixture.conversation.id, operationID),
+        .resume(operationID, true),
+    ])
     await client.disconnect()
 }
 
@@ -344,7 +417,7 @@ import CockpitTerminalCore
     await client.disconnect()
 }
 
-@Test func hostExportAndClientPreservePOSIXAndCocoaErrorDomainCodeAndPath() async throws {
+@Test func hostWorkspaceXPCSanitizesPOSIXAndCocoaPaths() async throws {
     let fixture = try WorkspaceFixture()
     let errors = [
         NSError(
@@ -359,8 +432,8 @@ import CockpitTerminalCore
         ),
     ]
 
-    for expected in errors {
-        let service = ThrowingWorkspaceService(error: expected)
+    for injected in errors {
+        let service = ThrowingWorkspaceService(error: injected)
         let exported = HostXPCExport(
             handshakeHandler: { try HostHandshakeHandler().handle($0) },
             workspaceRouter: WorkspaceCommandRouter(service: service)
@@ -375,14 +448,10 @@ import CockpitTerminalCore
             Issue.record("Expected file operation to fail")
         } catch {
             let actual = error as NSError
-            #expect(actual.domain == expected.domain)
-            #expect(actual.code == expected.code)
-            if let path = expected.userInfo[NSFilePathErrorKey] as? String {
-                #expect(actual.userInfo[NSFilePathErrorKey] as? String == path)
-            }
-            if let url = expected.userInfo[NSURLErrorKey] as? URL {
-                #expect(actual.userInfo[NSURLErrorKey] as? URL == url)
-            }
+            #expect(actual.domain == "dev.cockpit.host-workspace")
+            #expect(actual.code == 1)
+            #expect(actual.userInfo.isEmpty)
+            #expect(!actual.description.contains("/private/tmp/root"))
         }
     }
 }
@@ -1234,6 +1303,50 @@ private actor RecordingClientWorkspaceStateService: ClientWorkspaceStateServing 
     func saveClientState(_ state: ClientWorkspaceState) throws {
         let valid = try state.validated()
         values[valid.key] = valid
+    }
+}
+
+private actor RecordingConversationDeletionService: ConversationDeletionServing {
+    enum Call: Hashable {
+        case impact(ConversationID)
+        case begin(ConversationID, DeletionOperationID)
+        case resume(DeletionOperationID, Bool)
+    }
+
+    let impact: ConversationDeletionImpact
+    private var progress: [ConversationDeletionProgress]
+    private(set) var calls: [Call] = []
+
+    init(
+        impact: ConversationDeletionImpact,
+        progress: [ConversationDeletionProgress]
+    ) {
+        self.impact = impact
+        self.progress = progress
+    }
+
+    func deletionImpact(
+        conversationID: ConversationID
+    ) -> ConversationDeletionImpact {
+        calls.append(.impact(conversationID))
+        return impact
+    }
+
+    func beginConversationDeletion(
+        conversationID: ConversationID,
+        operationID: DeletionOperationID,
+        preparationID: UUID
+    ) -> ConversationDeletionProgress {
+        calls.append(.begin(conversationID, operationID))
+        return progress.removeFirst()
+    }
+
+    func resumeConversationDeletion(
+        operationID: DeletionOperationID,
+        force: Bool
+    ) -> ConversationDeletionProgress {
+        calls.append(.resume(operationID, force))
+        return progress.removeFirst()
     }
 }
 

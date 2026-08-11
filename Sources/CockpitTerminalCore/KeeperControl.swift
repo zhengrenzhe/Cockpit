@@ -159,6 +159,13 @@ public protocol KeeperControlling: Sendable {
     func authenticatedStart(_ request: AuthenticatedStartRequest) async throws
         -> CLIProcessIdentity
     func inspect(_ endpoint: KeeperEndpoint) async throws -> KeeperIdentity
+    func terminate(_ endpoint: KeeperEndpoint, force: Bool) async throws
+}
+
+public extension KeeperControlling {
+    func terminate(_ endpoint: KeeperEndpoint, force: Bool) async throws {
+        throw KeeperControlError.disconnected
+    }
 }
 
 public enum KeeperAuthentication {

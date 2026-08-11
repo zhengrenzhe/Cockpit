@@ -23,4 +23,13 @@ public protocol DocumentDataTransport: Sendable {
         expectedFingerprint: DiskFingerprint
     ) async throws -> DocumentSnapshot
     func discard(documentID: DocumentID) async throws -> DocumentSnapshot
+    func retainViewer(documentID: DocumentID) async throws
+    func releaseViewer(documentID: DocumentID) async
+    func closeDocument(documentID: DocumentID) async
+}
+
+public extension DocumentDataTransport {
+    func retainViewer(documentID: DocumentID) async throws {}
+    func releaseViewer(documentID: DocumentID) async {}
+    func closeDocument(documentID: DocumentID) async {}
 }

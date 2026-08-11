@@ -200,7 +200,16 @@ final class TabCommandControllerTests: XCTestCase {
             ),
             clientID: fixture.clientInstanceID
         )
-        let documents = TabDocumentFactory(transport: transport)
+        let secondTransport = try TabDocumentTransport(
+            snapshot: fixture.snapshot(
+                documentID: documentID,
+                environmentID: fixture.project.environmentID,
+                path: path,
+                dirtyState: .dirty
+            ),
+            clientID: fixture.clientInstanceID
+        )
+        let documents = TabDocumentSequenceFactory(values: [transport, secondTransport])
         let files = TabFilePicker(values: [
             TabFileSelection(path: path, language: "swift"),
             TabFileSelection(path: path, language: "swift"),
@@ -226,7 +235,11 @@ final class TabCommandControllerTests: XCTestCase {
         )
         XCTAssertEqual(first, .file(documentID))
         XCTAssertEqual(second, .file(documentID))
-        XCTAssertEqual(documents.calls, [fixture.project])
+        XCTAssertEqual(documents.calls, [fixture.project, fixture.conversation])
+        let firstRetained = await transport.retainedDocumentIDs()
+        let secondRetained = await secondTransport.retainedDocumentIDs()
+        XCTAssertEqual(firstRetained, [documentID])
+        XCTAssertEqual(secondRetained, [documentID])
         let session = try XCTUnwrap(fixture.bridge.resolver.session(documentID: documentID))
         XCTAssertEqual(session.references.count, 2)
         XCTAssertTrue(session.references.contains {
@@ -249,6 +262,12 @@ final class TabCommandControllerTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.resolver.session(documentID: documentID)?.references.count, 2)
         try await controller.finalizeClose(projectTab, in: fixture.project)
         XCTAssertEqual(fixture.bridge.resolver.session(documentID: documentID)?.references.count, 1)
+        let firstReleased = await transport.releasedDocumentIDs()
+        let secondReleasedBeforeClose = await secondTransport.releasedDocumentIDs()
+        XCTAssertEqual(firstReleased, [documentID])
+        XCTAssertEqual(secondReleasedBeforeClose, [])
+        let closeCountAfterFirst = await transport.closeCount()
+        XCTAssertEqual(closeCountAfterFirst, 0)
 
         let conversationTab = try WorkspaceTab(
             record: TabRecord(
@@ -268,6 +287,12 @@ final class TabCommandControllerTests: XCTestCase {
         XCTAssertNotNil(fixture.bridge.resolver.session(documentID: documentID))
         try await controller.finalizeClose(conversationTab, in: fixture.conversation)
         XCTAssertNil(fixture.bridge.resolver.session(documentID: documentID))
+        let secondReleased = await secondTransport.releasedDocumentIDs()
+        XCTAssertEqual(secondReleased, [documentID])
+        let closeCountAfterLast = await transport.closeCount()
+        XCTAssertEqual(closeCountAfterLast, 1)
+        let secondCloseCount = await secondTransport.closeCount()
+        XCTAssertEqual(secondCloseCount, 1)
     }
 
     func testDirtyLastViewerCancelKeepsReferenceAndSaveUsesObservedFingerprint() async throws {
@@ -447,7 +472,20 @@ final class TabCommandControllerTests: XCTestCase {
             ),
             clientID: fixture.clientInstanceID
         )
-        let documents = TabDocumentSequenceFactory(values: [original, recreated])
+        let reopenedNewViewer = try TabDocumentTransport(
+            snapshot: fixture.snapshot(
+                documentID: originalDocumentID,
+                environmentID: fixture.project.environmentID,
+                path: newPath,
+                dirtyState: .clean
+            ),
+            clientID: fixture.clientInstanceID
+        )
+        let documents = TabDocumentSequenceFactory(values: [
+            original,
+            recreated,
+            reopenedNewViewer,
+        ])
         let files = TabFilePicker(values: [
             TabFileSelection(path: oldPath, language: "swift"),
             TabFileSelection(path: oldPath, language: "swift"),
@@ -488,7 +526,7 @@ final class TabCommandControllerTests: XCTestCase {
 
         XCTAssertEqual(reopenedOld, .file(recreatedDocumentID))
         XCTAssertEqual(reopenedNew, .file(originalDocumentID))
-        XCTAssertEqual(documents.calls.count, 2)
+        XCTAssertEqual(documents.calls.count, 3)
         XCTAssertEqual(
             fixture.bridge.resolver.session(documentID: originalDocumentID)?.lastAuthoritativePath,
             newPath
@@ -508,7 +546,19 @@ final class TabCommandControllerTests: XCTestCase {
             ),
             clientID: fixture.clientInstanceID
         )
-        let documents = TabDocumentFactory(transport: transport)
+        let secondViewerTransport = try TabDocumentTransport(
+            snapshot: fixture.snapshot(
+                documentID: documentID,
+                environmentID: fixture.project.environmentID,
+                path: path,
+                dirtyState: .clean
+            ),
+            clientID: fixture.clientInstanceID
+        )
+        let documents = TabDocumentSequenceFactory(values: [
+            transport,
+            secondViewerTransport,
+        ])
         let files = TabFilePicker(values: [
             TabFileSelection(path: path, language: "swift"),
             TabFileSelection(path: path, language: "swift"),
@@ -538,7 +588,7 @@ final class TabCommandControllerTests: XCTestCase {
 
         let opened = try await [first, second]
         XCTAssertEqual(opened, [.file(documentID), .file(documentID)])
-        XCTAssertEqual(documents.calls.count, 1)
+        XCTAssertEqual(documents.calls.count, 2)
         let session = try XCTUnwrap(fixture.bridge.resolver.session(documentID: documentID))
         XCTAssertEqual(session.references.count, 2)
     }
@@ -690,7 +740,7 @@ final class TabCommandControllerTests: XCTestCase {
         let opened = try await opening.value
         XCTAssertEqual(retried, .complete)
         XCTAssertEqual(opened, .file(originalDocumentID))
-        XCTAssertEqual(documents.calls.count, 1)
+        XCTAssertEqual(documents.calls.count, 2)
         XCTAssertNil(fixture.bridge.resolver.session(documentID: duplicateDocumentID))
         XCTAssertEqual(
             fixture.bridge.resolver.session(documentID: originalDocumentID)?.references.count,
@@ -786,7 +836,7 @@ final class TabCommandControllerTests: XCTestCase {
         let opened = try await opening.value
         XCTAssertEqual(retryDisposition, .complete)
         XCTAssertEqual(opened, .file(originalDocumentID))
-        XCTAssertEqual(documents.calls.count, 1)
+        XCTAssertEqual(documents.calls.count, 2)
         XCTAssertEqual(controller.pendingRelocationTokens, [])
         controller.relocationRecoveryObserver = nil
     }
@@ -1367,6 +1417,9 @@ private actor TabDocumentTransport: DocumentDataTransport {
     private var remainingSnapshotFailures = 0
     private var saves = 0
     private var discards = 0
+    private var closes = 0
+    private var retained: [DocumentID] = []
+    private var released: [DocumentID] = []
     private var pauseOpen = false
     private var openPaused = false
     private var openPauseWaiter: CheckedContinuation<Void, Never>?
@@ -1443,6 +1496,9 @@ private actor TabDocumentTransport: DocumentDataTransport {
         discards += 1
         return current
     }
+    func retainViewer(documentID: DocumentID) { retained.append(documentID) }
+    func releaseViewer(documentID: DocumentID) { released.append(documentID) }
+    func closeDocument(documentID: DocumentID) { closes += 1 }
 
     func setPath(_ path: RelativePath) throws {
         current = try DocumentSnapshot(
@@ -1462,6 +1518,9 @@ private actor TabDocumentTransport: DocumentDataTransport {
     func failNextSnapshots(_ count: Int) { remainingSnapshotFailures = count }
     func saveCount() -> Int { saves }
     func discardCount() -> Int { discards }
+    func closeCount() -> Int { closes }
+    func retainedDocumentIDs() -> [DocumentID] { retained }
+    func releasedDocumentIDs() -> [DocumentID] { released }
 }
 
 @MainActor

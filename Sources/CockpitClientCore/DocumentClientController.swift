@@ -215,6 +215,29 @@ public actor DocumentClientController {
         }
     }
 
+    public func close() async {
+        let controlID = await acquireUncancellableControl()
+        defer {
+            releaseControl(controlID)
+            controlRequestStates.removeValue(forKey: controlID)
+        }
+        let documentID = authoritativeSnapshot?.documentID
+        state = .closed
+        environmentID = nil
+        path = nil
+        authoritativeSnapshot = nil
+        lease = nil
+        let abandoned = pendingEdits
+        pendingEdits.removeAll()
+        for pending in abandoned {
+            submitRequestStates[pending.id] = .completed
+            pending.continuation.resume(throwing: DocumentProtocolError.invalidValue)
+        }
+        if let documentID {
+            await transport.closeDocument(documentID: documentID)
+        }
+    }
+
     private func enqueue(_ pending: PendingEdit) {
         if case .cancelled = submitRequestStates[pending.id] {
             submitRequestStates[pending.id] = .completed
@@ -367,6 +390,26 @@ public actor DocumentClientController {
         } onCancel: {
             Task { await self.cancelControl(id) }
         }
+        return id
+    }
+
+    private func acquireUncancellableControl() async -> UUID {
+        let id = UUID()
+        controlRequestStates[id] = .queued
+        do {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                controlWaiters.append(ControlWaiter(
+                    id: id,
+                    order: takeOperationOrder(),
+                    continuation: continuation
+                ))
+                scheduleNextOperation()
+            }
+        } catch {
+            preconditionFailure("uncancellable document close failed: \(error)")
+        }
+        controlRequestStates[id] = .active
         return id
     }
 
