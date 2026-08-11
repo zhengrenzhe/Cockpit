@@ -452,6 +452,82 @@ import CockpitTerminalCore
     #expect(await supervisor.created?.workspaceRoot == "/private/tmp/Cockpit")
 }
 
+@Test func hostTerminalAgentSelectionUsesBookmarkOnClientBoundaryAndResolvedPathInternally() async throws {
+    let projectID = ProjectID()
+    let contextID = WorkspaceContextID.project(projectID)
+    let environmentID = EnvironmentID()
+    let bookmark = Data("agent-bookmark-fixture".utf8)
+    let resolvedExecutable = "/private/tmp/Cockpit-Fixtures/codex"
+    let intent = TerminalCreateRequest(
+        contextID: contextID,
+        environmentID: environmentID,
+        kind: .agent(.codex),
+        arguments: ["--resume", "task-17"],
+        terminalSize: try TerminalResize(validatingColumns: 100, rows: 30),
+        environmentOverrides: [:],
+        idempotencyKey: RequestID(),
+        selectedExecutableBookmark: bookmark
+    )
+    let wire = try JSONEncoder().encode(HostTerminalCommandRequest.create(intent))
+    let wireText = String(decoding: wire, as: UTF8.self)
+    #expect(wireText.contains(bookmark.base64EncodedString()))
+    #expect(!wireText.contains(resolvedExecutable))
+
+    let supervisor = RecordingTerminalSupervisorControl()
+    let service = WorkspaceTerminalService(
+        resolveContext: { requested in
+            #expect(requested == contextID)
+            return try ResolvedWorkspaceContext(
+                validating: contextID,
+                projectID: projectID,
+                conversationID: nil,
+                environmentID: environmentID,
+                workspaceRootIdentity: "root-id"
+            )
+        },
+        resolveWorkspaceRoot: { _ in "/private/tmp/Cockpit" },
+        resolveAgentExecutableBookmark: { value in
+            #expect(value == bookmark)
+            return resolvedExecutable
+        },
+        supervisor: supervisor
+    )
+
+    _ = try await service.perform(.create(intent))
+    #expect(await supervisor.created?.selectedExecutablePath == resolvedExecutable)
+}
+
+@Test func hostTerminalAgentSelectionRequiredReturnsTypedResponseWithoutPathErrorMetadata() async throws {
+    let fixture = try WorkspaceFixture()
+    let supervisor = RecordingTerminalSupervisorControl()
+    await supervisor.setCreateError(
+        TerminalSupervisorCreateError.agentExecutableSelectionRequired(.claude)
+    )
+    let service = WorkspaceTerminalService(
+        resolveContext: { _ in fixture.projectContext },
+        resolveWorkspaceRoot: { _ in "/private/tmp/Cockpit" },
+        resolveAgentExecutableBookmark: { _ in
+            Issue.record("bookmark resolver must not run without a selected bookmark")
+            return "/private/tmp/unexpected"
+        },
+        supervisor: supervisor
+    )
+    let request = TerminalCreateRequest(
+        contextID: fixture.projectContext.contextID,
+        environmentID: fixture.environmentID,
+        kind: .agent(.claude),
+        arguments: [],
+        terminalSize: try TerminalResize(validatingColumns: 90, rows: 28),
+        environmentOverrides: [:],
+        idempotencyKey: RequestID()
+    )
+
+    #expect(
+        try await service.perform(.create(request))
+            == .agentExecutableSelectionRequired(.claude)
+    )
+}
+
 @Test func hostTerminalResponsesRedactLaunchStateEndpointPathAndArchiveBytes() async throws {
     let fixture = try WorkspaceFixture()
     let contextID = fixture.projectContext.contextID
@@ -914,6 +990,7 @@ private actor RecordingTerminalSupervisorControl: TerminalSupervisorControlling 
     private var authorization: TerminalAttachAuthorization?
     private var inputLease: InputLeaseGrant?
     private var archiveURL: URL?
+    private var createError: (any Error)?
 
     func setRecords(_ records: [TerminalSessionRecord]) { self.records = records }
     func setAuthorization(_ authorization: TerminalAttachAuthorization) {
@@ -921,15 +998,33 @@ private actor RecordingTerminalSupervisorControl: TerminalSupervisorControlling 
     }
     func setInputLease(_ inputLease: InputLeaseGrant) { self.inputLease = inputLease }
     func setArchiveURL(_ archiveURL: URL) { self.archiveURL = archiveURL }
+    func setCreateError(_ error: any Error) { createError = error }
     func createResolved(_ request: ResolvedTerminalCreateRequest) async throws -> TerminalSessionRecord {
         created = request
+        if let createError { throw createError }
         if let first = records.first { return first }
+        let executablePath: String
+        switch request.kind {
+        case .shell:
+            executablePath = "/bin/zsh"
+        case .agent:
+            executablePath = request.selectedExecutablePath ?? "/usr/bin/true"
+        }
+        let launchSpec = try LaunchSpec(
+            kind: request.kind,
+            loginShellPath: "/bin/zsh",
+            executablePath: executablePath,
+            arguments: request.arguments,
+            workspaceRoot: request.workspaceRoot,
+            terminalSize: request.terminalSize,
+            environmentOverrides: request.environmentOverrides
+        )
         return try TerminalSessionRecord(
             validatingSessionID: TerminalSessionID(),
             contextID: request.contextID,
             environmentID: request.environmentID,
             protocolVersion: .current,
-            launchSpecData: Data([1]),
+            launchSpecData: JSONEncoder().encode(launchSpec),
             lifecycleState: .preparing,
             startNonce: Data(repeating: 3, count: 16)
         )

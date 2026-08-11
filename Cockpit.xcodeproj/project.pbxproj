@@ -28,18 +28,22 @@
 		07FECF87EDC303623C2C031A /* TerminalTabViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */; };
 		17E1FAF124AB3699D39183E8 /* FileTreeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72199350E653181BD3EB3C4 /* FileTreeViewController.swift */; };
 		212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
+		22EA011AF83B130CF389F9D3 /* ConversationCommandController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */; };
 		351D3D324BAED80562181E32 /* CockpitWorkspace in Frameworks */ = {isa = PBXBuildFile; productRef = 6B63A056B655604A5CAB68B6 /* CockpitWorkspace */; };
 		38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */; };
 		39069795D81C4857832CB0D5 /* WorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E864EDF8F667F282B715A /* WorkspaceWindowController.swift */; };
 		3B5CBAA8FBFB3F631C2F4EA7 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8EA676EB67971DEACE962407 /* CoreGraphics.framework */; };
+		463C67C9A8A5E45E198415C1 /* ProjectCommandControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 587C19468BF073BA4E77E04F /* ProjectCommandControllerTests.swift */; };
 		493D8CBE3E815C9A151FF0F3 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		4F386E5E70267D4642394E9A /* WorkspaceHierarchyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BF59ED429382282C6713FC1 /* WorkspaceHierarchyTests.swift */; };
+		527A91D10DC6D6779FDF0AF3 /* TabCommandControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1183768045AE445F258A4859 /* TabCommandControllerTests.swift */; };
 		5504EF2E91B30EAA53DE6A0E /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = DE5F175E55180A6CB6E41C96 /* CockpitHostCore */; };
 		591C5D12CD00A336A5410F70 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 98B021792EC132C38CE754AF /* CockpitLocalTransport */; };
 		5F406859AC1EF68C058E5F6D /* CoreText.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 967DA6F781A08A3775427A27 /* CoreText.framework */; };
 		60026EC79653E301CEE5491E /* CockpitHostCore in Frameworks */ = {isa = PBXBuildFile; productRef = 9F4222C3217C5CD667A61F57 /* CockpitHostCore */; };
 		636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E88B0BC4EEA46D8B82BE00 /* MonacoMessage.swift */; };
 		67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */; };
+		68E85917A1DEAC817192DAF1 /* ConversationCommandControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 345DA9F403FADE69A83C8512 /* ConversationCommandControllerTests.swift */; };
 		69E3BF81CBA08EB3D15300C4 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C3A65312477EAD5232A52B0 /* main.swift */; };
 		6D6EC2E47259CF1C9CD06F87 /* CockpitClientCore in Frameworks */ = {isa = PBXBuildFile; productRef = 805F46A4F8C9EE76A1A590E3 /* CockpitClientCore */; };
 		717C660DB30DD27E152966D1 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A9306517642B4E50E65EE7C /* Metal.framework */; };
@@ -52,6 +56,7 @@
 		995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BFB39C38A17E2083706555 /* AppDelegate.swift */; };
 		9981B72B37BDC5B5A74191ED /* CockpitTerminalClient in Frameworks */ = {isa = PBXBuildFile; productRef = 5A754E919142603676936801 /* CockpitTerminalClient */; };
 		9D5FC418CC572EF2C0D4BAC6 /* GhosttyVTAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F212D66BE21DB1B93B562CF /* GhosttyVTAdapter.swift */; };
+		A1340526403B5B92EFF4314D /* TabCommandController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */; };
 		A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
 		A7DFA31121D9E31C872E4793 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 41F1F75F27D0D4B661D8228C /* CockpitPersistence */; };
 		B35FEE05419E4A6A32CCC004 /* WorkspaceSidebarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5760D618B16CD0E88EF12499 /* WorkspaceSidebarController.swift */; };
@@ -65,6 +70,7 @@
 		D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */; };
 		DE1A356D6AFAC3DA1F075DCB /* CockpitTerminalCore in Frameworks */ = {isa = PBXBuildFile; productRef = 93F4B0E2D22242211D1B9075 /* CockpitTerminalCore */; };
 		E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */; };
+		EDBDC9E13ACCBDEEF9504871 /* ProjectCommandController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4DFCC4C543B9F5B3D87D2E1F /* ProjectCommandController.swift */; };
 		F2FA65E881BC08614E18A4F4 /* MonacoEditorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */; };
 		F3D27AB90F5E2D6B72AB3A5E /* WorkspaceViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5B374DCEC4748EA788BEEE2 /* WorkspaceViewModelTests.swift */; };
 		F61FCBEC5572862FE710A9E1 /* WorkspaceSplitViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57A7D9649155671F2B78038C /* WorkspaceSplitViewController.swift */; };
@@ -119,11 +125,13 @@
 
 /* Begin PBXFileReference section */
 		03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridgeTests.swift; sourceTree = "<group>"; };
+		1183768045AE445F258A4859 /* TabCommandControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabCommandControllerTests.swift; sourceTree = "<group>"; };
 		1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTabViewController.swift; sourceTree = "<group>"; };
 		23AAD691375B8C8DC385B733 /* GhosttyTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalView.swift; sourceTree = "<group>"; };
 		263DA7B80F345C7A4A093699 /* MonacoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridge.swift; sourceTree = "<group>"; };
 		2BF59ED429382282C6713FC1 /* WorkspaceHierarchyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceHierarchyTests.swift; sourceTree = "<group>"; };
 		2C3A65312477EAD5232A52B0 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		345DA9F403FADE69A83C8512 /* ConversationCommandControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationCommandControllerTests.swift; sourceTree = "<group>"; };
 		38288D3FCC85DFAAB98E11CB /* NewTabPickerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewTabPickerController.swift; sourceTree = "<group>"; };
 		3F212D66BE21DB1B93B562CF /* GhosttyVTAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyVTAdapter.swift; sourceTree = "<group>"; };
 		434FD56C66EABF9EB68397FE /* CockpitHost */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitHost; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -132,9 +140,11 @@
 		48DD68C2340D2B3D207AB36A /* MonacoRuntime.bundle */ = {isa = PBXFileReference; lastKnownFileType = folder; name = MonacoRuntime.bundle; path = EditorRuntime/dist/MonacoRuntime.bundle; sourceTree = SOURCE_ROOT; };
 		4B5AFD79708EC200DB637479 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		4C20796303E1E5A8E048F156 /* MonacoWindowSessionResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoWindowSessionResolver.swift; sourceTree = "<group>"; };
+		4DFCC4C543B9F5B3D87D2E1F /* ProjectCommandController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectCommandController.swift; sourceTree = "<group>"; };
 		521FA9CA3D31F33E20B0CC22 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		5760D618B16CD0E88EF12499 /* WorkspaceSidebarController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceSidebarController.swift; sourceTree = "<group>"; };
 		57A7D9649155671F2B78038C /* WorkspaceSplitViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceSplitViewController.swift; sourceTree = "<group>"; };
+		587C19468BF073BA4E77E04F /* ProjectCommandControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectCommandControllerTests.swift; sourceTree = "<group>"; };
 		5A9306517642B4E50E65EE7C /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		66551CF10D010C7EAD2F7ECF /* WorkspaceViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViewModel.swift; sourceTree = "<group>"; };
 		6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppTestScaffoldTests.swift; sourceTree = "<group>"; };
@@ -153,7 +163,9 @@
 		C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceStatusViewModel.swift; sourceTree = "<group>"; };
 		C4FA2BE19C1AAE871BA1097F /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		C5C87AF4E75B23201A214E82 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
+		C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationCommandController.swift; sourceTree = "<group>"; };
 		CA5E864EDF8F667F282B715A /* WorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceWindowController.swift; sourceTree = "<group>"; };
+		CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabCommandController.swift; sourceTree = "<group>"; };
 		DFD547040C5A1D676AFBC840 /* ContentHostController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentHostController.swift; sourceTree = "<group>"; };
 		E7CC18242186F71956E15599 /* CockpitPTYKeeper */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitPTYKeeper; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -232,9 +244,12 @@
 			children = (
 				A0BFB39C38A17E2083706555 /* AppDelegate.swift */,
 				DFD547040C5A1D676AFBC840 /* ContentHostController.swift */,
+				C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */,
 				B72199350E653181BD3EB3C4 /* FileTreeViewController.swift */,
 				38288D3FCC85DFAAB98E11CB /* NewTabPickerController.swift */,
+				4DFCC4C543B9F5B3D87D2E1F /* ProjectCommandController.swift */,
 				C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */,
+				CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */,
 				C230093E1E264CC2FD374D62 /* TabStripController.swift */,
 				5760D618B16CD0E88EF12499 /* WorkspaceSidebarController.swift */,
 				57A7D9649155671F2B78038C /* WorkspaceSplitViewController.swift */,
@@ -347,8 +362,11 @@
 			isa = PBXGroup;
 			children = (
 				6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */,
+				345DA9F403FADE69A83C8512 /* ConversationCommandControllerTests.swift */,
 				B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */,
 				03CFE05ED5FAE0544DEBFDFF /* MonacoBridgeTests.swift */,
+				587C19468BF073BA4E77E04F /* ProjectCommandControllerTests.swift */,
+				1183768045AE445F258A4859 /* TabCommandControllerTests.swift */,
 				2BF59ED429382282C6713FC1 /* WorkspaceHierarchyTests.swift */,
 				B5B374DCEC4748EA788BEEE2 /* WorkspaceViewModelTests.swift */,
 			);
@@ -617,6 +635,7 @@
 			files = (
 				995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */,
 				7F13BCE3D62D913A6C051792 /* ContentHostController.swift in Sources */,
+				22EA011AF83B130CF389F9D3 /* ConversationCommandController.swift in Sources */,
 				17E1FAF124AB3699D39183E8 /* FileTreeViewController.swift in Sources */,
 				FA281D4C5CEED0F7CDA552A8 /* GhosttyTerminalView.swift in Sources */,
 				BC6C1FA49B0AAE09EB84DF87 /* MonacoBridge.swift in Sources */,
@@ -624,7 +643,9 @@
 				636047E92D5F2E3E5F493341 /* MonacoMessage.swift in Sources */,
 				8BFCCDEEF23A54D74469E967 /* MonacoWindowSessionResolver.swift in Sources */,
 				B877D89767A2A9D7755ED7E2 /* NewTabPickerController.swift in Sources */,
+				EDBDC9E13ACCBDEEF9504871 /* ProjectCommandController.swift in Sources */,
 				E7F9727E3D6B46E9C5D54C32 /* ServiceStatusViewModel.swift in Sources */,
+				A1340526403B5B92EFF4314D /* TabCommandController.swift in Sources */,
 				CE310A5B431632FB0D2FA014 /* TabStripController.swift in Sources */,
 				07FECF87EDC303623C2C031A /* TerminalTabViewController.swift in Sources */,
 				B35FEE05419E4A6A32CCC004 /* WorkspaceSidebarController.swift in Sources */,
@@ -656,8 +677,11 @@
 			buildActionMask = 2147483647;
 			files = (
 				67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */,
+				68E85917A1DEAC817192DAF1 /* ConversationCommandControllerTests.swift in Sources */,
 				38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */,
 				D6E67DD9156648A4918D79F2 /* MonacoBridgeTests.swift in Sources */,
+				463C67C9A8A5E45E198415C1 /* ProjectCommandControllerTests.swift in Sources */,
+				527A91D10DC6D6779FDF0AF3 /* TabCommandControllerTests.swift in Sources */,
 				4F386E5E70267D4642394E9A /* WorkspaceHierarchyTests.swift in Sources */,
 				F3D27AB90F5E2D6B72AB3A5E /* WorkspaceViewModelTests.swift in Sources */,
 			);

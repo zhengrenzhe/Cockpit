@@ -127,10 +127,14 @@ public actor HostTerminalControlTransport: TerminalControlTransport {
     }
 
     public func create(_ request: TerminalCreateRequest) async throws -> ClientTerminalSession {
-        guard case let .session(value) = try await client.terminalCommand(.create(request)) else {
+        switch try await client.terminalCommand(.create(request)) {
+        case let .session(value):
+            return value
+        case let .agentExecutableSelectionRequired(profileID):
+            throw TerminalSupervisorCreateError.agentExecutableSelectionRequired(profileID)
+        default:
             throw CocoaError(.coderInvalidValue)
         }
-        return value
     }
 
     public func list() async throws -> [ClientTerminalSession] {

@@ -15,18 +15,24 @@ public actor WorkspaceTerminalService {
     public typealias WorkspaceRootResolver = @Sendable (
         ResolvedWorkspaceContext
     ) async throws -> String
+    public typealias AgentExecutableBookmarkResolver = @Sendable (Data) throws -> String
 
     private let resolveContext: ContextResolver
     private let resolveWorkspaceRoot: WorkspaceRootResolver
+    private let resolveAgentExecutableBookmark: AgentExecutableBookmarkResolver
     private let supervisor: any TerminalSupervisorControlling
 
     public init(
         resolveContext: @escaping ContextResolver,
         resolveWorkspaceRoot: @escaping WorkspaceRootResolver,
+        resolveAgentExecutableBookmark: @escaping AgentExecutableBookmarkResolver = { _ in
+            throw CocoaError(.fileReadInvalidFileName)
+        },
         supervisor: any TerminalSupervisorControlling
     ) {
         self.resolveContext = resolveContext
         self.resolveWorkspaceRoot = resolveWorkspaceRoot
+        self.resolveAgentExecutableBookmark = resolveAgentExecutableBookmark
         self.supervisor = supervisor
     }
 
@@ -40,23 +46,41 @@ public actor WorkspaceTerminalService {
                 environmentID: request.environmentID
             )
             let root = try await resolveWorkspaceRoot(context)
-            let record = try await supervisor.createResolved(
-                ResolvedTerminalCreateRequest(
-                    contextID: request.contextID,
-                    environmentID: request.environmentID,
-                    kind: request.kind,
-                    arguments: request.arguments,
-                    workspaceRoot: root,
-                    terminalSize: request.terminalSize,
-                    environmentOverrides: request.environmentOverrides,
-                    idempotencyKey: request.idempotencyKey
+            let selectedExecutablePath: String?
+            if let bookmark = request.selectedExecutableBookmark {
+                guard case .agent = request.kind else {
+                    throw WorkspaceTerminalServiceError.invalidResponse
+                }
+                selectedExecutablePath = try resolveAgentExecutableBookmark(bookmark)
+            } else {
+                selectedExecutablePath = nil
+            }
+            let record: TerminalSessionRecord
+            do {
+                record = try await supervisor.createResolved(
+                    ResolvedTerminalCreateRequest(
+                        contextID: request.contextID,
+                        environmentID: request.environmentID,
+                        kind: request.kind,
+                        arguments: request.arguments,
+                        workspaceRoot: root,
+                        terminalSize: request.terminalSize,
+                        environmentOverrides: request.environmentOverrides,
+                        idempotencyKey: request.idempotencyKey,
+                        selectedExecutablePath: selectedExecutablePath
+                    )
                 )
-            )
+            } catch let error as TerminalSupervisorCreateError {
+                guard case let .agentExecutableSelectionRequired(profileID) = error else {
+                    throw error
+                }
+                return .agentExecutableSelectionRequired(profileID)
+            }
             guard record.contextID == request.contextID,
                   record.environmentID == request.environmentID else {
                 throw WorkspaceTerminalServiceError.sessionBindingMismatch
             }
-            return .session(ClientTerminalSession(record))
+            return .session(try ClientTerminalSession(validating: record))
         case let .list(contextID):
             let context = try await resolveContext(contextID)
             guard context.contextID == contextID else {
@@ -68,7 +92,7 @@ public actor WorkspaceTerminalService {
             }) else {
                 throw WorkspaceTerminalServiceError.sessionBindingMismatch
             }
-            return .sessions(records.map(ClientTerminalSession.init))
+            return .sessions(try records.map(ClientTerminalSession.init(validating:)))
         case let .issueAttachTicket(contextID, environmentID, request):
             let record = try await validateSession(
                 request.sessionID,

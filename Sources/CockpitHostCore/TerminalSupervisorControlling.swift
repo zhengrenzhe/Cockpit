@@ -10,6 +10,7 @@ public struct TerminalCreateRequest: Hashable, Codable, Sendable {
     public let terminalSize: TerminalResize
     public let environmentOverrides: [String: String]
     public let idempotencyKey: RequestID
+    public let selectedExecutableBookmark: Data?
 
     public init(
         contextID: WorkspaceContextID,
@@ -18,7 +19,8 @@ public struct TerminalCreateRequest: Hashable, Codable, Sendable {
         arguments: [String],
         terminalSize: TerminalResize,
         environmentOverrides: [String: String],
-        idempotencyKey: RequestID
+        idempotencyKey: RequestID,
+        selectedExecutableBookmark: Data? = nil
     ) {
         self.contextID = contextID
         self.environmentID = environmentID
@@ -27,6 +29,7 @@ public struct TerminalCreateRequest: Hashable, Codable, Sendable {
         self.terminalSize = terminalSize
         self.environmentOverrides = environmentOverrides
         self.idempotencyKey = idempotencyKey
+        self.selectedExecutableBookmark = selectedExecutableBookmark
     }
 }
 
@@ -39,6 +42,7 @@ public struct ResolvedTerminalCreateRequest: Hashable, Codable, Sendable {
     public let terminalSize: TerminalResize
     public let environmentOverrides: [String: String]
     public let idempotencyKey: RequestID
+    public let selectedExecutablePath: String?
 
     public init(
         contextID: WorkspaceContextID,
@@ -48,7 +52,8 @@ public struct ResolvedTerminalCreateRequest: Hashable, Codable, Sendable {
         workspaceRoot: String,
         terminalSize: TerminalResize,
         environmentOverrides: [String: String],
-        idempotencyKey: RequestID
+        idempotencyKey: RequestID,
+        selectedExecutablePath: String? = nil
     ) {
         self.contextID = contextID
         self.environmentID = environmentID
@@ -58,7 +63,12 @@ public struct ResolvedTerminalCreateRequest: Hashable, Codable, Sendable {
         self.terminalSize = terminalSize
         self.environmentOverrides = environmentOverrides
         self.idempotencyKey = idempotencyKey
+        self.selectedExecutablePath = selectedExecutablePath
     }
+}
+
+public enum TerminalSupervisorCreateError: Error, Equatable, Sendable {
+    case agentExecutableSelectionRequired(AgentProfileID)
 }
 
 public struct TerminalAttachTicketRequest: Hashable, Codable, Sendable {
@@ -122,17 +132,23 @@ public struct ClientTerminalSession: Hashable, Codable, Sendable {
     public let protocolVersion: ProtocolVersion
     public let workerID: WorkerInstanceID?
     public let lifecycleState: TerminalLifecycleState
+    public let kind: TerminalKind
     public let exitStatus: Int32?
     public let latestSequence: UInt64
     public let archiveAvailable: Bool
 
-    public init(_ record: TerminalSessionRecord) {
+    public init(validating record: TerminalSessionRecord) throws {
+        let launchSpec = try JSONDecoder().decode(
+            LaunchSpec.self,
+            from: record.launchSpecData
+        )
         sessionID = record.sessionID
         contextID = record.contextID
         environmentID = record.environmentID
         protocolVersion = record.protocolVersion
         workerID = record.workerID
         lifecycleState = record.lifecycleState
+        kind = launchSpec.kind
         exitStatus = record.exitStatus
         latestSequence = record.latestSequence
         archiveAvailable = record.archiveManifest != nil
@@ -223,6 +239,7 @@ public enum TerminalSupervisorCommandResponse: Hashable, Codable, Sendable {
     case inputLease(InputLeaseGrant)
     case processGroup(Int32)
     case purged(Int)
+    case agentExecutableSelectionRequired(AgentProfileID)
     case empty
 }
 
@@ -274,5 +291,6 @@ public enum HostTerminalCommandResponse: Hashable, Codable, Sendable {
     case attachAuthorization(ClientTerminalAttachAuthorization)
     case inputLease(InputLeaseGrant)
     case processGroup(Int32)
+    case agentExecutableSelectionRequired(AgentProfileID)
     case empty
 }

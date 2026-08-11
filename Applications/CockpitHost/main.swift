@@ -43,6 +43,7 @@ let service = WorkspaceService(
     rootResolver: projectRootResolver,
     kernelRegistry: registry
 )
+let agentExecutableBookmarkResolver = SecurityScopedExecutableBookmarkResolver()
 let router = WorkspaceCommandRouter(service: service)
 let ticketStore = HostDataPlaneTicketStore()
 let dataPlaneService = WorkspaceHostDataPlaneService(
@@ -72,6 +73,7 @@ let terminalService = WorkspaceTerminalService(
         }
         return root.canonicalAbsolutePath
     },
+    resolveAgentExecutableBookmark: agentExecutableBookmarkResolver.resolve,
     supervisor: terminalSupervisor
 )
 let exported = HostXPCExport(

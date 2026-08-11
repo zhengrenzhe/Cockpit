@@ -118,7 +118,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     contextID: active.contextID,
                     environmentID: active.environmentID,
                     clientInstanceID: clientInstanceID,
-                    hostClient: hostClient
+                    hostClient: hostClient,
+                    restart: { [weak viewModel] sessionID, profileID in
+                        guard let viewModel else { throw CancellationError() }
+                        try await viewModel.restartTerminalTab(
+                            tab.id,
+                            replacing: sessionID,
+                            switchingTo: profileID
+                        )
+                    }
                 )
             }
         )

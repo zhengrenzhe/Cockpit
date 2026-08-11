@@ -89,7 +89,14 @@ private actor TerminalSupervisorCommandService {
     ) async throws -> TerminalSupervisorCommandResponse {
         switch command {
         case let .createResolved(request):
-            return .session(try await createResolved(request))
+            do {
+                return .session(try await createResolved(request))
+            } catch AgentExecutableResolverError.agentExecutableSelectionRequired {
+                guard case let .agent(profileID) = request.kind else {
+                    throw AgentExecutableResolverError.agentExecutableSelectionRequired
+                }
+                return .agentExecutableSelectionRequired(profileID)
+            }
         case let .list(contextID):
             return .sessions(try await repository.records(contextID: contextID))
         case let .issueAttachTicket(request):
@@ -145,7 +152,8 @@ private actor TerminalSupervisorCommandService {
         case let .agent(profileID):
             executable = try await AgentExecutableResolver(repository: repository).resolve(
                 profileID: profileID,
-                loginShellPath: loginShell
+                loginShellPath: loginShell,
+                selectedExecutablePath: request.selectedExecutablePath
             )
         }
         let launch = try LaunchSpec(

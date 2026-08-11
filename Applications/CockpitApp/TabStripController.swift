@@ -1,27 +1,56 @@
 import AppKit
 import CockpitTypes
 
+struct WorkspaceTabCloseBinding: Hashable {
+    let tab: WorkspaceTab
+    let activeContext: ActiveContext
+}
+
 @MainActor
-private final class WorkspaceTabCollectionItem: NSCollectionViewItem {
+final class WorkspaceTabCollectionItem: NSCollectionViewItem {
     static let identifier = NSUserInterfaceItemIdentifier("workspace-tab")
     private let label = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
+    private var closeBinding: WorkspaceTabCloseBinding?
+    private var onClose: (@MainActor (WorkspaceTabCloseBinding) -> Void)?
 
     override func loadView() {
         let container = NSView()
         label.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingTail
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.title = "×"
+        closeButton.isBordered = false
+        closeButton.identifier = NSUserInterfaceItemIdentifier("workspace-tab-close")
+        closeButton.target = self
+        closeButton.action = #selector(closeTab(_:))
         container.addSubview(label)
+        container.addSubview(closeButton)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -4),
             label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+            closeButton.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 20),
         ])
         view = container
     }
 
-    func configure(title: String) {
+    func configure(
+        title: String,
+        closeBinding: WorkspaceTabCloseBinding,
+        onClose: @escaping @MainActor (WorkspaceTabCloseBinding) -> Void
+    ) {
         loadViewIfNeeded()
         label.stringValue = title
+        self.closeBinding = closeBinding
+        self.onClose = onClose
+    }
+
+    @objc private func closeTab(_ sender: NSButton) {
+        guard let closeBinding else { return }
+        onClose?(closeBinding)
     }
 }
 
@@ -69,7 +98,19 @@ final class TabStripController: NSViewController, NSCollectionViewDelegate {
                 withIdentifier: WorkspaceTabCollectionItem.identifier,
                 for: indexPath
             ) as? WorkspaceTabCollectionItem else { return nil }
-            item.configure(title: self?.title(for: tabID) ?? "Tab")
+            if let self,
+               let tab = self.tabsByID[tabID],
+               let activeContext = self.activeContext
+            {
+                item.configure(
+                    title: self.title(for: tabID),
+                    closeBinding: WorkspaceTabCloseBinding(
+                        tab: tab,
+                        activeContext: activeContext
+                    ),
+                    onClose: { [weak self] binding in self?.requestClose(binding) }
+                )
+            }
             return item
         }
         self.dataSource = dataSource
@@ -141,6 +182,23 @@ final class TabStripController: NSViewController, NSCollectionViewDelegate {
             guard let self else { return }
             do {
                 try await viewModel.selectTab(tabID)
+            } catch is CancellationError {
+                return
+            } catch {
+                NSApp.presentError(error)
+            }
+        }
+    }
+
+    private func requestClose(_ binding: WorkspaceTabCloseBinding) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await viewModel.closeTab(
+                    binding.tab.id,
+                    expectedTab: binding.tab,
+                    in: binding.activeContext
+                )
             } catch is CancellationError {
                 return
             } catch {

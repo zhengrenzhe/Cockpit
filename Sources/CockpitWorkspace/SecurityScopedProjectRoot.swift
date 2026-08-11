@@ -56,6 +56,36 @@ private struct FoundationSecurityScopedBookmarkAccess: SecurityScopedBookmarkAcc
     }
 }
 
+public struct SecurityScopedExecutableBookmarkResolver: Sendable {
+    private let boundary: any SecurityScopedBookmarkAccessing
+
+    public init() {
+        boundary = FoundationSecurityScopedBookmarkAccess()
+    }
+
+    init(boundary: any SecurityScopedBookmarkAccessing) {
+        self.boundary = boundary
+    }
+
+    public func resolve(bookmark: Data) throws -> String {
+        let resolution = try boundary.resolve(
+            bookmark: bookmark,
+            options: [.withSecurityScope, .withoutImplicitStartAccessing]
+        )
+        guard !resolution.isStale else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        guard boundary.startAccessing(resolution.url) else {
+            throw CocoaError(.fileReadNoPermission)
+        }
+        defer { boundary.stopAccessing(resolution.url) }
+        return resolution.url
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+    }
+}
+
 public struct SecurityScopedProjectRootResolver: ProjectRootResolving {
     private let boundary: any SecurityScopedBookmarkAccessing
 

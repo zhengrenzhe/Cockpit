@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import XCTest
+import CockpitHostCore
 import CockpitTerminalCore
 import CockpitTerminalClient
 import CockpitTypes
@@ -335,6 +336,172 @@ final class GhosttyTerminalViewTests: XCTestCase {
         XCTAssertEqual(renderer.presentationAttempts, attemptsAtTearDown)
     }
 
+    func testFinalArchiveSnapshotReplacesLiveViewportWithoutInventingAResumeSequence() throws {
+        let renderer = RecordingGhosttyRenderer()
+        let view = GhosttyTerminalView(renderer: renderer)
+        let window = TestOcclusionWindow(contentView: view)
+        window.testOcclusionState = [.visible]
+        view.isTerminalActive = true
+        let sessionID = TerminalSessionID()
+        view.beginSession(sessionID, preservingAcknowledgedSequence: nil)
+        view.apply(
+            try TerminalOutputFrame(
+                firstOutputSequence: 7,
+                outputSequence: 7,
+                kind: .snapshot,
+                fragments: [Data("live".utf8)]
+            )
+        )
+
+        try view.applyFinalSnapshot(Data("final".utf8), for: sessionID)
+
+        XCTAssertEqual(renderer.applied, [Data("live".utf8), Data("final".utf8)])
+        XCTAssertNil(view.resumableAcknowledgement(for: sessionID, requested: 7))
+    }
+
+    func testNaturalAgentExitLoadsFinalArchiveShowsExitCodeAndSerializesRestartActions() async throws {
+        let renderer = RecordingGhosttyRenderer()
+        let terminalView = GhosttyTerminalView(renderer: renderer)
+        let window = TestOcclusionWindow(contentView: terminalView)
+        window.testOcclusionState = [.visible]
+        terminalView.isTerminalActive = true
+        let sessionID = TerminalSessionID()
+        let live = try terminalClientSession(
+            sessionID: sessionID,
+            lifecycle: .running,
+            kind: .agent(.codex)
+        )
+        let finished = try terminalClientSession(
+            sessionID: sessionID,
+            lifecycle: .exited,
+            kind: .agent(.codex),
+            exitStatus: 23,
+            latestSequence: 8,
+            archiveAvailable: true
+        )
+        let lifecycle = TerminalTabLifecycleRecorder(
+            listResults: [[live], [finished]],
+            archiveData: Data("final-agent-screen".utf8)
+        )
+        let liveFrame = try TerminalOutputFrame(
+            firstOutputSequence: 1,
+            outputSequence: 1,
+            kind: .snapshot,
+            fragments: [Data("live-agent-screen".utf8)]
+        )
+        let controller = TerminalAttachmentController(
+            clientInstanceID: ClientInstanceID(),
+            requestedCapabilities: [.view],
+            controlTransport: ImmediateTerminalControlTransport(),
+            dataTransport: FiniteTerminalDataTransport(
+                connection: FiniteTerminalDataConnection(frames: [liveFrame])
+            )
+        )
+        let tab = TerminalTabViewController(
+            attachmentController: controller,
+            terminalView: terminalView,
+            sessionList: lifecycle.list,
+            archiveOpen: lifecycle.openArchive,
+            restart: lifecycle.restart
+        )
+        tab.loadViewIfNeeded()
+
+        try await tab.attach(sessionID: sessionID, lastAcknowledgedSequence: nil)
+        for _ in 0..<200 where !renderer.applied.contains(Data("final-agent-screen".utf8)) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertEqual(renderer.applied.last, Data("final-agent-screen".utf8))
+        XCTAssertNil(terminalView.resumableAcknowledgement(for: sessionID, requested: 8))
+        let status: NSTextField? = descendant(
+            in: tab.view,
+            identifier: "terminal-exit-status"
+        )
+        XCTAssertTrue(status?.stringValue.contains("23") == true)
+        let restart: NSButton? = descendant(
+            in: tab.view,
+            identifier: "terminal-restart"
+        )
+        let switchAgent: NSButton? = descendant(
+            in: tab.view,
+            identifier: "terminal-switch-agent"
+        )
+        guard let restart, let switchAgent else {
+            return XCTFail("expected restart and switch-agent controls")
+        }
+
+        lifecycle.pauseNextRestart()
+        restart.performClick(nil)
+        await lifecycle.waitUntilRestartPaused()
+        restart.performClick(nil)
+        XCTAssertEqual(lifecycle.restartCalls.count, 1)
+        XCTAssertEqual(lifecycle.restartCalls.first?.sessionID, sessionID)
+        XCTAssertNil(lifecycle.restartCalls.first?.profileID)
+        lifecycle.resumeRestart()
+        for _ in 0..<200 where !restart.isEnabled {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        switchAgent.performClick(nil)
+        for _ in 0..<200 where lifecycle.restartCalls.count < 2 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(lifecycle.restartCalls.last?.sessionID, sessionID)
+        XCTAssertEqual(lifecycle.restartCalls.last?.profileID, .claude)
+        tab.detach()
+    }
+
+    func testAttachFailureRechecksDurableStateAndShowsTheFinalArchive() async throws {
+        let renderer = RecordingGhosttyRenderer()
+        let terminalView = GhosttyTerminalView(renderer: renderer)
+        let window = TestOcclusionWindow(contentView: terminalView)
+        window.testOcclusionState = [.visible]
+        terminalView.isTerminalActive = true
+        let sessionID = TerminalSessionID()
+        let live = try terminalClientSession(
+            sessionID: sessionID,
+            lifecycle: .running,
+            kind: .agent(.claude)
+        )
+        let finished = try terminalClientSession(
+            sessionID: sessionID,
+            lifecycle: .exited,
+            kind: .agent(.claude),
+            exitStatus: 9,
+            latestSequence: 3,
+            archiveAvailable: true
+        )
+        let lifecycle = TerminalTabLifecycleRecorder(
+            listResults: [[live], [finished]],
+            archiveData: Data("race-final-screen".utf8)
+        )
+        let tab = TerminalTabViewController(
+            attachmentController: TerminalAttachmentController(
+                clientInstanceID: ClientInstanceID(),
+                requestedCapabilities: [.view],
+                controlTransport: ImmediateTerminalControlTransport(),
+                dataTransport: FailingTerminalDataTransport()
+            ),
+            terminalView: terminalView,
+            sessionList: lifecycle.list,
+            archiveOpen: lifecycle.openArchive,
+            restart: lifecycle.restart
+        )
+        tab.loadViewIfNeeded()
+
+        var attachError: (any Error)?
+        do {
+            try await tab.attach(sessionID: sessionID, lastAcknowledgedSequence: nil)
+        } catch {
+            attachError = error
+        }
+
+        XCTAssertNil(attachError)
+        XCTAssertEqual(renderer.applied, [Data("race-final-screen".utf8)])
+        XCTAssertEqual(lifecycle.listCallCount, 2)
+        XCTAssertEqual(lifecycle.archiveRequests, [sessionID])
+        tab.detach()
+    }
+
     func testTerminalTabAttachSubscribesBeforeImmediateInitialFrame() async throws {
         let renderer = RecordingGhosttyRenderer()
         let terminalView = GhosttyTerminalView(renderer: renderer)
@@ -652,6 +819,70 @@ private final class RecordingGhosttyRenderer: GhosttyRendererDriving {
 }
 
 @MainActor
+private final class TerminalTabLifecycleRecorder {
+    struct RestartCall: Equatable {
+        let sessionID: TerminalSessionID
+        let profileID: AgentProfileID?
+    }
+
+    private var listResults: [[ClientTerminalSession]]
+    private let archiveData: Data
+    private var pauseRestart = false
+    private var restartPaused = false
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+    private var resumeWaiter: CheckedContinuation<Void, Never>?
+    private(set) var listCallCount = 0
+    private(set) var archiveRequests: [TerminalSessionID] = []
+    private(set) var restartCalls: [RestartCall] = []
+
+    init(listResults: [[ClientTerminalSession]], archiveData: Data) {
+        self.listResults = listResults
+        self.archiveData = archiveData
+    }
+
+    func list() -> [ClientTerminalSession] {
+        listCallCount += 1
+        if listResults.count == 1 { return listResults[0] }
+        return listResults.removeFirst()
+    }
+
+    func openArchive(_ sessionID: TerminalSessionID) throws -> FileHandle {
+        archiveRequests.append(sessionID)
+        let pipe = Pipe()
+        try pipe.fileHandleForWriting.write(contentsOf: archiveData)
+        try pipe.fileHandleForWriting.close()
+        return pipe.fileHandleForReading
+    }
+
+    func pauseNextRestart() { pauseRestart = true }
+
+    func waitUntilRestartPaused() async {
+        if restartPaused { return }
+        await withCheckedContinuation { pauseWaiter = $0 }
+    }
+
+    func resumeRestart() {
+        resumeWaiter?.resume()
+        resumeWaiter = nil
+    }
+
+    func restart(
+        _ sessionID: TerminalSessionID,
+        _ profileID: AgentProfileID?
+    ) async {
+        restartCalls.append(.init(sessionID: sessionID, profileID: profileID))
+        if pauseRestart {
+            pauseRestart = false
+            restartPaused = true
+            pauseWaiter?.resume()
+            pauseWaiter = nil
+            await withCheckedContinuation { resumeWaiter = $0 }
+            restartPaused = false
+        }
+    }
+}
+
+@MainActor
 private final class FailingSecondFragmentGhosttyRenderer: GhosttyRendererDriving {
     private(set) var attempted: [Data] = []
     private(set) var visibility: [Bool] = []
@@ -793,6 +1024,41 @@ private struct ImmediateTerminalDataTransport: TerminalDataTransport {
     }
 }
 
+private struct FailingTerminalDataTransport: TerminalDataTransport {
+    func attach(
+        authorization: TerminalAttachAuthorization,
+        lastAcknowledgedSequence: UInt64?
+    ) async throws -> any TerminalDataConnection {
+        throw CocoaError(.fileReadUnknown)
+    }
+}
+
+private struct FiniteTerminalDataTransport: TerminalDataTransport {
+    let connection: FiniteTerminalDataConnection
+
+    func attach(
+        authorization: TerminalAttachAuthorization,
+        lastAcknowledgedSequence: UInt64?
+    ) async throws -> any TerminalDataConnection {
+        connection
+    }
+}
+
+private actor FiniteTerminalDataConnection: TerminalDataConnection {
+    private var frames: [TerminalOutputFrame]
+
+    init(frames: [TerminalOutputFrame]) { self.frames = frames }
+
+    func nextOutput() async throws -> TerminalOutputFrame? {
+        guard !frames.isEmpty else { return nil }
+        return frames.removeFirst()
+    }
+
+    func send(_ input: TerminalInput) async throws -> UInt64 { input.inputSequence }
+    func setVisible(_ visible: Bool) async throws {}
+    func detach() async {}
+}
+
 private actor RecordingTerminalDataTransport: TerminalDataTransport {
     let connection: ImmediateTerminalDataConnection
     private var receivedAcknowledgements: [UInt64?] = []
@@ -904,4 +1170,54 @@ private actor ImmediateTerminalDataConnection: TerminalDataConnection {
         waiter?.resume(returning: nil)
         waiter = nil
     }
+}
+
+@MainActor
+private func descendant<View: NSView>(
+    in root: NSView,
+    identifier: String
+) -> View? {
+    if root.identifier?.rawValue == identifier, let value = root as? View {
+        return value
+    }
+    for subview in root.subviews {
+        if let value: View = descendant(in: subview, identifier: identifier) {
+            return value
+        }
+    }
+    return nil
+}
+
+private func terminalClientSession(
+    sessionID: TerminalSessionID,
+    lifecycle: TerminalLifecycleState,
+    kind: TerminalKind,
+    exitStatus: Int32? = nil,
+    latestSequence: UInt64 = 0,
+    archiveAvailable: Bool = false
+) throws -> ClientTerminalSession {
+    let launchSpec = try LaunchSpec(
+        kind: kind,
+        loginShellPath: "/bin/zsh",
+        executablePath: kind == .shell ? "/bin/zsh" : "/usr/bin/true",
+        arguments: [],
+        workspaceRoot: "/tmp",
+        terminalSize: TerminalResize(validatingColumns: 80, rows: 24),
+        environmentOverrides: [:]
+    )
+    return try ClientTerminalSession(validating: TerminalSessionRecord(
+        validatingSessionID: sessionID,
+        contextID: .project(ProjectID()),
+        environmentID: EnvironmentID(),
+        protocolVersion: .current,
+        launchSpecData: JSONEncoder().encode(launchSpec),
+        lifecycleState: lifecycle,
+        startNonce: Data(repeating: 1, count: 16),
+        workerID: WorkerInstanceID(),
+        exitStatus: exitStatus,
+        latestSequence: latestSequence,
+        archiveManifest: archiveAvailable
+            ? try RelativeArchivePath(validating: "\(sessionID)/manifest.json")
+            : nil
+    ))
 }

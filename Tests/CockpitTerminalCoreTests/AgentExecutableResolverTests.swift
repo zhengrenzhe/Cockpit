@@ -65,6 +65,55 @@ struct AgentExecutableResolverTests {
         #expect(await calls.values.isEmpty)
     }
 
+    @Test func selectedExecutableIsCanonicalizedPersistedAndSkipsLoginShellResolution() async throws {
+        let repository = MemoryAgentExecutableRepository()
+        let fixture = try fixtureExecutable(named: "codex")
+        let calls = AgentCommandCalls()
+        let resolver = AgentExecutableResolver(
+            repository: repository,
+            effectiveUserID: geteuid(),
+            commandRunner: { executable, arguments, environment in
+                await calls.append(
+                    executable: executable,
+                    arguments: arguments,
+                    environment: environment
+                )
+                return "unexpected"
+            }
+        )
+
+        let result = try await resolver.resolve(
+            profileID: .codex,
+            loginShellPath: "/bin/zsh",
+            selectedExecutablePath: fixture.path
+        )
+
+        #expect(result == fixture.path)
+        #expect(await repository.canonicalExecutable(for: .codex) == fixture.path)
+        #expect(await calls.values.isEmpty)
+
+        let symlink = fixture.deletingLastPathComponent()
+            .appendingPathComponent("selected-codex-link")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: fixture)
+        defer { try? FileManager.default.removeItem(at: symlink) }
+        #expect(try await resolver.resolve(
+            profileID: .codex,
+            loginShellPath: "/bin/zsh",
+            selectedExecutablePath: symlink.path
+        ) == fixture.path)
+        #expect(await repository.canonicalExecutable(for: .codex) == fixture.path)
+
+        await #expect(throws: AgentExecutableResolverError.agentExecutableSelectionRequired) {
+            _ = try await resolver.resolve(
+                profileID: .codex,
+                loginShellPath: "/bin/zsh",
+                selectedExecutablePath: fixture.deletingLastPathComponent().path
+            )
+        }
+        #expect(await repository.canonicalExecutable(for: .codex) == fixture.path)
+        #expect(await calls.values.isEmpty)
+    }
+
     @Test func launchSpecBuildsOnlyFrozenShellAndAgentArgv() throws {
         let size = try TerminalResize(validatingColumns: 100, rows: 40)
         let shell = try LaunchSpec(

@@ -2,6 +2,8 @@ import Foundation
 import CockpitClientCore
 import CockpitHostCore
 import CockpitLocalTransport
+import CockpitProtocol
+import CockpitTerminalCore
 import CockpitTypes
 
 enum WorkspaceViewModelError: Error, Equatable {
@@ -11,6 +13,15 @@ enum WorkspaceViewModelError: Error, Equatable {
     case invalidTabKind
     case relocationUnavailable
     case tabCommandUnavailable
+    case commandInFlight
+    case staleTerminalSession
+}
+
+private enum WorkspaceCommandAdmission: Hashable {
+    case addProject
+    case createConversation
+    case newTab(WorkspaceContextID, TabID)
+    case restart(WorkspaceContextID, TabID, TerminalSessionID)
 }
 
 @MainActor
@@ -225,6 +236,7 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
     let windowID: WindowID
     let clientInstanceID: ClientInstanceID
     let commandDependencies: WorkspaceCommandDependencies?
+    let tabCommands: (any TabCommanding)?
 
     private(set) var projects: WorkspaceSnapshot = []
     private(set) var sidebarItems: [WorkspaceSidebarItem] = []
@@ -235,8 +247,18 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
     private var selectionRequest: UInt64 = 0
     private var tabSelectionRequest: UInt64 = 0
     private var workspaceLoadRequest: UInt64 = 0
+    private var tabStatePublications: [ClientWorkspaceStateKey: UInt64] = [:]
+    private var commandAdmissions: Set<WorkspaceCommandAdmission> = []
     private var changeHandler: (@MainActor () -> Void)?
     private let fileSelection: WorkspaceFileSelectionHandler
+    private let projectDirectoryPicker: ProjectDirectoryPicker
+    private let conversationProfilePicker: ConversationAgentProfilePicker
+    // Module-internal deterministic observation seam used only by @testable tests.
+    // The production nil path performs no callback or suspension.
+    var tabStatePublicationObserver: (@MainActor @Sendable (
+        ClientWorkspaceStateKey,
+        UInt64
+    ) async -> Void)?
 
     init(
         workspaceService: any WorkspaceServing,
@@ -246,6 +268,9 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         windowID: WindowID,
         clientInstanceID: ClientInstanceID,
         commandDependencies: WorkspaceCommandDependencies? = nil,
+        tabCommands: (any TabCommanding)? = nil,
+        projectDirectoryPicker: @escaping ProjectDirectoryPicker = ProjectCommandController.appKitDirectoryPicker,
+        conversationProfilePicker: @escaping ConversationAgentProfilePicker = ConversationCommandController.appKitProfilePicker,
         fileSelection: @escaping WorkspaceFileSelectionHandler
     ) {
         self.workspaceService = workspaceService
@@ -255,7 +280,59 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         self.windowID = windowID
         self.clientInstanceID = clientInstanceID
         self.commandDependencies = commandDependencies
+        if let tabCommands {
+            self.tabCommands = tabCommands
+        } else if let commandDependencies {
+            let hostClient = commandDependencies.hostClient
+            let bridge = commandDependencies.monacoBridge
+            self.tabCommands = TabCommandController(
+                workspaceService: hostClient,
+                bridge: bridge,
+                clientInstanceID: clientInstanceID,
+                windowID: windowID,
+                activeContext: { contextID in
+                    guard let active = await activeContexts.current(),
+                          active.contextID == contextID
+                    else { throw CancellationError() }
+                    return active
+                },
+                terminalCreate: { active, request in
+                    try await HostTerminalControlTransport(
+                        client: hostClient,
+                        contextID: active.contextID,
+                        environmentID: active.environmentID
+                    ).create(request)
+                },
+                terminalList: { active in
+                    try await HostTerminalControlTransport(
+                        client: hostClient,
+                        contextID: active.contextID,
+                        environmentID: active.environmentID
+                    ).list()
+                },
+                documentTransportFactory: { active in
+                    HostDataPlaneClient(
+                        binding: try HostDataPlaneBinding(
+                            validatingClientInstanceID: clientInstanceID,
+                            windowID: windowID,
+                            workspaceContextID: active.contextID,
+                            environmentID: active.environmentID,
+                            activeContextGeneration: active.generation
+                        ),
+                        xpcClient: hostClient
+                    )
+                },
+                filePicker: TabCommandController.appKitFilePicker,
+                executablePicker: TabCommandController.appKitExecutablePicker,
+                detachedTerminalPicker: TabCommandController.appKitDetachedTerminalPicker,
+                dirtyFileCloseDecision: TabCommandController.appKitDirtyFileCloseDecision
+            )
+        } else {
+            self.tabCommands = nil
+        }
         self.fileSelection = fileSelection
+        self.projectDirectoryPicker = projectDirectoryPicker
+        self.conversationProfilePicker = conversationProfilePicker
     }
 
     func setChangeHandler(_ handler: @escaping @MainActor () -> Void) {
@@ -274,6 +351,66 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
                 + project.conversations.map { .conversation($0.id) }
         }
         notifyChange()
+    }
+
+    @discardableResult
+    func addProject() async throws -> ProjectSnapshot? {
+        try await withCommandAdmission(.addProject) {
+            let admittedSelection = selectionRequest
+            let controller = ProjectCommandController(
+                workspaceService: workspaceService,
+                directoryPicker: projectDirectoryPicker,
+                projectCreated: { [weak self] _ in
+                    guard let self else { throw CancellationError() }
+                    try await self.loadWorkspace()
+                },
+                selectContext: { [weak self] contextID in
+                    guard let self,
+                          self.selectionRequest == admittedSelection
+                    else { throw CancellationError() }
+                    _ = try await self.selectContext(contextID)
+                }
+            )
+            return try await controller.addProject()
+        }
+    }
+
+    @discardableResult
+    func createConversation(projectID: ProjectID) async throws -> Conversation? {
+        try await withCommandAdmission(.createConversation) {
+            let admittedSelection = selectionRequest
+            let controller = ConversationCommandController(
+                workspaceService: workspaceService,
+                profilePicker: conversationProfilePicker,
+                conversationCreated: { [weak self] _ in
+                    guard let self else { throw CancellationError() }
+                    try await self.loadWorkspace()
+                },
+                selectContext: { [weak self] contextID in
+                    guard let self,
+                          self.selectionRequest == admittedSelection
+                    else { throw CancellationError() }
+                    return try await self.selectContext(contextID)
+                },
+                launchFirstAgent: { [weak self] _, active, profileID in
+                    guard let self else { throw CancellationError() }
+                    let tabID = try await self.openNewTabPicker()
+                    let option: NewTabPickerOption = profileID == .codex ? .codex : .claude
+                    try await self.routeNewTabPickerChoice(
+                        option,
+                        tabID: tabID,
+                        contextID: active.contextID
+                    )
+                },
+                presentLaunchFailure: { _, _, _ in }
+            )
+            return try await controller.createConversation(projectID: projectID)
+        }
+    }
+
+    func renameConversation(id: ConversationID, title: String) async throws {
+        try await workspaceService.renameConversation(id: id, title: title)
+        try await loadWorkspace()
     }
 
     @discardableResult
@@ -320,6 +457,12 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
     @discardableResult
     func openNewTabPicker() async throws -> TabID {
         let active = try requireActiveContext()
+        return try await openNewTabPicker(in: active)
+    }
+
+    @discardableResult
+    func openNewTabPicker(in active: ActiveContext) async throws -> TabID {
+        guard activeContext == active else { throw CancellationError() }
         let initial = try await state(for: active.contextID)
         try await requireAccepted(active)
 
@@ -339,9 +482,8 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
                 selectedTabID: tabID
             )
         }
-        try await requireAccepted(active)
-
-        applyCurrentState(state)
+        let publication = reserveTabStatePublication(for: state.key)
+        await publishCurrentState(state, in: active, publication: publication)
         return tabID
     }
 
@@ -353,6 +495,14 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
             throw WorkspaceViewModelError.invalidTabKind
         }
         let active = try requireActiveContext()
+        try await replaceNewTabPicker(tabID, with: kind, in: active)
+    }
+
+    private func replaceNewTabPicker(
+        _ tabID: TabID,
+        with kind: WorkspaceTabKind,
+        in active: ActiveContext
+    ) async throws {
         let initial = try await state(for: active.contextID)
         try await requireAccepted(active)
         let state = try await stateCoordinator.mutate(
@@ -377,9 +527,8 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
                 selectedTabID: tabID
             )
         }
-        try await requireAccepted(active)
-
-        applyCurrentState(state)
+        let publication = reserveTabStatePublication(for: state.key)
+        await publishCurrentState(state, in: active, publication: publication)
     }
 
     func cancelNewTabPicker(_ tabID: TabID) async throws {
@@ -406,9 +555,8 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
                 selectedTabID: selected
             )
         }
-        try await requireAccepted(active)
-
-        applyCurrentState(state)
+        let publication = reserveTabStatePublication(for: state.key)
+        await publishCurrentState(state, in: active, publication: publication)
     }
 
     func selectTab(_ tabID: TabID) async throws {
@@ -438,9 +586,9 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
                 selectedTabID: tabID
             )
         }
+        let publication = reserveTabStatePublication(for: state.key)
         guard request == tabSelectionRequest else { throw CancellationError() }
-        try await requireAccepted(active)
-        applyCurrentState(state)
+        await publishCurrentState(state, in: active, publication: publication)
     }
 
     func routeNewTabPickerChoice(
@@ -454,17 +602,130 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
                   $0.id == tabID && $0.kind == .newTabPicker
               })
         else { throw WorkspaceViewModelError.newTabPickerRequired }
-        _ = option
-        throw WorkspaceViewModelError.tabCommandUnavailable
+        guard let tabCommands else { throw WorkspaceViewModelError.tabCommandUnavailable }
+        try await withCommandAdmission(.newTab(contextID, tabID)) {
+            var uncommittedKind: WorkspaceTabKind?
+            do {
+                let kind: WorkspaceTabKind
+                if option == .reattach {
+                    let attached = Set(currentTabs.compactMap(\.kind.terminalSessionID))
+                    kind = try await tabCommands.reattachTerminal(
+                        in: active,
+                        excluding: attached
+                    )
+                } else {
+                    kind = try await tabCommands.createTab(
+                        for: option,
+                        tabID: tabID,
+                        in: active
+                    )
+                }
+                uncommittedKind = kind
+                try await requireAccepted(active)
+                try await replaceNewTabPicker(tabID, with: kind, in: active)
+                uncommittedKind = nil
+            } catch {
+                if case let .file(documentID) = uncommittedKind,
+                   let transient = try? WorkspaceTab(
+                       record: TabRecord(
+                           validatingID: tabID,
+                           resource: .file(documentID),
+                           fileViewState: .initial()
+                       )
+                   )
+                {
+                    try? await tabCommands.finalizeClose(transient, in: active)
+                }
+                if error is CancellationError { throw CancellationError() }
+                NewTabPickerController.presentFailure(
+                    error,
+                    option: option,
+                    tabID: tabID,
+                    contextID: contextID
+                )
+                throw error
+            }
+        }
     }
 
     func routeNewTabPickerCancellation(
         tabID: TabID,
         contextID: WorkspaceContextID
     ) async throws {
+        guard !commandAdmissions.contains(.newTab(contextID, tabID)) else {
+            throw WorkspaceViewModelError.commandInFlight
+        }
         let active = try requireActiveContext()
         guard active.contextID == contextID else { throw CancellationError() }
         try await cancelNewTabPicker(tabID)
+    }
+
+    func restartTerminalTab(
+        _ tabID: TabID,
+        replacing expectedSessionID: TerminalSessionID,
+        switchingTo profileID: AgentProfileID?
+    ) async throws {
+        let active = try requireActiveContext()
+        guard let tab = currentTabs.first(where: { $0.id == tabID }) else {
+            throw WorkspaceViewModelError.tabNotFound
+        }
+        guard tab.kind.terminalSessionID == expectedSessionID else {
+            throw WorkspaceViewModelError.staleTerminalSession
+        }
+        guard let tabCommands else { throw WorkspaceViewModelError.tabCommandUnavailable }
+        try await withCommandAdmission(.restart(active.contextID, tabID, expectedSessionID)) {
+            let kind = try await tabCommands.restartTerminal(
+                tab,
+                in: active,
+                switchingTo: profileID
+            )
+            guard kind.terminalKind == .codex || kind.terminalKind == .claude else {
+                throw WorkspaceViewModelError.invalidTabKind
+            }
+            try await replaceTerminalTab(
+                tabID,
+                replacing: expectedSessionID,
+                with: kind,
+                in: active
+            )
+        }
+    }
+
+    private func replaceTerminalTab(
+        _ tabID: TabID,
+        replacing expectedSessionID: TerminalSessionID,
+        with kind: WorkspaceTabKind,
+        in active: ActiveContext
+    ) async throws {
+        guard kind.terminalSessionID != nil, let terminalKind = kind.terminalKind else {
+            throw WorkspaceViewModelError.invalidTabKind
+        }
+        try await requireAccepted(active)
+        let initial = try await state(for: active.contextID)
+        let state = try await stateCoordinator.mutate(
+            key: initial.key,
+            initial: initial
+        ) { state in
+            guard let index = state.tabs.firstIndex(where: { $0.id == tabID }) else {
+                throw WorkspaceViewModelError.tabNotFound
+            }
+            guard state.tabs[index].resource == .terminal(expectedSessionID) else {
+                throw WorkspaceViewModelError.staleTerminalSession
+            }
+            state.tabs[index] = try TabRecord(
+                validatingID: tabID,
+                resource: kind.resource,
+                terminalKind: terminalKind,
+                fileViewState: nil
+            )
+            state = try Self.replacing(
+                state,
+                tabs: state.tabs,
+                selectedTabID: tabID
+            )
+        }
+        let publication = reserveTabStatePublication(for: state.key)
+        await publishCurrentState(state, in: active, publication: publication)
     }
 
     func accepts(generation: UInt64) async -> Bool {
@@ -475,7 +736,96 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         _ operation: FileOperation,
         workspaceContextID: WorkspaceContextID
     ) async throws {
-        throw WorkspaceViewModelError.relocationUnavailable
+        guard let tabCommands else { throw WorkspaceViewModelError.relocationUnavailable }
+        try await tabCommands.performRelocation(
+            operation,
+            workspaceContextID: workspaceContextID
+        )
+    }
+
+    @discardableResult
+    func closeTab(_ tabID: TabID) async throws -> Bool {
+        let active = try requireActiveContext()
+        guard let tab = currentTabs.first(where: { $0.id == tabID }) else {
+            throw WorkspaceViewModelError.tabNotFound
+        }
+        return try await closeTab(tabID, expectedTab: tab, in: active)
+    }
+
+    @discardableResult
+    func closeTab(
+        _ tabID: TabID,
+        expectedTab tab: WorkspaceTab,
+        in active: ActiveContext
+    ) async throws -> Bool {
+        guard activeContext == active,
+              tab.id == tabID,
+              currentTabs.first(where: { $0.id == tabID }) == tab
+        else { throw CancellationError() }
+        guard !commandAdmissions.contains(.newTab(active.contextID, tabID)) else {
+            throw WorkspaceViewModelError.commandInFlight
+        }
+        guard let tabCommands else { throw WorkspaceViewModelError.tabCommandUnavailable }
+        guard try await tabCommands.prepareClose(tab, in: active) else { return false }
+        try await requireAccepted(active)
+        guard currentTabs.first(where: { $0.id == tabID }) == tab else {
+            throw CancellationError()
+        }
+        let initial = try await state(for: active.contextID)
+        let state = try await stateCoordinator.mutate(
+            key: initial.key,
+            initial: initial
+        ) { state in
+            guard let index = state.tabs.firstIndex(where: { $0.id == tabID }),
+                  state.tabs[index] == tab.record
+            else { throw CancellationError() }
+            state.tabs.remove(at: index)
+            let selected = state.selectedTabID == tabID
+                ? state.tabs.first?.id
+                : state.selectedTabID
+            state = try Self.replacing(
+                state,
+                tabs: state.tabs,
+                selectedTabID: selected
+            )
+        }
+        let closePublication = reserveTabStatePublication(for: state.key)
+        do {
+            try await tabCommands.finalizeClose(tab, in: active)
+        } catch {
+            let originalIndex = initial.tabs.firstIndex(where: { $0.id == tabID })
+            let rolledBack = try await stateCoordinator.mutate(
+                key: initial.key,
+                initial: state
+            ) { current in
+                if !current.tabs.contains(where: { $0.id == tabID }),
+                   let originalIndex
+                {
+                    current.tabs.insert(
+                        tab.record,
+                        at: min(originalIndex, current.tabs.count)
+                    )
+                }
+                let selected = initial.selectedTabID == tabID
+                    && current.selectedTabID == state.selectedTabID
+                    ? tabID
+                    : current.selectedTabID
+                current = try Self.replacing(
+                    current,
+                    tabs: current.tabs,
+                    selectedTabID: selected
+                )
+            }
+            let rollbackPublication = reserveTabStatePublication(for: rolledBack.key)
+            await publishCurrentState(
+                rolledBack,
+                in: active,
+                publication: rollbackPublication
+            )
+            throw error
+        }
+        await publishCurrentState(state, in: active, publication: closePublication)
+        return true
     }
 
     private func requireActiveContext() throws -> ActiveContext {
@@ -487,6 +837,41 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         guard activeContext?.generation == active.generation,
               await activeContexts.accepts(generation: active.generation)
         else { throw CancellationError() }
+    }
+
+    private func withCommandAdmission<Value>(
+        _ admission: WorkspaceCommandAdmission,
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        guard commandAdmissions.insert(admission).inserted else {
+            throw WorkspaceViewModelError.commandInFlight
+        }
+        defer { commandAdmissions.remove(admission) }
+        return try await operation()
+    }
+
+    private func reserveTabStatePublication(for key: ClientWorkspaceStateKey) -> UInt64 {
+        let current = tabStatePublications[key] ?? 0
+        precondition(current < UInt64.max, "Tab state publication exhausted")
+        let next = current + 1
+        tabStatePublications[key] = next
+        return next
+    }
+
+    private func publishCurrentState(
+        _ state: ClientWorkspaceState,
+        in active: ActiveContext,
+        publication: UInt64
+    ) async {
+        if let tabStatePublicationObserver {
+            await tabStatePublicationObserver(state.key, publication)
+        }
+        guard publication == tabStatePublications[state.key],
+              activeContext?.generation == active.generation,
+              await activeContexts.accepts(generation: active.generation),
+              publication == tabStatePublications[state.key]
+        else { return }
+        applyCurrentState(state)
     }
 
     private func state(for contextID: WorkspaceContextID) async throws -> ClientWorkspaceState {

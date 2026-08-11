@@ -66,9 +66,11 @@ final class GhosttyTerminalView: NSView {
 
     private var renderer: (any GhosttyRendererDriving)?
     private var pendingFrames: [PendingFrame] = []
+    private var pendingFinalSnapshot: Data?
     private var latestReceivedSequence: UInt64 = 0
     private var lastAppliedSequence: UInt64 = 0
     private var hasSessionViewport = false
+    private var hasFinalArchiveViewport = false
     private var sessionID: TerminalSessionID?
     private var rendererWantsVisible = false
     private var rendererIsVisible = false
@@ -147,6 +149,17 @@ final class GhosttyTerminalView: NSView {
         refreshRendererVisibility()
     }
 
+    func applyFinalSnapshot(
+        _ snapshot: Data,
+        for sessionID: TerminalSessionID
+    ) throws {
+        guard !snapshot.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+        beginSession(sessionID, preservingAcknowledgedSequence: nil)
+        pendingFinalSnapshot = snapshot
+        hasFinalArchiveViewport = true
+        refreshRendererVisibility()
+    }
+
     func beginSession() {
         beginSession(TerminalSessionID(), preservingAcknowledgedSequence: nil)
     }
@@ -163,9 +176,11 @@ final class GhosttyTerminalView: NSView {
         }
         self.sessionID = sessionID
         pendingFrames.removeAll(keepingCapacity: true)
+        pendingFinalSnapshot = nil
         latestReceivedSequence = 0
         lastAppliedSequence = 0
         hasSessionViewport = false
+        hasFinalArchiveViewport = false
         cancelPresentationRetry()
         rendererWantsVisible = false
         rendererIsVisible = false
@@ -178,6 +193,7 @@ final class GhosttyTerminalView: NSView {
     ) -> UInt64? {
         guard self.sessionID == sessionID,
               hasSessionViewport,
+              !hasFinalArchiveViewport,
               let requested,
               requested == lastAppliedSequence else { return nil }
         return requested
@@ -208,6 +224,17 @@ final class GhosttyTerminalView: NSView {
             return true
         }
         do {
+            if let finalSnapshot = pendingFinalSnapshot {
+                let presented = try renderer.apply(finalSnapshot)
+                if rendererWantsVisible && !presented {
+                    rendererIsVisible = false
+                    if scheduleRetry { schedulePresentationRetry() }
+                    return false
+                }
+                if rendererWantsVisible { rendererIsVisible = true }
+                pendingFinalSnapshot = nil
+                hasSessionViewport = true
+            }
             while !pendingFrames.isEmpty {
                 let frame = pendingFrames[0].frame
                 if frame.outputSequence <= lastAppliedSequence {
@@ -266,7 +293,8 @@ final class GhosttyTerminalView: NSView {
     private func schedulePresentationRetry() {
         guard presentationRetryTask == nil,
               rendererShouldBeVisible,
-              hasSessionViewport || !pendingFrames.isEmpty else { return }
+              hasSessionViewport || pendingFinalSnapshot != nil || !pendingFrames.isEmpty
+        else { return }
         let retryID = UUID()
         presentationRetryID = retryID
         presentationRetryTask = Task { @MainActor [weak self] in

@@ -210,12 +210,12 @@ final class WorkspaceHierarchyTests: XCTestCase {
             }
         )
         shell.performClick(nil)
-        cancel.performClick(nil)
-
         await fulfillment(
-            of: [recorder.choiceExpectation, recorder.cancelExpectation],
+            of: [recorder.choiceExpectation],
             timeout: 1
         )
+        cancel.performClick(nil)
+        await fulfillment(of: [recorder.cancelExpectation], timeout: 1)
         XCTAssertEqual(
             recorder.choice,
             .init(option: .shell, tabID: tabID, contextID: contextID)
@@ -223,6 +223,287 @@ final class WorkspaceHierarchyTests: XCTestCase {
         XCTAssertEqual(
             recorder.cancellation,
             .init(tabID: tabID, contextID: contextID)
+        )
+    }
+
+    func testAgentFailurePageOffersRetryAndSwitchAgentWithExactError() async throws {
+        let tabID = TabID()
+        let contextID = WorkspaceContextID.project(ProjectID())
+        let launchError = NSError(
+            domain: "dev.cockpit.agent-test",
+            code: 91,
+            userInfo: [NSLocalizedDescriptionKey: "fixture agent failed"]
+        )
+        let retry = FailingNewTabPickerActions(error: launchError, failureCount: 1)
+        let retryController = NewTabPickerController(
+            tabID: tabID,
+            contextID: contextID,
+            onChoose: retry.choose,
+            onCancel: { _, _ in }
+        )
+        retryController.loadViewIfNeeded()
+        try XCTUnwrap(
+            descendantButtons(in: retryController.view).first {
+                $0.identifier?.rawValue == "new-tab-codex"
+            }
+        ).performClick(nil)
+        guard await waitUntil({
+            descendantButtons(in: retryController.view).contains {
+                $0.identifier?.rawValue == "new-tab-retry"
+            }
+        }) else { return }
+        let message = descendantTextFields(in: retryController.view)
+            .map(\.stringValue)
+            .joined(separator: " ")
+        XCTAssertTrue(message.contains(launchError.domain))
+        XCTAssertTrue(message.contains(String(launchError.code)))
+        XCTAssertTrue(message.contains(launchError.localizedDescription))
+        try XCTUnwrap(
+            descendantButtons(in: retryController.view).first {
+                $0.identifier?.rawValue == "new-tab-retry"
+            }
+        ).performClick(nil)
+        guard await waitUntil({ retry.choices == [.codex, .codex] }) else { return }
+
+        let switching = FailingNewTabPickerActions(error: launchError, failureCount: 1)
+        let switchController = NewTabPickerController(
+            tabID: TabID(),
+            contextID: contextID,
+            onChoose: switching.choose,
+            onCancel: { _, _ in }
+        )
+        switchController.loadViewIfNeeded()
+        try XCTUnwrap(
+            descendantButtons(in: switchController.view).first {
+                $0.identifier?.rawValue == "new-tab-codex"
+            }
+        ).performClick(nil)
+        guard await waitUntil({
+            descendantButtons(in: switchController.view).contains {
+                $0.identifier?.rawValue == "new-tab-switch-agent"
+            }
+        }) else { return }
+        try XCTUnwrap(
+            descendantButtons(in: switchController.view).first {
+                $0.identifier?.rawValue == "new-tab-switch-agent"
+            }
+        ).performClick(nil)
+        guard await waitUntil({ switching.choices == [.codex, .claude] }) else { return }
+    }
+
+    func testTabCollectionItemProvidesNativeCloseAffordanceWithExactContextBinding() throws {
+        let tabID = TabID()
+        let sessionID = TerminalSessionID()
+        let tab = try WorkspaceTab(record: TabRecord(
+            validatingID: tabID,
+            resource: .terminal(sessionID),
+            terminalKind: .shell,
+            fileViewState: nil
+        ))
+        let projectID = ProjectID()
+        let active = try ActiveContext(
+            validating: .project(projectID),
+            projectID: projectID,
+            conversationID: nil,
+            environmentID: EnvironmentID(),
+            workspaceRootIdentity: "close-binding-root",
+            generation: 7
+        )
+        let recorder = TabCloseRecorder()
+        let item = WorkspaceTabCollectionItem()
+        item.configure(
+            title: "Shell",
+            closeBinding: WorkspaceTabCloseBinding(tab: tab, activeContext: active)
+        ) { recorder.values.append($0) }
+
+        let close = try XCTUnwrap(
+            descendantButtons(in: item.view).first {
+                $0.identifier?.rawValue == "workspace-tab-close"
+            }
+        )
+        close.performClick(nil)
+        XCTAssertEqual(
+            recorder.values,
+            [WorkspaceTabCloseBinding(tab: tab, activeContext: active)]
+        )
+    }
+
+    func testPureProjectSidebarNewTabActionOpensTheRealFiveChoicePicker() async throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        let windowController = fixture.makeWindowController()
+        try await windowController.start()
+        _ = try await fixture.viewModel.selectContext(
+            .project(fixture.emptyProject.projectID)
+        )
+        let root = windowController.workspaceSplitViewController
+        let button = try XCTUnwrap(
+            descendantButtons(in: root.sidebarController.view).first {
+                $0.identifier?.rawValue == "workspace-new-tab"
+            }
+        )
+
+        button.performClick(nil)
+        guard await waitUntil({
+            fixture.viewModel.currentTabs.map(\.kind) == [.newTabPicker]
+        }) else { return }
+
+        let picker = try XCTUnwrap(
+            root.contentHostController.children.compactMap {
+                $0 as? NewTabPickerController
+            }.first
+        )
+        picker.loadViewIfNeeded()
+        let identifiers = Set(descendantButtons(in: picker.view).compactMap {
+            $0.identifier?.rawValue
+        })
+        XCTAssertTrue(identifiers.isSuperset(of: [
+            "new-tab-file",
+            "new-tab-shell",
+            "new-tab-codex",
+            "new-tab-claude",
+            "new-tab-reattach",
+        ]))
+    }
+
+    func testSidebarButtonsAndInlineRenameRouteExactNativeCommandsAndRestoreFailure() async throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        try await fixture.viewModel.loadWorkspace()
+        _ = try await fixture.viewModel.selectContext(.conversation(fixture.conversation.id))
+        let actions = SidebarActionRecorder()
+        let renameError = NSError(
+            domain: "dev.cockpit.rename-test",
+            code: 44,
+            userInfo: [NSLocalizedDescriptionKey: "rename failed"]
+        )
+        let controller = WorkspaceSidebarController(
+            viewModel: fixture.viewModel,
+            addProject: actions.addProject,
+            createConversation: actions.createConversation,
+            renameConversation: actions.rename,
+            presentError: actions.present
+        )
+        controller.loadViewIfNeeded()
+        controller.update(
+            projects: fixture.viewModel.projects,
+            activeContext: fixture.viewModel.activeContext
+        )
+
+        try XCTUnwrap(
+            descendantButtons(in: controller.view).first {
+                $0.identifier?.rawValue == "workspace-add-project"
+            }
+        ).performClick(nil)
+        guard await waitUntil({ actions.addProjectCount == 1 }) else { return }
+        try XCTUnwrap(
+            descendantButtons(in: controller.view).first {
+                $0.identifier?.rawValue == "workspace-new-conversation"
+            }
+        ).performClick(nil)
+        guard await waitUntil({
+            actions.conversationProjectIDs == [fixture.project.projectID]
+        }) else { return }
+
+        let item = WorkspaceSidebarItem.conversation(fixture.conversation.id)
+        let field = try XCTUnwrap(
+            controller.outlineView(
+                controller.outlineView,
+                viewFor: controller.outlineView.outlineTableColumn,
+                item: item
+            ) as? NSTextField
+        )
+        XCTAssertTrue(field.isEditable)
+        field.stringValue = "Renamed"
+        field.delegate?.controlTextDidEndEditing?(
+            Notification(name: NSControl.textDidEndEditingNotification, object: field)
+        )
+        guard await waitUntil({ actions.renames.count == 1 }) else { return }
+        XCTAssertEqual(
+            actions.renames,
+            [.init(id: fixture.conversation.id, title: "Renamed")]
+        )
+
+        let blankField = try XCTUnwrap(
+            controller.outlineView(
+                controller.outlineView,
+                viewFor: controller.outlineView.outlineTableColumn,
+                item: item
+            ) as? NSTextField
+        )
+        blankField.stringValue = " \t\n"
+        blankField.delegate?.controlTextDidEndEditing?(
+            Notification(name: NSControl.textDidEndEditingNotification, object: blankField)
+        )
+        XCTAssertEqual(actions.renames.count, 1)
+        XCTAssertEqual(blankField.stringValue, fixture.conversation.title)
+        XCTAssertEqual(
+            actions.presentedErrors.first?.localizedDescription,
+            "Conversation title cannot be empty."
+        )
+
+        actions.renameError = renameError
+        let failedField = try XCTUnwrap(
+            controller.outlineView(
+                controller.outlineView,
+                viewFor: controller.outlineView.outlineTableColumn,
+                item: item
+            ) as? NSTextField
+        )
+        failedField.stringValue = "Rejected"
+        failedField.delegate?.controlTextDidEndEditing?(
+            Notification(name: NSControl.textDidEndEditingNotification, object: failedField)
+        )
+        guard await waitUntil({ actions.presentedErrors.count == 2 }) else { return }
+        XCTAssertEqual(failedField.stringValue, fixture.conversation.title)
+        XCTAssertEqual(actions.presentedErrors[1].domain, renameError.domain)
+        XCTAssertEqual(actions.presentedErrors[1].code, renameError.code)
+        XCTAssertEqual(
+            actions.presentedErrors[1].localizedDescription,
+            renameError.localizedDescription
+        )
+    }
+
+    func testConversationRenameIsSingleFlightWhileTheHostCommandIsPending() async throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        try await fixture.viewModel.loadWorkspace()
+        _ = try await fixture.viewModel.selectContext(.conversation(fixture.conversation.id))
+        let actions = SidebarActionRecorder()
+        let controller = WorkspaceSidebarController(
+            viewModel: fixture.viewModel,
+            addProject: actions.addProject,
+            createConversation: actions.createConversation,
+            renameConversation: actions.rename,
+            presentError: actions.present
+        )
+        controller.loadViewIfNeeded()
+        controller.update(
+            projects: fixture.viewModel.projects,
+            activeContext: fixture.viewModel.activeContext
+        )
+        let item = WorkspaceSidebarItem.conversation(fixture.conversation.id)
+        let field = try XCTUnwrap(
+            controller.outlineView(
+                controller.outlineView,
+                viewFor: controller.outlineView.outlineTableColumn,
+                item: item
+            ) as? NSTextField
+        )
+        actions.pauseNextRename()
+        field.stringValue = "First"
+        field.delegate?.controlTextDidEndEditing?(
+            Notification(name: NSControl.textDidEndEditingNotification, object: field)
+        )
+        await actions.waitUntilRenamePaused()
+        XCTAssertFalse(field.isEditable)
+
+        field.stringValue = "Second"
+        field.delegate?.controlTextDidEndEditing?(
+            Notification(name: NSControl.textDidEndEditingNotification, object: field)
+        )
+        actions.resumeRename()
+        guard await waitUntil({ actions.renames.count == 1 && field.isEditable }) else { return }
+        XCTAssertEqual(
+            actions.renames,
+            [.init(id: fixture.conversation.id, title: "First")]
         )
     }
 
@@ -975,6 +1256,83 @@ private final class RecordingNewTabPickerActions {
 }
 
 @MainActor
+private final class FailingNewTabPickerActions {
+    let error: NSError
+    var remainingFailures: Int
+    private(set) var choices: [NewTabPickerOption] = []
+
+    init(error: NSError, failureCount: Int) {
+        self.error = error
+        remainingFailures = failureCount
+    }
+
+    func choose(
+        _ option: NewTabPickerOption,
+        tabID: TabID,
+        contextID: WorkspaceContextID
+    ) async throws {
+        choices.append(option)
+        if remainingFailures > 0 {
+            remainingFailures -= 1
+            throw error
+        }
+    }
+}
+
+@MainActor
+private final class TabCloseRecorder {
+    var values: [WorkspaceTabCloseBinding] = []
+}
+
+@MainActor
+private final class SidebarActionRecorder {
+    struct Rename: Equatable {
+        let id: ConversationID
+        let title: String
+    }
+
+    private(set) var addProjectCount = 0
+    private(set) var conversationProjectIDs: [ProjectID] = []
+    private(set) var renames: [Rename] = []
+    private(set) var presentedErrors: [NSError] = []
+    var renameError: NSError?
+    private var pauseRename = false
+    private var renamePaused = false
+    private var renamePauseWaiter: CheckedContinuation<Void, Never>?
+    private var renameResumeWaiter: CheckedContinuation<Void, Never>?
+
+    func addProject() async throws { addProjectCount += 1 }
+    func createConversation(_ projectID: ProjectID) async throws {
+        conversationProjectIDs.append(projectID)
+    }
+    func pauseNextRename() { pauseRename = true }
+
+    func waitUntilRenamePaused() async {
+        if renamePaused { return }
+        await withCheckedContinuation { renamePauseWaiter = $0 }
+    }
+
+    func resumeRename() {
+        renameResumeWaiter?.resume()
+        renameResumeWaiter = nil
+    }
+
+    func rename(_ id: ConversationID, _ title: String) async throws {
+        renames.append(.init(id: id, title: title))
+        if pauseRename {
+            pauseRename = false
+            renamePaused = true
+            renamePauseWaiter?.resume()
+            renamePauseWaiter = nil
+            await withCheckedContinuation { renameResumeWaiter = $0 }
+            renamePaused = false
+        }
+        if let renameError { throw renameError }
+    }
+    func present(_ error: any Error) { presentedErrors.append(error as NSError) }
+}
+
+@MainActor
 private final class TestDraggingInfo: NSObject, @MainActor NSDraggingInfo {
     let draggingPasteboard: NSPasteboard
     var draggingDestinationWindow: NSWindow? { nil }
@@ -1024,6 +1382,16 @@ private func descendantButtons(in view: NSView) -> [NSButton] {
     if let button = view as? NSButton { values.append(button) }
     for subview in view.subviews {
         values.append(contentsOf: descendantButtons(in: subview))
+    }
+    return values
+}
+
+@MainActor
+private func descendantTextFields(in view: NSView) -> [NSTextField] {
+    var values: [NSTextField] = []
+    if let field = view as? NSTextField { values.append(field) }
+    for subview in view.subviews {
+        values.append(contentsOf: descendantTextFields(in: subview))
     }
     return values
 }

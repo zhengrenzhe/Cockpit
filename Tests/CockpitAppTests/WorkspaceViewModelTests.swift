@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 import CockpitClientCore
 import CockpitHostCore
+import CockpitTerminalCore
 import CockpitTypes
 @testable import Cockpit
 
@@ -98,7 +99,10 @@ final class WorkspaceViewModelTests: XCTestCase {
         }
 
         XCTAssertEqual(viewModel.currentTabs.map(\.kind), kinds)
-        XCTAssertEqual(NewTabPickerController.options, [.file, .shell, .codex, .claude])
+        XCTAssertEqual(
+            NewTabPickerController.options,
+            [.file, .shell, .codex, .claude, .reattach]
+        )
     }
 
     func testStaleAsyncContextSelectionCannotOverwriteTheLatestIntent() async throws {
@@ -226,6 +230,536 @@ final class WorkspaceViewModelTests: XCTestCase {
         )
         XCTAssertEqual(Set(try XCTUnwrap(restored).tabs.map(\.id)), Set(created))
     }
+
+    func testPickerChoiceRelocationAndCloseRouteThroughInjectedTabCommands() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let picker = try await viewModel.openNewTabPicker()
+        let sessionID = TerminalSessionID()
+        commands.createdKind = .shell(sessionID)
+
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: picker,
+            contextID: active.contextID
+        )
+        XCTAssertEqual(commands.createCalls, [
+            .init(option: .shell, tabID: picker, contextID: active.contextID),
+        ])
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.shell(sessionID)])
+
+        let operation = FileOperation.rename(
+            source: try RelativePath("Old.swift"),
+            newName: "New.swift"
+        )
+        try await viewModel.performRelocation(
+            operation,
+            workspaceContextID: active.contextID
+        )
+        XCTAssertEqual(commands.relocations, [
+            .init(operation: operation, contextID: active.contextID),
+        ])
+
+        commands.closeResult = false
+        let cancelled = try await viewModel.closeTab(picker)
+        XCTAssertFalse(cancelled)
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.shell(sessionID)])
+        XCTAssertEqual(commands.preparedCloseTabIDs, [picker])
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [])
+        commands.closeResult = true
+        let closed = try await viewModel.closeTab(picker)
+        XCTAssertTrue(closed)
+        XCTAssertEqual(viewModel.currentTabs, [])
+        XCTAssertNil(viewModel.selectedTabID)
+        XCTAssertEqual(commands.preparedCloseTabIDs, [picker, picker])
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [picker])
+    }
+
+    func testCloseFinalizesOnlyAfterDurableRemovalAndNotAfterSaveFailure() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let store = FailingClientWorkspaceStateService()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(stateService: store, tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let picker = try await viewModel.openNewTabPicker()
+        let sessionID = TerminalSessionID()
+        commands.createdKind = .shell(sessionID)
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: picker,
+            contextID: active.contextID
+        )
+
+        await store.failNextSave()
+        await XCTAssertThrowsErrorAsync(WorkspaceStateTestError.self) {
+            _ = try await viewModel.closeTab(picker)
+        }
+
+        XCTAssertEqual(commands.preparedCloseTabIDs, [picker])
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [])
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.shell(sessionID)])
+        let durableTabs = try await viewModel.tabs(for: active.contextID)
+        XCTAssertEqual(durableTabs.map(\.kind), [.shell(sessionID)])
+    }
+
+    func testClosePreparedBeforeContextSwitchDoesNotFinalizeOrRemoveOldTab() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let project = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let picker = try await viewModel.openNewTabPicker()
+        let sessionID = TerminalSessionID()
+        commands.createdKind = .shell(sessionID)
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: picker,
+            contextID: project.contextID
+        )
+
+        commands.pauseNextPrepareClose()
+        let closing = Task { try await viewModel.closeTab(picker) }
+        await commands.waitUntilPrepareClosePaused()
+        _ = try await viewModel.selectContext(.conversation(fixture.conversation.id))
+        commands.resumePrepareClose()
+
+        await XCTAssertThrowsErrorAsync(CancellationError.self) {
+            _ = try await closing.value
+        }
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [])
+        let durableTabs = try await viewModel.tabs(for: project.contextID)
+        XCTAssertEqual(durableTabs.map(\.kind), [.shell(sessionID)])
+    }
+
+    func testCloseRollsDurableTabBackWhenReferenceFinalizationFails() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let picker = try await viewModel.openNewTabPicker()
+        let sessionID = TerminalSessionID()
+        commands.createdKind = .shell(sessionID)
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: picker,
+            contextID: active.contextID
+        )
+        commands.finalizeError = WorkspaceStateTestError.saveFailed
+
+        await XCTAssertThrowsErrorAsync(WorkspaceStateTestError.self) {
+            _ = try await viewModel.closeTab(picker)
+        }
+
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [picker])
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.shell(sessionID)])
+        XCTAssertEqual(viewModel.selectedTabID, picker)
+        let durableTabs = try await viewModel.tabs(for: active.contextID)
+        XCTAssertEqual(durableTabs.map(\.kind), [.shell(sessionID)])
+    }
+
+    func testReattachExcludesCurrentTabsAndAgentRestartReplacesSameDurableTab() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+
+        let attachedPicker = try await viewModel.openNewTabPicker()
+        let attachedSession = TerminalSessionID()
+        commands.createdKind = .shell(attachedSession)
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: attachedPicker,
+            contextID: active.contextID
+        )
+
+        let reattachPicker = try await viewModel.openNewTabPicker()
+        let detachedSession = TerminalSessionID()
+        commands.reattachedKind = .claude(detachedSession)
+        try await viewModel.routeNewTabPickerChoice(
+            .reattach,
+            tabID: reattachPicker,
+            contextID: active.contextID
+        )
+        XCTAssertEqual(commands.reattachExclusions, [[attachedSession]])
+        XCTAssertEqual(
+            viewModel.currentTabs.map(\.kind),
+            [.shell(attachedSession), .claude(detachedSession)]
+        )
+
+        let replacement = TerminalSessionID()
+        commands.restartedKind = .codex(replacement)
+        try await viewModel.restartTerminalTab(
+            reattachPicker,
+            replacing: detachedSession,
+            switchingTo: .codex
+        )
+        XCTAssertEqual(commands.restartCalls.map(\.tabID), [reattachPicker])
+        XCTAssertEqual(commands.restartCalls.map(\.profileID), [.codex])
+        XCTAssertEqual(viewModel.currentTabs[1].id, reattachPicker)
+        XCTAssertEqual(viewModel.currentTabs[1].kind, .codex(replacement))
+        XCTAssertEqual(viewModel.selectedTabID, reattachPicker)
+
+        let rebuilt = fixture.makeViewModel(tabCommands: commands)
+        try await rebuilt.loadWorkspace()
+        try await rebuilt.selectContext(active.contextID)
+        XCTAssertEqual(rebuilt.currentTabs[1].id, reattachPicker)
+        XCTAssertEqual(rebuilt.currentTabs[1].kind, .codex(replacement))
+    }
+
+    func testAgentRestartIsSingleFlightAndRejectsTheReplacedSessionID() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let picker = try await viewModel.openNewTabPicker()
+        let original = TerminalSessionID()
+        commands.createdKind = .codex(original)
+        try await viewModel.routeNewTabPickerChoice(
+            .codex,
+            tabID: picker,
+            contextID: active.contextID
+        )
+        let replacement = TerminalSessionID()
+        commands.restartedKind = .codex(replacement)
+        commands.pauseNextRestart()
+
+        let first = Task {
+            try await viewModel.restartTerminalTab(
+                picker,
+                replacing: original,
+                switchingTo: nil
+            )
+        }
+        await commands.waitUntilRestartPaused()
+        await XCTAssertThrowsWorkspaceViewModelError(.commandInFlight) {
+            try await viewModel.restartTerminalTab(
+                picker,
+                replacing: original,
+                switchingTo: .claude
+            )
+        }
+        commands.resumeRestart()
+        try await first.value
+
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.codex(replacement)])
+        XCTAssertEqual(commands.restartCalls.count, 1)
+        await XCTAssertThrowsWorkspaceViewModelError(.staleTerminalSession) {
+            try await viewModel.restartTerminalTab(
+                picker,
+                replacing: original,
+                switchingTo: nil
+            )
+        }
+        XCTAssertEqual(commands.restartCalls.count, 1)
+    }
+
+    func testNewTabChoiceIsSingleFlightAndReleasesUncommittedFileAfterContextSwitch() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let picker = try await viewModel.openNewTabPicker()
+        let documentID = DocumentID()
+        commands.createdKind = .file(documentID)
+        commands.pauseNextCreate()
+
+        let first = Task {
+            try await viewModel.routeNewTabPickerChoice(
+                .file,
+                tabID: picker,
+                contextID: active.contextID
+            )
+        }
+        await commands.waitUntilCreatePaused()
+        await XCTAssertThrowsWorkspaceViewModelError(.commandInFlight) {
+            try await viewModel.routeNewTabPickerChoice(
+                .file,
+                tabID: picker,
+                contextID: active.contextID
+            )
+        }
+        await XCTAssertThrowsWorkspaceViewModelError(.commandInFlight) {
+            try await viewModel.routeNewTabPickerCancellation(
+                tabID: picker,
+                contextID: active.contextID
+            )
+        }
+        await XCTAssertThrowsWorkspaceViewModelError(.commandInFlight) {
+            _ = try await viewModel.closeTab(picker)
+        }
+        _ = try await viewModel.selectContext(.conversation(fixture.conversation.id))
+        commands.resumeCreate()
+
+        await XCTAssertThrowsErrorAsync(CancellationError.self) {
+            try await first.value
+        }
+        XCTAssertEqual(commands.createCalls.count, 1)
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [picker])
+        let projectTabs = try await viewModel.tabs(for: active.contextID)
+        XCTAssertEqual(projectTabs.map(\.kind), [.newTabPicker])
+    }
+
+    func testCloseCannotPublishOlderStateOverAConcurrentTabMutation() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let active = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let firstTab = try await viewModel.openNewTabPicker()
+        let sessionID = TerminalSessionID()
+        commands.createdKind = .shell(sessionID)
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: firstTab,
+            contextID: active.contextID
+        )
+        commands.pauseNextFinalizeClose()
+
+        let closing = Task { try await viewModel.closeTab(firstTab) }
+        await commands.waitUntilFinalizeClosePaused()
+        let latestPicker = try await viewModel.openNewTabPicker()
+        commands.resumeFinalizeClose()
+        let didClose = try await closing.value
+        XCTAssertTrue(didClose)
+
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.newTabPicker])
+        XCTAssertEqual(viewModel.selectedTabID, latestPicker)
+        let durableTabs = try await viewModel.tabs(for: active.contextID)
+        XCTAssertEqual(durableTabs.map(\.kind), [.newTabPicker])
+        XCTAssertEqual(durableTabs.map(\.id), [latestPicker])
+    }
+
+    func testRollbackInOneContextCannotSuppressAReservedPublicationInAnother() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let project = try await viewModel.selectContext(.project(fixture.project.projectID))
+        let projectTabID = try await viewModel.openNewTabPicker()
+        let sessionID = TerminalSessionID()
+        commands.createdKind = .shell(sessionID)
+        try await viewModel.routeNewTabPickerChoice(
+            .shell,
+            tabID: projectTabID,
+            contextID: project.contextID
+        )
+        commands.pauseNextFinalizeClose()
+        commands.finalizeError = WorkspaceStateTestError.saveFailed
+        let closing = Task { try await viewModel.closeTab(projectTabID) }
+        await commands.waitUntilFinalizeClosePaused()
+
+        let conversation = try await viewModel.selectContext(
+            .conversation(fixture.conversation.id)
+        )
+        let publication = WorkspacePublicationBarrier(
+            contextID: conversation.contextID
+        )
+        viewModel.tabStatePublicationObserver = publication.observe
+        publication.pauseNextObservation()
+        let opening = Task { try await viewModel.openNewTabPicker() }
+        await publication.waitUntilPaused()
+
+        commands.resumeFinalizeClose()
+        await XCTAssertThrowsErrorAsync(WorkspaceStateTestError.self) {
+            _ = try await closing.value
+        }
+        publication.resume()
+        let conversationTabID = try await opening.value
+        viewModel.tabStatePublicationObserver = nil
+
+        XCTAssertEqual(viewModel.currentTabs.map(\.id), [conversationTabID])
+        XCTAssertEqual(viewModel.currentTabs.map(\.kind), [.newTabPicker])
+        let durable = try await viewModel.tabs(for: conversation.contextID)
+        XCTAssertEqual(durable.map(\.id), [conversationTabID])
+    }
+
+    func testCloseBindingFromPriorContextCannotDeleteSameTabIDInCurrentContext() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let commands = RecordingWorkspaceTabCommands()
+        let tabID = TabID()
+        let projectSessionID = TerminalSessionID()
+        let conversationSessionID = TerminalSessionID()
+        let projectContextID = WorkspaceContextID.project(fixture.project.projectID)
+        let conversationContextID = WorkspaceContextID.conversation(fixture.conversation.id)
+        try await fixture.stateService.saveClientState(try testWorkspaceState(
+            fixture: fixture,
+            contextID: projectContextID,
+            tabID: tabID,
+            sessionID: projectSessionID
+        ))
+        try await fixture.stateService.saveClientState(try testWorkspaceState(
+            fixture: fixture,
+            contextID: conversationContextID,
+            tabID: tabID,
+            sessionID: conversationSessionID
+        ))
+        let viewModel = fixture.makeViewModel(tabCommands: commands)
+        try await viewModel.loadWorkspace()
+        let project = try await viewModel.selectContext(projectContextID)
+        let clickedTab = try XCTUnwrap(viewModel.currentTabs.first)
+        _ = try await viewModel.selectContext(conversationContextID)
+
+        await XCTAssertThrowsErrorAsync(CancellationError.self) {
+            _ = try await viewModel.closeTab(
+                tabID,
+                expectedTab: clickedTab,
+                in: project
+            )
+        }
+
+        let projectTabs = try await viewModel.tabs(for: projectContextID)
+        let conversationTabs = try await viewModel.tabs(for: conversationContextID)
+        XCTAssertEqual(projectTabs.map(\.kind), [
+            .shell(projectSessionID),
+        ])
+        XCTAssertEqual(conversationTabs.map(\.kind), [
+            .shell(conversationSessionID),
+        ])
+        XCTAssertEqual(commands.preparedCloseTabIDs, [])
+        XCTAssertEqual(commands.finalizedCloseTabIDs, [])
+    }
+
+    func testProjectCommandIsSingleFlightAndCannotOverrideLaterSelection() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let service = PausingCreationWorkspaceService(
+            snapshot: fixture.snapshot,
+            resolved: fixture.resolved,
+            project: fixture.emptyProject,
+            conversation: fixture.conversation
+        )
+        let viewModel = fixture.makeViewModel(
+            service: service,
+            projectDirectoryPicker: {
+                ProjectDirectorySelection(
+                    bookmark: Data("project".utf8),
+                    displayName: "Project"
+                )
+            }
+        )
+        try await viewModel.loadWorkspace()
+        _ = try await viewModel.selectContext(.project(fixture.project.projectID))
+        await service.pauseNextProjectCreation()
+
+        let first = Task { try await viewModel.addProject() }
+        await service.waitUntilCreationPaused()
+        await XCTAssertThrowsWorkspaceViewModelError(.commandInFlight) {
+            _ = try await viewModel.addProject()
+        }
+        let latest = try await viewModel.selectContext(.conversation(fixture.conversation.id))
+        await service.resumeCreation()
+
+        await XCTAssertThrowsErrorAsync(CancellationError.self) {
+            _ = try await first.value
+        }
+        let projectCreateCount = await service.projectCreateCount()
+        XCTAssertEqual(projectCreateCount, 1)
+        XCTAssertEqual(viewModel.activeContext, latest)
+    }
+
+    func testConversationCommandIsSingleFlightAndCannotOverrideLaterSelection() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let service = PausingCreationWorkspaceService(
+            snapshot: fixture.snapshot,
+            resolved: fixture.resolved,
+            project: fixture.emptyProject,
+            conversation: fixture.conversation
+        )
+        let viewModel = fixture.makeViewModel(
+            service: service,
+            conversationProfilePicker: { .codex }
+        )
+        try await viewModel.loadWorkspace()
+        _ = try await viewModel.selectContext(.project(fixture.project.projectID))
+        await service.pauseNextConversationCreation()
+
+        let first = Task {
+            try await viewModel.createConversation(projectID: fixture.project.projectID)
+        }
+        await service.waitUntilCreationPaused()
+        await XCTAssertThrowsWorkspaceViewModelError(.commandInFlight) {
+            _ = try await viewModel.createConversation(projectID: fixture.project.projectID)
+        }
+        let latest = try await viewModel.selectContext(.project(fixture.emptyProject.projectID))
+        await service.resumeCreation()
+
+        await XCTAssertThrowsErrorAsync(CancellationError.self) {
+            _ = try await first.value
+        }
+        let conversationCreateCount = await service.conversationCreateCount()
+        XCTAssertEqual(conversationCreateCount, 1)
+        XCTAssertEqual(viewModel.activeContext, latest)
+    }
+}
+
+@MainActor
+private func testWorkspaceState(
+    fixture: WorkspaceModelFixture,
+    contextID: WorkspaceContextID,
+    tabID: TabID,
+    sessionID: TerminalSessionID
+) throws -> ClientWorkspaceState {
+    try ClientWorkspaceState(
+        validatingKey: ClientWorkspaceStateKey(
+            deviceID: fixture.deviceID,
+            windowID: fixture.windowID,
+            workspaceContextID: contextID
+        ),
+        tabs: [
+            TabRecord(
+                validatingID: tabID,
+                resource: .terminal(sessionID),
+                terminalKind: .shell,
+                fileViewState: nil
+            ),
+        ],
+        selectedTabID: tabID,
+        sidebar: SidebarState(isCollapsed: false),
+        splitView: SplitViewState(
+            validatingLeadingPaneWidth: 240,
+            trailingPaneWidth: 300
+        )
+    )
+}
+
+@MainActor
+private final class WorkspacePublicationBarrier {
+    let contextID: WorkspaceContextID
+    private var pauseNext = false
+    private var isPaused = false
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
+    private var resumeWaiter: CheckedContinuation<Void, Never>?
+
+    init(contextID: WorkspaceContextID) { self.contextID = contextID }
+
+    func pauseNextObservation() { pauseNext = true }
+
+    func observe(_ key: ClientWorkspaceStateKey, _ publication: UInt64) async {
+        guard pauseNext, key.workspaceContextID == contextID else { return }
+        pauseNext = false
+        isPaused = true
+        pauseWaiter?.resume()
+        pauseWaiter = nil
+        await withCheckedContinuation { resumeWaiter = $0 }
+        isPaused = false
+    }
+
+    func waitUntilPaused() async {
+        if isPaused { return }
+        await withCheckedContinuation { pauseWaiter = $0 }
+    }
+
+    func resume() {
+        resumeWaiter?.resume()
+        resumeWaiter = nil
+    }
 }
 
 @MainActor
@@ -298,6 +832,9 @@ private struct WorkspaceModelFixture {
     func makeViewModel(
         service: (any WorkspaceServing)? = nil,
         stateService: (any ClientWorkspaceStateServing)? = nil,
+        tabCommands: (any TabCommanding)? = nil,
+        projectDirectoryPicker: @escaping ProjectDirectoryPicker = ProjectCommandController.appKitDirectoryPicker,
+        conversationProfilePicker: @escaping ConversationAgentProfilePicker = ConversationCommandController.appKitProfilePicker,
         fileSelection: @escaping WorkspaceFileSelectionHandler = { _, _, _ in }
     ) -> WorkspaceViewModel {
         WorkspaceViewModel(
@@ -313,8 +850,180 @@ private struct WorkspaceModelFixture {
             deviceID: deviceID,
             windowID: windowID,
             clientInstanceID: clientInstanceID,
+            tabCommands: tabCommands,
+            projectDirectoryPicker: projectDirectoryPicker,
+            conversationProfilePicker: conversationProfilePicker,
             fileSelection: fileSelection
         )
+    }
+}
+
+@MainActor
+private final class RecordingWorkspaceTabCommands: TabCommanding {
+    struct CreateCall: Equatable {
+        let option: NewTabPickerOption
+        let tabID: TabID
+        let contextID: WorkspaceContextID
+    }
+
+    struct Relocation: Equatable {
+        let operation: FileOperation
+        let contextID: WorkspaceContextID
+    }
+
+    struct RestartCall: Equatable {
+        let tabID: TabID
+        let profileID: AgentProfileID?
+    }
+
+    var createdKind: WorkspaceTabKind = .shell(TerminalSessionID())
+    var reattachedKind: WorkspaceTabKind = .shell(TerminalSessionID())
+    var restartedKind: WorkspaceTabKind = .codex(TerminalSessionID())
+    var closeResult = true
+    var finalizeError: Error?
+    private(set) var createCalls: [CreateCall] = []
+    private(set) var relocations: [Relocation] = []
+    private(set) var reattachExclusions: [Set<TerminalSessionID>] = []
+    private(set) var restartCalls: [RestartCall] = []
+    private(set) var preparedCloseTabIDs: [TabID] = []
+    private(set) var finalizedCloseTabIDs: [TabID] = []
+    private var pausePrepareClose = false
+    private var prepareClosePaused = false
+    private var prepareClosePauseWaiter: CheckedContinuation<Void, Never>?
+    private var prepareCloseResumeWaiter: CheckedContinuation<Void, Never>?
+    private var pauseCreate = false
+    private var createPaused = false
+    private var createPauseWaiter: CheckedContinuation<Void, Never>?
+    private var createResumeWaiter: CheckedContinuation<Void, Never>?
+    private var pauseFinalizeClose = false
+    private var finalizeClosePaused = false
+    private var finalizeClosePauseWaiter: CheckedContinuation<Void, Never>?
+    private var finalizeCloseResumeWaiter: CheckedContinuation<Void, Never>?
+    private var pauseRestart = false
+    private var restartPaused = false
+    private var restartPauseWaiter: CheckedContinuation<Void, Never>?
+    private var restartResumeWaiter: CheckedContinuation<Void, Never>?
+
+    func createTab(
+        for option: NewTabPickerOption,
+        tabID: TabID,
+        in active: ActiveContext
+    ) async throws -> WorkspaceTabKind {
+        createCalls.append(.init(option: option, tabID: tabID, contextID: active.contextID))
+        if pauseCreate {
+            pauseCreate = false
+            createPaused = true
+            createPauseWaiter?.resume()
+            createPauseWaiter = nil
+            await withCheckedContinuation { createResumeWaiter = $0 }
+            createPaused = false
+        }
+        return createdKind
+    }
+
+    func reattachTerminal(
+        in active: ActiveContext,
+        excluding sessionIDs: Set<TerminalSessionID>
+    ) async throws -> WorkspaceTabKind {
+        reattachExclusions.append(sessionIDs)
+        return reattachedKind
+    }
+
+    func restartTerminal(
+        _ tab: WorkspaceTab,
+        in active: ActiveContext,
+        switchingTo profileID: AgentProfileID?
+    ) async throws -> WorkspaceTabKind {
+        restartCalls.append(.init(tabID: tab.id, profileID: profileID))
+        if pauseRestart {
+            pauseRestart = false
+            restartPaused = true
+            restartPauseWaiter?.resume()
+            restartPauseWaiter = nil
+            await withCheckedContinuation { restartResumeWaiter = $0 }
+            restartPaused = false
+        }
+        return restartedKind
+    }
+
+    func pauseNextRestart() { pauseRestart = true }
+
+    func waitUntilRestartPaused() async {
+        if restartPaused { return }
+        await withCheckedContinuation { restartPauseWaiter = $0 }
+    }
+
+    func resumeRestart() {
+        restartResumeWaiter?.resume()
+        restartResumeWaiter = nil
+    }
+
+    func pauseNextPrepareClose() { pausePrepareClose = true }
+    func pauseNextFinalizeClose() { pauseFinalizeClose = true }
+
+    func pauseNextCreate() { pauseCreate = true }
+
+    func waitUntilCreatePaused() async {
+        if createPaused { return }
+        await withCheckedContinuation { createPauseWaiter = $0 }
+    }
+
+    func resumeCreate() {
+        createResumeWaiter?.resume()
+        createResumeWaiter = nil
+    }
+
+    func waitUntilPrepareClosePaused() async {
+        if prepareClosePaused { return }
+        await withCheckedContinuation { prepareClosePauseWaiter = $0 }
+    }
+
+    func resumePrepareClose() {
+        prepareCloseResumeWaiter?.resume()
+        prepareCloseResumeWaiter = nil
+    }
+
+    func waitUntilFinalizeClosePaused() async {
+        if finalizeClosePaused { return }
+        await withCheckedContinuation { finalizeClosePauseWaiter = $0 }
+    }
+
+    func resumeFinalizeClose() {
+        finalizeCloseResumeWaiter?.resume()
+        finalizeCloseResumeWaiter = nil
+    }
+
+    func prepareClose(_ tab: WorkspaceTab, in active: ActiveContext) async throws -> Bool {
+        preparedCloseTabIDs.append(tab.id)
+        if pausePrepareClose {
+            pausePrepareClose = false
+            prepareClosePaused = true
+            prepareClosePauseWaiter?.resume()
+            prepareClosePauseWaiter = nil
+            await withCheckedContinuation { prepareCloseResumeWaiter = $0 }
+            prepareClosePaused = false
+        }
+        return closeResult
+    }
+
+    func finalizeClose(_ tab: WorkspaceTab, in active: ActiveContext) async throws {
+        finalizedCloseTabIDs.append(tab.id)
+        if pauseFinalizeClose {
+            pauseFinalizeClose = false
+            finalizeClosePaused = true
+            finalizeClosePauseWaiter?.resume()
+            finalizeClosePauseWaiter = nil
+            await withCheckedContinuation { finalizeCloseResumeWaiter = $0 }
+            finalizeClosePaused = false
+        }
+        if let finalizeError { throw finalizeError }
+    }
+
+    func performRelocation(
+        _ operation: FileOperation,
+        workspaceContextID: WorkspaceContextID
+    ) async throws {
+        relocations.append(.init(operation: operation, contextID: workspaceContextID))
     }
 }
 
@@ -326,6 +1035,30 @@ private actor MemoryClientWorkspaceStateService: ClientWorkspaceStateServing {
     }
 
     func saveClientState(_ state: ClientWorkspaceState) throws {
+        let valid = try state.validated()
+        values[valid.key] = valid
+    }
+}
+
+private enum WorkspaceStateTestError: Error {
+    case saveFailed
+}
+
+private actor FailingClientWorkspaceStateService: ClientWorkspaceStateServing {
+    private var values: [ClientWorkspaceStateKey: ClientWorkspaceState] = [:]
+    private var shouldFailNextSave = false
+
+    func failNextSave() { shouldFailNextSave = true }
+
+    func loadClientState(_ key: ClientWorkspaceStateKey) -> ClientWorkspaceState? {
+        values[key]
+    }
+
+    func saveClientState(_ state: ClientWorkspaceState) throws {
+        if shouldFailNextSave {
+            shouldFailNextSave = false
+            throw WorkspaceStateTestError.saveFailed
+        }
         let valid = try state.validated()
         values[valid.key] = valid
     }
@@ -489,6 +1222,86 @@ private actor PausingWorkspaceService: WorkspaceServing {
     }
 }
 
+private actor PausingCreationWorkspaceService: WorkspaceServing {
+    enum PausedOperation: Equatable { case project, conversation }
+
+    let snapshot: WorkspaceSnapshot
+    let resolved: [WorkspaceContextID: ResolvedWorkspaceContext]
+    let project: ProjectSnapshot
+    let conversation: Conversation
+    private var pausedOperation: PausedOperation?
+    private var isPaused = false
+    private var pauseContinuation: CheckedContinuation<Void, Never>?
+    private var resumeContinuation: CheckedContinuation<Void, Never>?
+    private var projectCount = 0
+    private var conversationCount = 0
+
+    init(
+        snapshot: WorkspaceSnapshot,
+        resolved: [WorkspaceContextID: ResolvedWorkspaceContext],
+        project: ProjectSnapshot,
+        conversation: Conversation
+    ) {
+        self.snapshot = snapshot
+        self.resolved = resolved
+        self.project = project
+        self.conversation = conversation
+    }
+
+    func pauseNextProjectCreation() { pausedOperation = .project }
+    func pauseNextConversationCreation() { pausedOperation = .conversation }
+    func projectCreateCount() -> Int { projectCount }
+    func conversationCreateCount() -> Int { conversationCount }
+
+    func waitUntilCreationPaused() async {
+        if isPaused { return }
+        await withCheckedContinuation { pauseContinuation = $0 }
+    }
+
+    func resumeCreation() {
+        isPaused = false
+        resumeContinuation?.resume()
+        resumeContinuation = nil
+    }
+
+    private func pauseIfNeeded(_ operation: PausedOperation) async {
+        guard pausedOperation == operation else { return }
+        pausedOperation = nil
+        isPaused = true
+        pauseContinuation?.resume()
+        pauseContinuation = nil
+        await withCheckedContinuation { resumeContinuation = $0 }
+    }
+
+    func addProject(bookmark: Data, displayName: String) async -> ProjectSnapshot {
+        projectCount += 1
+        await pauseIfNeeded(.project)
+        return project
+    }
+
+    func listWorkspace() -> WorkspaceSnapshot { snapshot }
+
+    func createDirectConversation(projectID: ProjectID) async -> Conversation {
+        conversationCount += 1
+        await pauseIfNeeded(.conversation)
+        return conversation
+    }
+
+    func renameConversation(id: ConversationID, title: String) {}
+
+    func resolveContext(_ id: WorkspaceContextID) throws -> ResolvedWorkspaceContext {
+        guard let value = resolved[id] else { throw WorkspaceRepositoryError.projectNotFound }
+        return value
+    }
+
+    func performFileOperation(
+        context: RequestContext,
+        operation: FileOperation
+    ) throws -> FileOperationResult {
+        throw FileOperationError.environmentNotRegistered
+    }
+}
+
 @MainActor
 private func XCTAssertThrowsErrorAsync<E: Error>(
     _ expected: E.Type,
@@ -498,6 +1311,21 @@ private func XCTAssertThrowsErrorAsync<E: Error>(
         try await operation()
         XCTFail("Expected \(expected)")
     } catch is E {
+    } catch {
+        XCTFail("Expected \(expected), got \(error)")
+    }
+}
+
+@MainActor
+private func XCTAssertThrowsWorkspaceViewModelError(
+    _ expected: WorkspaceViewModelError,
+    operation: () async throws -> Void
+) async {
+    do {
+        try await operation()
+        XCTFail("Expected \(expected)")
+    } catch let error as WorkspaceViewModelError {
+        XCTAssertEqual(error, expected)
     } catch {
         XCTFail("Expected \(expected), got \(error)")
     }

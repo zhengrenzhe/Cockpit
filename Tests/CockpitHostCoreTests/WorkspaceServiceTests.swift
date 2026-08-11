@@ -179,6 +179,42 @@ import CockpitTypes
     }
 }
 
+@Test func securityScopedExecutableResolverFailsClosedWhenManualAccessCannotStart() throws {
+    try withSecurityScopeFixture(isDirectory: false) { url in
+        let boundary = RecordingSecurityScopeBoundary(
+            resolvedURL: url,
+            startAccessResult: false
+        )
+        let resolver = SecurityScopedExecutableBookmarkResolver(boundary: boundary)
+
+        do {
+            _ = try resolver.resolve(bookmark: Data([0x02]))
+            Issue.record("Expected executable security-scope start to fail")
+        } catch {
+            let actual = error as NSError
+            #expect(actual.domain == NSCocoaErrorDomain)
+            #expect(actual.code == CocoaError.Code.fileReadNoPermission.rawValue)
+        }
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs.isEmpty)
+    }
+}
+
+@Test func securityScopedExecutableResolverCanonicalizesAndStopsExactlyOnce() throws {
+    try withSecurityScopeFixture(isDirectory: false) { url in
+        let boundary = RecordingSecurityScopeBoundary(resolvedURL: url)
+        let resolver = SecurityScopedExecutableBookmarkResolver(boundary: boundary)
+
+        let resolved = try resolver.resolve(bookmark: Data([0x03]))
+
+        #expect(resolved == url.resolvingSymlinksInPath().standardizedFileURL.path)
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs == [url])
+        #expect(boundary.usedWithSecurityScope)
+        #expect(boundary.usedWithoutImplicitStartAccessing)
+    }
+}
+
 @Test func staleBookmarkFailsAddProjectBeforeStartingSecurityScope() async throws {
     let url = try makeSecurityScopeFixture(isDirectory: true)
     defer { try? FileManager.default.removeItem(at: url) }

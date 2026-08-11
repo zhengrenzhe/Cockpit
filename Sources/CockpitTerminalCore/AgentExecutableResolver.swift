@@ -38,8 +38,19 @@ public struct AgentExecutableResolver: Sendable {
     public func resolve(
         profileID: AgentProfileID,
         loginShellPath: String,
+        selectedExecutablePath: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) async throws -> String {
+        if let selectedExecutablePath {
+            guard let canonical = Self.canonicalExecutable(selectedExecutablePath),
+                  Self.isExecutable(canonical, effectiveUserID: effectiveUserID)
+            else {
+                throw AgentExecutableResolverError.agentExecutableSelectionRequired
+            }
+            try await repository.storeCanonicalExecutable(canonical, for: profileID)
+            return canonical
+        }
+
         if let stored = try await repository.canonicalExecutable(for: profileID) {
             guard Self.isExecutable(stored, effectiveUserID: effectiveUserID) else {
                 throw AgentExecutableResolverError.agentExecutableSelectionRequired

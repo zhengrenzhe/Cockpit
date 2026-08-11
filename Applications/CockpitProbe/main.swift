@@ -50,6 +50,16 @@ enum CockpitProbe {
                 mode: values[5],
                 marker: values.count == 7 ? values[6] : nil
             )
+        case "context-workflow":
+            let values = Array(CommandLine.arguments.dropFirst(2))
+            guard values.count == 5 else { throw ProbeError.invalidCommand }
+            try await contextWorkflow(
+                runtimeDirectory: values[0],
+                projectRoot: values[1],
+                codexExecutablePath: values[2],
+                claudeExecutablePath: values[3],
+                agentOutputDirectory: values[4]
+            )
         default:
             throw ProbeError.invalidCommand
         }
@@ -113,7 +123,14 @@ enum CockpitProbe {
             arguments: [],
             terminalSize: try TerminalResize(validatingColumns: 80, rows: 24),
             environmentOverrides: [:],
-            idempotencyKey: RequestID()
+            idempotencyKey: RequestID(),
+            selectedExecutableBookmark: try executablePath.map {
+                try URL(fileURLWithPath: $0).bookmarkData(
+                    options: .withSecurityScope,
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                )
+            }
         ))
         guard let workerID = record.workerID else {
             throw CocoaError(.coderInvalidValue)
@@ -134,6 +151,242 @@ enum CockpitProbe {
             ]
         }
         print(fields.joined(separator: "\t"))
+    }
+
+    private static func contextWorkflow(
+        runtimeDirectory: String,
+        projectRoot: String,
+        codexExecutablePath: String,
+        claudeExecutablePath: String,
+        agentOutputDirectory: String
+    ) async throws {
+        let host = HostXPCClient()
+        guard try await host.listWorkspace().isEmpty else {
+            throw ProbeError.terminalFailure("workspace fixture is not empty")
+        }
+        let projectBookmark = try URL(
+            fileURLWithPath: projectRoot,
+            isDirectory: true
+        ).bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        let codexBookmark = try executableBookmark(path: codexExecutablePath)
+        let claudeBookmark = try executableBookmark(path: claudeExecutablePath)
+        let project = try await host.addProject(
+            bookmark: projectBookmark,
+            displayName: "Task 18 Project"
+        )
+        guard project.conversations.isEmpty else {
+            throw ProbeError.terminalFailure("project unexpectedly created a conversation")
+        }
+        let conversationOne = try await host.createDirectConversation(
+            projectID: project.projectID
+        )
+        try await host.renameConversation(
+            id: conversationOne.id,
+            title: "Task 18 One"
+        )
+        let conversationTwo = try await host.createDirectConversation(
+            projectID: project.projectID
+        )
+        let projectContext = project.resolvedContext
+        let firstContext = try await host.resolveContext(.conversation(conversationOne.id))
+        let secondContext = try await host.resolveContext(.conversation(conversationTwo.id))
+        guard projectContext.projectID == project.projectID,
+              firstContext.projectID == project.projectID,
+              secondContext.projectID == project.projectID,
+              projectContext.environmentID == firstContext.environmentID,
+              firstContext.environmentID == secondContext.environmentID,
+              firstContext.conversationID == conversationOne.id,
+              secondContext.conversationID == conversationTwo.id
+        else { throw ProbeError.terminalFailure("context binding mismatch") }
+
+        let projectTerminal = HostTerminalControlTransport(
+            client: host,
+            contextID: projectContext.contextID,
+            environmentID: projectContext.environmentID,
+            runtimeDirectory: runtimeDirectory
+        )
+        let firstTerminal = HostTerminalControlTransport(
+            client: host,
+            contextID: firstContext.contextID,
+            environmentID: firstContext.environmentID,
+            runtimeDirectory: runtimeDirectory
+        )
+        let secondTerminal = HostTerminalControlTransport(
+            client: host,
+            contextID: secondContext.contextID,
+            environmentID: secondContext.environmentID,
+            runtimeDirectory: runtimeDirectory
+        )
+        let projectShell = try await createWorkflowTerminal(
+            transport: projectTerminal,
+            context: projectContext,
+            kind: .shell,
+            executableBookmark: nil,
+            agentOutputPath: nil
+        )
+        let firstCodex = try await createWorkflowTerminal(
+            transport: firstTerminal,
+            context: firstContext,
+            kind: .agent(.codex),
+            executableBookmark: codexBookmark,
+            agentOutputPath: URL(
+                fileURLWithPath: agentOutputDirectory,
+                isDirectory: true
+            ).appendingPathComponent("conversation-one-codex").path
+        )
+        let firstClaude = try await createWorkflowTerminal(
+            transport: firstTerminal,
+            context: firstContext,
+            kind: .agent(.claude),
+            executableBookmark: claudeBookmark,
+            agentOutputPath: URL(
+                fileURLWithPath: agentOutputDirectory,
+                isDirectory: true
+            ).appendingPathComponent("conversation-one-claude").path
+        )
+        let firstShell = try await createWorkflowTerminal(
+            transport: firstTerminal,
+            context: firstContext,
+            kind: .shell,
+            executableBookmark: nil,
+            agentOutputPath: nil
+        )
+        let secondCodex = try await createWorkflowTerminal(
+            transport: secondTerminal,
+            context: secondContext,
+            kind: .agent(.codex),
+            executableBookmark: codexBookmark,
+            agentOutputPath: URL(
+                fileURLWithPath: agentOutputDirectory,
+                isDirectory: true
+            ).appendingPathComponent("conversation-two-codex").path
+        )
+        let exited = try await waitForWorkflowFinalSession(
+            firstCodex.sessionID,
+            transport: firstTerminal
+        )
+        guard exited.exitStatus == 0, exited.kind == .agent(.codex) else {
+            throw ProbeError.terminalFailure("agent exit record mismatch")
+        }
+        _ = try await waitForWorkflowFinalSession(
+            firstClaude.sessionID,
+            transport: firstTerminal
+        )
+        _ = try await waitForWorkflowFinalSession(
+            secondCodex.sessionID,
+            transport: secondTerminal
+        )
+        let restarted = try await createWorkflowTerminal(
+            transport: firstTerminal,
+            context: firstContext,
+            kind: .agent(.codex),
+            executableBookmark: codexBookmark,
+            agentOutputPath: URL(
+                fileURLWithPath: agentOutputDirectory,
+                isDirectory: true
+            ).appendingPathComponent("conversation-one-codex-restart").path
+        )
+        _ = try await waitForWorkflowFinalSession(
+            restarted.sessionID,
+            transport: firstTerminal
+        )
+
+        let projectSessions = try await projectTerminal.list()
+        let firstSessions = try await firstTerminal.list()
+        let secondSessions = try await secondTerminal.list()
+        guard projectSessions.map(\.sessionID) == [projectShell.sessionID],
+              Set(firstSessions.map(\.sessionID)) == Set([
+                  firstCodex.sessionID,
+                  firstClaude.sessionID,
+                  firstShell.sessionID,
+                  restarted.sessionID,
+              ]),
+              secondSessions.map(\.sessionID) == [secondCodex.sessionID]
+        else { throw ProbeError.terminalFailure("context terminal isolation mismatch") }
+        let workspace = try await host.listWorkspace()
+        guard workspace.count == 1,
+              workspace[0].conversations.count == 2,
+              workspace[0].conversations.first(where: { $0.id == conversationOne.id })?.title
+                == "Task 18 One"
+        else { throw ProbeError.terminalFailure("workspace workflow mismatch") }
+
+        print([
+            project.projectID.description,
+            projectContext.environmentID.description,
+            conversationOne.id.description,
+            conversationTwo.id.description,
+            projectShell.sessionID.description,
+            firstCodex.sessionID.description,
+            firstClaude.sessionID.description,
+            firstShell.sessionID.description,
+            secondCodex.sessionID.description,
+            exited.sessionID.description,
+            String(exited.exitStatus!),
+            restarted.sessionID.description,
+            String(projectSessions.count),
+            String(firstSessions.count),
+            String(secondSessions.count),
+        ].joined(separator: "\t"))
+    }
+
+    private static func createWorkflowTerminal(
+        transport: HostTerminalControlTransport,
+        context: ResolvedWorkspaceContext,
+        kind: TerminalKind,
+        executableBookmark: Data?,
+        agentOutputPath: String?
+    ) async throws -> ClientTerminalSession {
+        let session = try await transport.create(TerminalCreateRequest(
+            contextID: context.contextID,
+            environmentID: context.environmentID,
+            kind: kind,
+            arguments: agentOutputPath.map { [$0] } ?? [],
+            terminalSize: try TerminalResize(validatingColumns: 80, rows: 24),
+            environmentOverrides: [:],
+            idempotencyKey: RequestID(),
+            selectedExecutableBookmark: executableBookmark
+        ))
+        guard session.contextID == context.contextID,
+              session.environmentID == context.environmentID,
+              session.kind == kind
+        else { throw ProbeError.terminalFailure("created terminal binding mismatch") }
+        return session
+    }
+
+    private static func executableBookmark(path: String) throws -> Data {
+        try URL(fileURLWithPath: path, isDirectory: false).bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+    }
+
+    private static func waitForWorkflowFinalSession(
+        _ sessionID: TerminalSessionID,
+        transport: HostTerminalControlTransport
+    ) async throws -> ClientTerminalSession {
+        var lastObserved: ClientTerminalSession?
+        for _ in 0..<200 {
+            if let session = try await transport.list().first(where: {
+                $0.sessionID == sessionID
+            }) {
+                lastObserved = session
+                switch session.lifecycleState {
+                case .exited, .terminated, .interrupted:
+                    return session
+                case .preparing, .committed, .running:
+                    break
+                }
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw ProbeError.terminalFailure(
+            "final session timeout: session=\(sessionID) lifecycle=\(String(describing: lastObserved?.lifecycleState)) exit=\(String(describing: lastObserved?.exitStatus))"
+        )
     }
 
     private static func terminalViewer(

@@ -77,10 +77,14 @@ public actor TerminalSupervisorXPCClient {
     public func createResolved(
         _ request: ResolvedTerminalCreateRequest
     ) async throws -> TerminalSessionRecord {
-        guard case let .session(value) = try await command(.createResolved(request)) else {
+        switch try await command(.createResolved(request)) {
+        case let .session(value):
+            return value
+        case let .agentExecutableSelectionRequired(profileID):
+            throw TerminalSupervisorCreateError.agentExecutableSelectionRequired(profileID)
+        default:
             throw CocoaError(.coderInvalidValue)
         }
-        return value
     }
 
     public func openArchive(sessionID: TerminalSessionID) async throws -> FileHandle {

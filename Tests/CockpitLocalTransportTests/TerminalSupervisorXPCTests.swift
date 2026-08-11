@@ -478,6 +478,38 @@ import CockpitTypes
     await client.disconnect()
 }
 
+@Test func terminalSupervisorXPCPreservesTypedAgentExecutableSelectionRequired() async throws {
+    let contextID = WorkspaceContextID.project(ProjectID())
+    let request = ResolvedTerminalCreateRequest(
+        contextID: contextID,
+        environmentID: EnvironmentID(),
+        kind: .agent(.codex),
+        arguments: [],
+        workspaceRoot: "/private/tmp/Cockpit",
+        terminalSize: try TerminalResize(validatingColumns: 120, rows: 40),
+        environmentOverrides: [:],
+        idempotencyKey: RequestID()
+    )
+    let exported = TerminalSupervisorXPCExport(
+        handshakeHandler: { try TerminalSupervisorHandshakeHandler().handle($0) },
+        commandHandler: { command in
+            guard command == .createResolved(request) else {
+                throw CocoaError(.coderInvalidValue)
+            }
+            return .agentExecutableSelectionRequired(.codex)
+        }
+    )
+    let connection = FakeTerminalSupervisorConnection(proxy: exported)
+    let client = TerminalSupervisorXPCClient(connectionFactory: { _ in connection })
+
+    await #expect(
+        throws: TerminalSupervisorCreateError.agentExecutableSelectionRequired(.codex)
+    ) {
+        _ = try await client.createResolved(request)
+    }
+    await client.disconnect()
+}
+
 @Test func terminalSupervisorProtocolRejectsWrongUIDBeforeExportOrResume() {
     let delegate = MachServiceListenerDelegate(
         exportedObject: NSObject(),
