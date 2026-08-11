@@ -303,6 +303,47 @@ import CockpitTerminalCore
     await client.disconnect()
 }
 
+@Test func hostClientRoundTripsDurableClientWorkspaceStateThroughWorkspaceCommand() async throws {
+    let fixture = try WorkspaceFixture()
+    let workspace = RecordingWorkspaceService(fixture: fixture)
+    let clientStates = RecordingClientWorkspaceStateService()
+    let exported = HostXPCExport(
+        handshakeHandler: { try HostHandshakeHandler().handle($0) },
+        workspaceRouter: WorkspaceCommandRouter(
+            service: workspace,
+            clientStateService: clientStates
+        )
+    )
+    let connection = FakeHostClientConnection(proxy: exported)
+    let client = HostXPCClient(connectionFactory: { _ in connection })
+    let key = ClientWorkspaceStateKey(
+        deviceID: DeviceID(UUID(uuidString: "00000000-0000-0000-0000-000000000911")!),
+        windowID: WindowID(UUID(uuidString: "00000000-0000-0000-0000-000000000912")!),
+        workspaceContextID: .project(fixture.projectID)
+    )
+    let tab = try TabRecord(
+        validatingID: TabID(UUID(uuidString: "00000000-0000-0000-0000-000000000913")!),
+        resource: .terminal(TerminalSessionID(UUID(uuidString: "00000000-0000-0000-0000-000000000914")!)),
+        terminalKind: .codex,
+        fileViewState: nil
+    )
+    let state = try ClientWorkspaceState(
+        validatingKey: key,
+        tabs: [tab],
+        selectedTabID: tab.id,
+        sidebar: SidebarState(isCollapsed: false),
+        splitView: SplitViewState(
+            validatingLeadingPaneWidth: 240,
+            trailingPaneWidth: 300
+        )
+    )
+
+    #expect(try await client.loadClientState(key) == nil)
+    try await client.saveClientState(state)
+    #expect(try await client.loadClientState(key) == state)
+    await client.disconnect()
+}
+
 @Test func hostExportAndClientPreservePOSIXAndCocoaErrorDomainCodeAndPath() async throws {
     let fixture = try WorkspaceFixture()
     let errors = [
@@ -1083,6 +1124,21 @@ private actor RecordingWorkspaceService: WorkspaceServing {
         case let .createDirectory(_, name): return .created(path: try RelativePath(name), kind: .directory)
         default: throw FileOperationError.invalidPath
         }
+    }
+}
+
+private actor RecordingClientWorkspaceStateService: ClientWorkspaceStateServing {
+    private var values: [ClientWorkspaceStateKey: ClientWorkspaceState] = [:]
+
+    func loadClientState(
+        _ key: ClientWorkspaceStateKey
+    ) -> ClientWorkspaceState? {
+        values[key]
+    }
+
+    func saveClientState(_ state: ClientWorkspaceState) throws {
+        let valid = try state.validated()
+        values[valid.key] = valid
     }
 }
 

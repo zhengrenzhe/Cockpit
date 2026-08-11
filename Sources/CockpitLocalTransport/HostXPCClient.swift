@@ -3,7 +3,7 @@ import CockpitHostCore
 import CockpitProtocol
 import CockpitTypes
 
-public actor HostXPCClient: WorkspaceServing {
+public actor HostXPCClient: WorkspaceServing, ClientWorkspaceStateServing {
     private struct ActiveConnection: Sendable {
         let value: any XPCConnectionBoundary
         let generation: UInt64
@@ -94,6 +94,23 @@ public actor HostXPCClient: WorkspaceServing {
             throw CocoaError(.coderInvalidValue)
         }
         return value
+    }
+
+    public func loadClientState(
+        _ key: ClientWorkspaceStateKey
+    ) async throws -> ClientWorkspaceState? {
+        guard case let .clientWorkspaceState(value) = try await send(
+            .loadClientState(key)
+        ) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return value
+    }
+
+    public func saveClientState(_ state: ClientWorkspaceState) async throws {
+        guard case .empty = try await send(.saveClientState(state)) else {
+            throw CocoaError(.coderInvalidValue)
+        }
     }
 
     public func issueHostDataPlaneTicket(

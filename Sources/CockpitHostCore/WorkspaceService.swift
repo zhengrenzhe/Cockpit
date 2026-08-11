@@ -34,6 +34,13 @@ public protocol WorkspaceServing: Sendable {
     ) async throws -> FileOperationResult
 }
 
+public protocol ClientWorkspaceStateServing: Sendable {
+    func loadClientState(
+        _ key: ClientWorkspaceStateKey
+    ) async throws -> ClientWorkspaceState?
+    func saveClientState(_ state: ClientWorkspaceState) async throws
+}
+
 public protocol ProjectRootAccessToken: AnyObject, Sendable {}
 
 public struct ResolvedProjectRoot: Sendable {
@@ -63,7 +70,7 @@ public protocol WorkspaceKernelRegistering: FileOperationServing, Sendable {
     func register(environmentID: EnvironmentID, root: ResolvedProjectRoot) async
 }
 
-public actor WorkspaceService: WorkspaceServing {
+public actor WorkspaceService: WorkspaceServing, ClientWorkspaceStateServing {
     private let repository: any WorkspaceRepository
     private let rootResolver: any ProjectRootResolving
     private let kernelRegistry: any WorkspaceKernelRegistering
@@ -142,6 +149,19 @@ public actor WorkspaceService: WorkspaceServing {
         let (_, root) = try await registerProject(id: resolved.projectID)
         await kernelRegistry.register(environmentID: resolved.environmentID, root: root)
         return try await kernelRegistry.perform(operation, in: resolved.environmentID)
+    }
+
+    public func loadClientState(
+        _ key: ClientWorkspaceStateKey
+    ) async throws -> ClientWorkspaceState? {
+        guard let state = try await repository.loadClientState(key) else { return nil }
+        let valid = try state.validated()
+        guard valid.key == key else { throw WorkspaceRepositoryError.invalidStoredValue }
+        return valid
+    }
+
+    public func saveClientState(_ state: ClientWorkspaceState) async throws {
+        try await repository.saveClientState(try state.validated())
     }
 
     private func snapshot(for project: Project) async throws -> ProjectSnapshot {

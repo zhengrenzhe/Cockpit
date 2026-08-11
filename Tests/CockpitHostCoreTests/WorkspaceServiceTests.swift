@@ -4,6 +4,41 @@ import CockpitTypes
 @testable import CockpitWorkspace
 @testable import CockpitHostCore
 
+@Test func hostOwnedClientWorkspaceStateRoundTripsThroughRepository() async throws {
+    let repository = InMemoryWorkspaceRepository()
+    let service = WorkspaceService(
+        repository: repository,
+        rootResolver: FixedProjectRootResolver(root: makeResolvedRoot()),
+        kernelRegistry: WorkspaceKernelRegistry()
+    )
+    let projectID = ProjectID(UUID(uuidString: "00000000-0000-0000-0000-000000000901")!)
+    let key = ClientWorkspaceStateKey(
+        deviceID: DeviceID(UUID(uuidString: "00000000-0000-0000-0000-000000000902")!),
+        windowID: WindowID(UUID(uuidString: "00000000-0000-0000-0000-000000000903")!),
+        workspaceContextID: .project(projectID)
+    )
+    let tab = try TabRecord(
+        validatingID: TabID(UUID(uuidString: "00000000-0000-0000-0000-000000000904")!),
+        resource: .terminal(TerminalSessionID(UUID(uuidString: "00000000-0000-0000-0000-000000000905")!)),
+        terminalKind: .claude,
+        fileViewState: nil
+    )
+    let state = try ClientWorkspaceState(
+        validatingKey: key,
+        tabs: [tab],
+        selectedTabID: tab.id,
+        sidebar: SidebarState(isCollapsed: true),
+        splitView: SplitViewState(
+            validatingLeadingPaneWidth: 212,
+            trailingPaneWidth: 344
+        )
+    )
+
+    #expect(try await service.loadClientState(key) == nil)
+    try await service.saveClientState(state)
+    #expect(try await service.loadClientState(key) == state)
+}
+
 @Test func addingProjectCreatesSelectableProjectContextWithoutConversationOrTerminalCreation() async throws {
     let repository = InMemoryWorkspaceRepository()
     let registry = WorkspaceKernelRegistry()

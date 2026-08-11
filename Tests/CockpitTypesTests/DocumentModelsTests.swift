@@ -82,6 +82,39 @@ private func documentUUID(_ suffix: Int) throws -> UUID {
     }
 }
 
+@Test func terminalTabKindRoundTripsAndLegacyRecordsDefaultOnlyToShell() throws {
+    let tabID = TabID(try documentUUID(8))
+    let terminalID = TerminalSessionID(try documentUUID(9))
+    let codex = try TabRecord(
+        validatingID: tabID,
+        resource: .terminal(terminalID),
+        terminalKind: .codex,
+        fileViewState: nil
+    )
+
+    let encoded = try JSONEncoder().encode(codex)
+    let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+    #expect(object["terminalKind"] as? String == "codex")
+    #expect(try JSONDecoder().decode(TabRecord.self, from: encoded) == codex)
+
+    let legacy = try #require("""
+    {"id":"00000000-0000-0000-0000-000000000008",
+     "resource":{"kind":"terminal","terminalSessionID":"00000000-0000-0000-0000-000000000009"},
+     "fileViewState":null}
+    """.data(using: .utf8))
+    let decodedLegacy = try JSONDecoder().decode(TabRecord.self, from: legacy)
+    #expect(decodedLegacy.terminalKind == .shell)
+
+    #expect(throws: CockpitDomainValidationError.invalidTabViewState) {
+        _ = try TabRecord(
+            validatingID: tabID,
+            resource: .file(DocumentID()),
+            terminalKind: .claude,
+            fileViewState: .initial()
+        )
+    }
+}
+
 @Test func codableRevalidatesMutatedDocumentAndTabState() throws {
     var state = DocumentViewState.initial()
     state.horizontalScrollOffset = .nan

@@ -8,6 +8,8 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
     case renameConversation(id: ConversationID, title: String)
     case resolveContext(WorkspaceContextID)
     case performFileOperation(context: RequestContext, operation: FileOperation)
+    case loadClientState(ClientWorkspaceStateKey)
+    case saveClientState(ClientWorkspaceState)
 
     private enum Command: String, Codable {
         case addProject
@@ -16,6 +18,8 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case renameConversation
         case resolveContext
         case performFileOperation
+        case loadClientState
+        case saveClientState
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -28,6 +32,8 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
         case contextID
         case context
         case fileOperation
+        case clientStateKey
+        case clientState
     }
 
     public init(from decoder: Decoder) throws {
@@ -82,6 +88,16 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
                 context: try container.decode(WireRequestContext.self, forKey: .context).value,
                 operation: try container.decode(WireFileOperation.self, forKey: .fileOperation).value
             )
+        case .loadClientState:
+            try requireExactKeys(decoder, required: ["command", "clientStateKey"])
+            self = .loadClientState(
+                try container.decode(ClientWorkspaceStateKey.self, forKey: .clientStateKey)
+            )
+        case .saveClientState:
+            try requireExactKeys(decoder, required: ["command", "clientState"])
+            self = .saveClientState(
+                try container.decode(ClientWorkspaceState.self, forKey: .clientState).validated()
+            )
         }
     }
 
@@ -108,6 +124,12 @@ public enum WorkspaceCommandRequest: Hashable, Sendable, Codable {
             try container.encode(Command.performFileOperation, forKey: .command)
             try container.encode(WireRequestContext(context), forKey: .context)
             try container.encode(WireFileOperation(operation), forKey: .fileOperation)
+        case let .loadClientState(key):
+            try container.encode(Command.loadClientState, forKey: .command)
+            try container.encode(key, forKey: .clientStateKey)
+        case let .saveClientState(state):
+            try container.encode(Command.saveClientState, forKey: .command)
+            try container.encode(try state.validated(), forKey: .clientState)
         }
     }
 
@@ -132,6 +154,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
     case empty
     case resolvedContext(ResolvedWorkspaceContext)
     case fileOperationResult(FileOperationResult)
+    case clientWorkspaceState(ClientWorkspaceState?)
 
     private enum Result: String, Codable {
         case projectSnapshot
@@ -140,6 +163,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case empty
         case resolvedContext
         case fileOperationResult
+        case clientWorkspaceState
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -149,6 +173,7 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case conversation
         case resolvedContext
         case fileOperationResult
+        case clientWorkspaceState
     }
 
     public init(from decoder: Decoder) throws {
@@ -189,6 +214,14 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
             self = .fileOperationResult(
                 try container.decode(WireFileOperationResult.self, forKey: .fileOperationResult).value
             )
+        case .clientWorkspaceState:
+            try requireExactKeys(decoder, required: ["result", "clientWorkspaceState"])
+            self = .clientWorkspaceState(
+                try container.decodeIfPresent(
+                    ClientWorkspaceState.self,
+                    forKey: .clientWorkspaceState
+                )?.validated()
+            )
         }
     }
 
@@ -212,6 +245,13 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
         case let .fileOperationResult(result):
             try container.encode(Result.fileOperationResult, forKey: .result)
             try container.encode(WireFileOperationResult(result), forKey: .fileOperationResult)
+        case let .clientWorkspaceState(state):
+            try container.encode(Result.clientWorkspaceState, forKey: .result)
+            if let state {
+                try container.encode(try state.validated(), forKey: .clientWorkspaceState)
+            } else {
+                try container.encodeNil(forKey: .clientWorkspaceState)
+            }
         }
     }
 
@@ -231,9 +271,15 @@ public enum WorkspaceCommandResponse: Hashable, Sendable, Codable {
 
 public struct WorkspaceCommandRouter: Sendable {
     private let service: any WorkspaceServing
+    private let clientStateService: (any ClientWorkspaceStateServing)?
 
-    public init(service: any WorkspaceServing) {
+    public init(
+        service: any WorkspaceServing,
+        clientStateService: (any ClientWorkspaceStateServing)? = nil
+    ) {
         self.service = service
+        self.clientStateService = clientStateService
+            ?? (service as? any ClientWorkspaceStateServing)
     }
 
     public func route(_ data: Data) async throws -> Data {
@@ -259,6 +305,15 @@ public struct WorkspaceCommandRouter: Sendable {
             response = .fileOperationResult(
                 try await service.performFileOperation(context: context, operation: operation)
             )
+        case let .loadClientState(key):
+            guard let clientStateService else { throw CocoaError(.coderInvalidValue) }
+            response = .clientWorkspaceState(
+                try await clientStateService.loadClientState(key)
+            )
+        case let .saveClientState(state):
+            guard let clientStateService else { throw CocoaError(.coderInvalidValue) }
+            try await clientStateService.saveClientState(state)
+            response = .empty
         }
         return try JSONEncoder().encode(response)
     }

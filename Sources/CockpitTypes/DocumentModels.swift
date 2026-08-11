@@ -104,6 +104,12 @@ public struct DocumentViewState: Hashable, Codable, Sendable {
     }
 }
 
+public enum TerminalTabKind: String, Hashable, Codable, Sendable {
+    case shell
+    case codex
+    case claude
+}
+
 public struct TabRecord: Hashable, Codable, Sendable {
     public enum Resource: Hashable, Codable, Sendable {
         case file(DocumentID)
@@ -159,24 +165,57 @@ public struct TabRecord: Hashable, Codable, Sendable {
 
     public let id: TabID
     public var resource: Resource
+    public var terminalKind: TerminalTabKind?
     public var fileViewState: DocumentViewState?
 
-    public init(validatingID id: TabID, resource: Resource, fileViewState: DocumentViewState?) throws {
-        switch (resource, fileViewState) {
-        case (.file, .some): break
-        case (.terminal, .none), (.newTabPicker, .none): break
+    public init(
+        validatingID id: TabID,
+        resource: Resource,
+        fileViewState: DocumentViewState?
+    ) throws {
+        try self.init(
+            validatingID: id,
+            resource: resource,
+            terminalKind: nil,
+            fileViewState: fileViewState
+        )
+    }
+
+    public init(
+        validatingID id: TabID,
+        resource: Resource,
+        terminalKind: TerminalTabKind?,
+        fileViewState: DocumentViewState?
+    ) throws {
+        let validTerminalKind: TerminalTabKind?
+        switch (resource, terminalKind, fileViewState) {
+        case (.file, .none, .some), (.newTabPicker, .none, .none):
+            validTerminalKind = nil
+        case (.terminal, let kind, .none):
+            validTerminalKind = kind ?? .shell
         default: throw CockpitDomainValidationError.invalidTabViewState
         }
         self.id = id
         self.resource = resource
+        self.terminalKind = validTerminalKind
         self.fileViewState = try fileViewState?.validated()
     }
 
     public func validated() throws -> Self {
-        try Self(validatingID: id, resource: resource, fileViewState: fileViewState)
+        try Self(
+            validatingID: id,
+            resource: resource,
+            terminalKind: terminalKind,
+            fileViewState: fileViewState
+        )
     }
 
-    private enum CodingKeys: String, CodingKey { case id, resource, fileViewState }
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case resource
+        case terminalKind
+        case fileViewState
+    }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -187,6 +226,10 @@ public struct TabRecord: Hashable, Codable, Sendable {
         try self.init(
             validatingID: TabID(uuid),
             resource: container.decode(Resource.self, forKey: .resource),
+            terminalKind: container.decodeIfPresent(
+                TerminalTabKind.self,
+                forKey: .terminalKind
+            ),
             fileViewState: container.decodeIfPresent(DocumentViewState.self, forKey: .fileViewState)
         )
     }
@@ -196,6 +239,7 @@ public struct TabRecord: Hashable, Codable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(valid.id.description, forKey: .id)
         try container.encode(valid.resource, forKey: .resource)
+        try container.encodeIfPresent(valid.terminalKind, forKey: .terminalKind)
         try container.encodeIfPresent(valid.fileViewState, forKey: .fileViewState)
     }
 }
