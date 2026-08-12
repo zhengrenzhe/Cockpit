@@ -24,6 +24,10 @@ struct SecurityScopedBookmarkResolution: Sendable {
 }
 
 protocol SecurityScopedBookmarkAccessing: Sendable {
+    func createBookmark(
+        for url: URL,
+        options: URL.BookmarkCreationOptions
+    ) throws -> Data
     func resolve(
         bookmark: Data,
         options: URL.BookmarkResolutionOptions
@@ -33,6 +37,17 @@ protocol SecurityScopedBookmarkAccessing: Sendable {
 }
 
 private struct FoundationSecurityScopedBookmarkAccess: SecurityScopedBookmarkAccessing {
+    func createBookmark(
+        for url: URL,
+        options: URL.BookmarkCreationOptions
+    ) throws -> Data {
+        try url.bookmarkData(
+            options: options,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+    }
+
     func resolve(
         bookmark: Data,
         options: URL.BookmarkResolutionOptions
@@ -95,6 +110,26 @@ public struct SecurityScopedProjectRootResolver: ProjectRootResolving {
 
     init(boundary: any SecurityScopedBookmarkAccessing) {
         self.boundary = boundary
+    }
+
+    public func importBookmark(
+        _ bookmark: Data
+    ) throws -> (persistentBookmark: Data, root: ResolvedProjectRoot) {
+        let clientResolution = try boundary.resolve(
+            bookmark: bookmark,
+            options: [.withoutUI]
+        )
+        guard !clientResolution.isStale else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let persistentBookmark = try boundary.createBookmark(
+            for: clientResolution.url,
+            options: .withSecurityScope
+        )
+        return (
+            persistentBookmark,
+            try resolve(bookmark: persistentBookmark)
+        )
     }
 
     public func resolve(bookmark: Data) throws -> ResolvedProjectRoot {

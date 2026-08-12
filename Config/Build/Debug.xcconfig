@@ -1,0 +1,4 @@
+#include "Base.xcconfig"
+
+CODE_SIGN_IDENTITY = -
+ENABLE_HARDENED_RUNTIME = NO

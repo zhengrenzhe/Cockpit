@@ -243,6 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let serviceNamespace = try XPCServiceNamespace(
             environment["COCKPIT_SERVICE_NAMESPACE"] ?? ""
         )
+        try registerProductionLaunchAgents(serviceNamespace: serviceNamespace)
         let phaseOneFixture = try PhaseOneAppFixtureConfiguration(
             environment: environment,
             namespace: serviceNamespace

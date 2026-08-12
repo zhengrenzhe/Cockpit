@@ -17,8 +17,8 @@ settings:
     Debug:
       SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
 configFiles:
-  Debug: Config/Build/Base.xcconfig
-  Release: Config/Build/Base.xcconfig
+  Debug: Config/Build/Debug.xcconfig
+  Release: Config/Build/Release.xcconfig
 aggregateTargets:
   CockpitGhosttyArtifacts:
     buildScripts:
@@ -137,6 +137,7 @@ targets:
       - sdk: QuartzCore.framework
       - sdk: CoreText.framework
       - sdk: CoreGraphics.framework
+      - sdk: ServiceManagement.framework
       - target: CockpitHost
         embed: false
       - target: CockpitTerminalSupervisor
@@ -186,9 +187,6 @@ targets:
           /bin/cp "$BUILT_PRODUCTS_DIR/CockpitPTYKeeper" "$resources/CockpitPTYKeeper"
           /bin/cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.host.plist" "$agents/"
           /bin/cp "$SRCROOT/Config/LaunchAgents/dev.cockpit.terminal.plist" "$agents/"
-          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitHost "$resources/CockpitHost"
-          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitTerminalSupervisor "$resources/CockpitTerminalSupervisor"
-          /usr/bin/codesign --force --sign - --identifier dev.cockpit.CockpitPTYKeeper "$resources/CockpitPTYKeeper"
   CockpitAppTests:
     type: bundle.unit-test
     platform: macOS

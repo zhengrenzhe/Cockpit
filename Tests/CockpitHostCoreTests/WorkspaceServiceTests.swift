@@ -62,6 +62,31 @@ import CockpitTypes
     #expect(workspace[0].resolvedContext == added.resolvedContext)
 }
 
+@Test func addingProjectPersistsTheRootResolversImportedBookmark() async throws {
+    let clientBookmark = Data([0x01, 0x02])
+    let persistentBookmark = Data([0x09, 0x08])
+    let repository = InMemoryWorkspaceRepository()
+    let resolver = RecordingImportingProjectRootResolver(
+        root: makeResolvedRoot(),
+        persistentBookmark: persistentBookmark
+    )
+    let service = WorkspaceService(
+        repository: repository,
+        rootResolver: resolver,
+        kernelRegistry: WorkspaceKernelRegistry()
+    )
+
+    _ = try await service.addProject(
+        bookmark: clientBookmark,
+        displayName: "Cockpit"
+    )
+
+    let projects = await repository.listProjects()
+    #expect(resolver.importedBookmarks == [clientBookmark])
+    #expect(resolver.resolvedBookmarks.isEmpty)
+    #expect(projects.map(\.rootBookmark) == [persistentBookmark])
+}
+
 @Test func directConversationsReuseProjectEnvironmentAndActualKernelInstance() async throws {
     let repository = InMemoryWorkspaceRepository()
     let registry = WorkspaceKernelRegistry()
@@ -141,6 +166,44 @@ import CockpitTypes
         withExtendedLifetime(root) {}
 
         #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs == [url])
+    }
+}
+
+@Test func securityScopedResolverImportsClientBookmarkIntoHostSecurityScope() throws {
+    try withSecurityScopeFixture(isDirectory: true) { url in
+        let clientBookmark = Data([0x01, 0x02])
+        let persistentBookmark = Data([0x09, 0x08])
+        let boundary = RecordingSecurityScopeBoundary(
+            resolvedURL: url,
+            createdBookmark: persistentBookmark
+        )
+        let resolver = SecurityScopedProjectRootResolver(boundary: boundary)
+        var imported: (persistentBookmark: Data, root: ResolvedProjectRoot)? =
+            try resolver.importBookmark(clientBookmark)
+
+        #expect(imported?.persistentBookmark == persistentBookmark)
+        #expect(
+            boundary.resolutionOptionHistory.map(\.rawValue) == [
+                URL.BookmarkResolutionOptions.withoutUI.rawValue,
+                (
+                    URL.BookmarkResolutionOptions.withSecurityScope.union(
+                        .withoutImplicitStartAccessing
+                    )
+                ).rawValue,
+            ]
+        )
+        #expect(boundary.createdURLs == [url])
+        #expect(
+            boundary.creationOptionHistory.map(\.rawValue) == [
+                URL.BookmarkCreationOptions.withSecurityScope.rawValue
+            ]
+        )
+        #expect(boundary.startURLs == [url])
+        #expect(boundary.stopURLs.isEmpty)
+
+        imported = nil
+        withExtendedLifetime(imported) {}
         #expect(boundary.stopURLs == [url])
     }
 }
@@ -325,26 +388,42 @@ private final class RecordingSecurityScopeBoundary:
     private let resolvedURL: URL
     private let startAccessResult: Bool
     private let isStale: Bool
-    private var resolutionOptions: URL.BookmarkResolutionOptions = []
+    private let createdBookmark: Data
+    private var recordedResolutionOptions: [URL.BookmarkResolutionOptions] = []
+    private var recordedCreationOptions: [URL.BookmarkCreationOptions] = []
+    private var recordedCreatedURLs: [URL] = []
     private var recordedStartURLs: [URL] = []
     private var recordedStopURLs: [URL] = []
 
     init(
         resolvedURL: URL,
         startAccessResult: Bool = true,
-        isStale: Bool = false
+        isStale: Bool = false,
+        createdBookmark: Data = Data([0xEE])
     ) {
         self.resolvedURL = resolvedURL
         self.startAccessResult = startAccessResult
         self.isStale = isStale
+        self.createdBookmark = createdBookmark
     }
 
     func resolve(
         bookmark: Data,
         options: URL.BookmarkResolutionOptions
     ) throws -> SecurityScopedBookmarkResolution {
-        lock.withLock { resolutionOptions = options }
+        lock.withLock { recordedResolutionOptions.append(options) }
         return SecurityScopedBookmarkResolution(url: resolvedURL, isStale: isStale)
+    }
+
+    func createBookmark(
+        for url: URL,
+        options: URL.BookmarkCreationOptions
+    ) throws -> Data {
+        lock.withLock {
+            recordedCreatedURLs.append(url)
+            recordedCreationOptions.append(options)
+        }
+        return createdBookmark
     }
 
     func startAccessing(_ url: URL) -> Bool {
@@ -358,11 +437,20 @@ private final class RecordingSecurityScopeBoundary:
 
     var startURLs: [URL] { lock.withLock { recordedStartURLs } }
     var stopURLs: [URL] { lock.withLock { recordedStopURLs } }
+    var resolutionOptionHistory: [URL.BookmarkResolutionOptions] {
+        lock.withLock { recordedResolutionOptions }
+    }
+    var creationOptionHistory: [URL.BookmarkCreationOptions] {
+        lock.withLock { recordedCreationOptions }
+    }
+    var createdURLs: [URL] { lock.withLock { recordedCreatedURLs } }
     var usedWithSecurityScope: Bool {
-        lock.withLock { resolutionOptions.contains(.withSecurityScope) }
+        lock.withLock { recordedResolutionOptions.last?.contains(.withSecurityScope) == true }
     }
     var usedWithoutImplicitStartAccessing: Bool {
-        lock.withLock { resolutionOptions.contains(.withoutImplicitStartAccessing) }
+        lock.withLock {
+            recordedResolutionOptions.last?.contains(.withoutImplicitStartAccessing) == true
+        }
     }
 }
 
@@ -422,6 +510,37 @@ private struct FailingProjectRootResolver: ProjectRootResolving {
     let error: NSError
 
     func resolve(bookmark: Data) throws -> ResolvedProjectRoot { throw error }
+}
+
+private final class RecordingImportingProjectRootResolver:
+    ProjectRootResolving,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let root: ResolvedProjectRoot
+    private let persistentBookmark: Data
+    private var recordedImportedBookmarks: [Data] = []
+    private var recordedResolvedBookmarks: [Data] = []
+
+    init(root: ResolvedProjectRoot, persistentBookmark: Data) {
+        self.root = root
+        self.persistentBookmark = persistentBookmark
+    }
+
+    func importBookmark(
+        _ bookmark: Data
+    ) throws -> (persistentBookmark: Data, root: ResolvedProjectRoot) {
+        lock.withLock { recordedImportedBookmarks.append(bookmark) }
+        return (persistentBookmark, root)
+    }
+
+    func resolve(bookmark: Data) throws -> ResolvedProjectRoot {
+        lock.withLock { recordedResolvedBookmarks.append(bookmark) }
+        return root
+    }
+
+    var importedBookmarks: [Data] { lock.withLock { recordedImportedBookmarks } }
+    var resolvedBookmarks: [Data] { lock.withLock { recordedResolvedBookmarks } }
 }
 
 private actor RecordingFileOperationRegistry: WorkspaceKernelRegistering {

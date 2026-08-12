@@ -64,7 +64,18 @@ public struct ResolvedProjectRoot: Sendable {
 }
 
 public protocol ProjectRootResolving: Sendable {
+    func importBookmark(
+        _ bookmark: Data
+    ) throws -> (persistentBookmark: Data, root: ResolvedProjectRoot)
     func resolve(bookmark: Data) throws -> ResolvedProjectRoot
+}
+
+public extension ProjectRootResolving {
+    func importBookmark(
+        _ bookmark: Data
+    ) throws -> (persistentBookmark: Data, root: ResolvedProjectRoot) {
+        (bookmark, try resolve(bookmark: bookmark))
+    }
 }
 
 public protocol WorkspaceKernelRegistering: FileOperationServing, Sendable {
@@ -180,11 +191,12 @@ public actor WorkspaceService: WorkspaceServing, ClientWorkspaceStateServing, Co
         bookmark: Data,
         displayName: String
     ) async throws -> ProjectSnapshot {
-        let root = try rootResolver.resolve(bookmark: bookmark)
+        let imported = try rootResolver.importBookmark(bookmark)
+        let root = imported.root
         let project = try await repository.createProjectWithDirectEnvironment(
             NewProject(
                 displayName: displayName,
-                rootBookmark: bookmark,
+                rootBookmark: imported.persistentBookmark,
                 canonicalRootIdentity: root.canonicalRootIdentity,
                 workspaceRoot: root.canonicalAbsolutePath,
                 gitCommonDirectory: root.gitCommonDirectory

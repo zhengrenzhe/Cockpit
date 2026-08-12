@@ -3,6 +3,7 @@ set -euo pipefail
 repo_root=${0:A:h:h:h}
 default_app="$repo_root/build/Debug/Cockpit.app"
 app=${COCKPIT_APP_BUNDLE_UNDER_TEST:-$default_app}
+expected_signing_team=${COCKPIT_EXPECTED_SIGNING_TEAM:-}
 resources="$app/Contents/Resources"
 agents="$app/Contents/Library/LaunchAgents"
 host_plist="$agents/dev.cockpit.host.plist"
@@ -121,12 +122,25 @@ verify_signed_product() {
     local product=$1
     local expected_identifier=$2
     local actual_identifier
+    local actual_team
+    local designated_requirement
     /usr/bin/codesign --verify --strict "$product"
     actual_identifier=$(
         /usr/bin/codesign -d --verbose=4 "$product" 2>&1 \
             | /usr/bin/sed -n 's/^Identifier=//p'
     )
     test "$actual_identifier" = "$expected_identifier"
+    if [[ -n "$expected_signing_team" ]]; then
+        actual_team=$(
+            /usr/bin/codesign -d --verbose=4 "$product" 2>&1 \
+                | /usr/bin/sed -n 's/^TeamIdentifier=//p'
+        )
+        test "$actual_team" = "$expected_signing_team"
+        designated_requirement=$(/usr/bin/codesign -d -r- "$product" 2>&1)
+        [[ "$designated_requirement" != *cdhash* ]]
+        [[ "$designated_requirement" == *"anchor apple generic"* ]]
+        [[ "$designated_requirement" == *"certificate leaf"* ]]
+    fi
 }
 
 verify_signed_product "$app" "dev.cockpit.Cockpit"
@@ -136,3 +150,11 @@ verify_signed_product \
     "dev.cockpit.CockpitTerminalSupervisor"
 verify_signed_product "$resources/CockpitPTYKeeper" "dev.cockpit.CockpitPTYKeeper"
 /usr/bin/codesign --verify --deep --strict "$app"
+if [[ -n "$expected_signing_team" ]]; then
+    app_entitlements=$(
+        /usr/bin/codesign -d --entitlements :- "$app" 2>/dev/null
+    )
+    ! print -rn -- "$app_entitlements" \
+        | /usr/bin/plutil -extract com.apple.security.get-task-allow raw -o - - \
+            >/dev/null 2>&1
+fi
