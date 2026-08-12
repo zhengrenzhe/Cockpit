@@ -9,6 +9,23 @@ import CockpitTypes
 
 @MainActor
 final class WorkspaceHierarchyTests: XCTestCase {
+    func testSidebarAllowsOnlyTheSinglePhaseOneProject() throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        let controller = WorkspaceSidebarController(viewModel: fixture.viewModel)
+        controller.loadViewIfNeeded()
+        let addProject = try XCTUnwrap(
+            descendantButtons(in: controller.view).first {
+                $0.identifier?.rawValue == "workspace-add-project"
+            }
+        )
+
+        controller.update(projects: [], activeContext: nil)
+        XCTAssertTrue(addProject.isEnabled)
+
+        controller.update(projects: [fixture.project], activeContext: nil)
+        XCTAssertFalse(addProject.isEnabled)
+    }
+
     func testWindowBuildsTheFrozenThreeColumnHierarchyWithOneMonacoController() throws {
         let fixture = try WorkspaceHierarchyFixture()
         let windowController = fixture.makeWindowController()
@@ -383,10 +400,7 @@ final class WorkspaceHierarchyTests: XCTestCase {
             presentError: actions.present
         )
         controller.loadViewIfNeeded()
-        controller.update(
-            projects: fixture.viewModel.projects,
-            activeContext: fixture.viewModel.activeContext
-        )
+        controller.update(projects: [], activeContext: nil)
 
         try XCTUnwrap(
             descendantButtons(in: controller.view).first {
@@ -394,6 +408,11 @@ final class WorkspaceHierarchyTests: XCTestCase {
             }
         ).performClick(nil)
         guard await waitUntil({ actions.addProjectCount == 1 }) else { return }
+
+        controller.update(
+            projects: fixture.viewModel.projects,
+            activeContext: fixture.viewModel.activeContext
+        )
         try XCTUnwrap(
             descendantButtons(in: controller.view).first {
                 $0.identifier?.rawValue == "workspace-new-conversation"

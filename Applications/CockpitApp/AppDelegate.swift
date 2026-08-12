@@ -207,6 +207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let delegate = AppDelegate()
         retainedApplicationDelegate = delegate
         application.delegate = delegate
+        application.mainMenu = makeCockpitMainMenu(
+            application: application,
+            applicationName: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleName"
+            ) as? String ?? "Cockpit"
+        )
         application.run()
     }
 

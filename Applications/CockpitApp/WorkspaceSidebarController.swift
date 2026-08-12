@@ -59,6 +59,7 @@ final class WorkspaceSidebarController: NSViewController,
     private let renameConversationAction: WorkspaceSidebarRenameConversationAction
     private let openNewTabAction: WorkspaceSidebarOpenNewTabAction
     private let presentError: WorkspaceSidebarErrorPresenter
+    private let addProjectButton = NSButton()
     private let newTabButton = NSButton()
     private var commandInFlight = false
     private var renameInFlight: Set<ConversationID> = []
@@ -110,12 +111,10 @@ final class WorkspaceSidebarController: NSViewController,
         scrollView.documentView = outlineView
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let addProject = NSButton(
-            title: "Add Project",
-            target: self,
-            action: #selector(addProject(_:))
-        )
-        addProject.identifier = NSUserInterfaceItemIdentifier("workspace-add-project")
+        addProjectButton.title = "Add Project"
+        addProjectButton.target = self
+        addProjectButton.action = #selector(addProject(_:))
+        addProjectButton.identifier = NSUserInterfaceItemIdentifier("workspace-add-project")
         let newConversation = NSButton(
             title: "New Conversation",
             target: self,
@@ -127,7 +126,7 @@ final class WorkspaceSidebarController: NSViewController,
         newTabButton.action = #selector(newTab(_:))
         newTabButton.identifier = NSUserInterfaceItemIdentifier("workspace-new-tab")
         newTabButton.isEnabled = false
-        let actions = NSStackView(views: [addProject, newConversation, newTabButton])
+        let actions = NSStackView(views: [addProjectButton, newConversation, newTabButton])
         actions.orientation = .horizontal
         actions.spacing = 6
         actions.translatesAutoresizingMaskIntoConstraints = false
@@ -149,6 +148,7 @@ final class WorkspaceSidebarController: NSViewController,
 
     func update(projects: WorkspaceSnapshot, activeContext: ActiveContext?) {
         self.projects = projects
+        addProjectButton.isEnabled = projects.isEmpty
         newTabButton.isEnabled = activeContext != nil
         selectableItems = Set(projects.flatMap { project in
             [.project(project.projectID)]

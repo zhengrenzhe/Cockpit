@@ -52,6 +52,7 @@
 		7365D6C7C3E5A73DD8CDCCA9 /* ProductionLaunchAgentRegistrar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 518754862ABDA5A664C60F8A /* ProductionLaunchAgentRegistrar.swift */; };
 		739F84561841F69B335B8581 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C4FA2BE19C1AAE871BA1097F /* WebKit.framework */; };
 		75C6C1CD346F5630A004DC72 /* WorkspaceViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66551CF10D010C7EAD2F7ECF /* WorkspaceViewModel.swift */; };
+		7A33D7A0C1A2BA7CE86F041B /* ApplicationMenuTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94F0C60A1B62CDCA2DA73007 /* ApplicationMenuTests.swift */; };
 		7A9C950C7D5D1EF8AE5FA023 /* ServiceManagement.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 57C0F916F7AFD4AAD7519E29 /* ServiceManagement.framework */; };
 		7F13BCE3D62D913A6C051792 /* ContentHostController.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFD547040C5A1D676AFBC840 /* ContentHostController.swift */; };
 		80169161B195865C65678342 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 75A939B292A29F0EA7497870 /* CockpitLocalTransport */; };
@@ -63,6 +64,7 @@
 		A1340526403B5B92EFF4314D /* TabCommandController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */; };
 		A370B28B6F0C30D43CAE9AC9 /* CockpitTypes in Frameworks */ = {isa = PBXBuildFile; productRef = 301696E7B6689F1F7F644EA6 /* CockpitTypes */; };
 		A7DFA31121D9E31C872E4793 /* CockpitPersistence in Frameworks */ = {isa = PBXBuildFile; productRef = 41F1F75F27D0D4B661D8228C /* CockpitPersistence */; };
+		A8BD698235ABF0B21BAC7D3F /* ApplicationMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = E76CD11BE762112041BA4638 /* ApplicationMenu.swift */; };
 		B35FEE05419E4A6A32CCC004 /* WorkspaceSidebarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5760D618B16CD0E88EF12499 /* WorkspaceSidebarController.swift */; };
 		B43C4F3BB2CABB70159B9558 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4B5AFD79708EC200DB637479 /* QuartzCore.framework */; };
 		B877D89767A2A9D7755ED7E2 /* NewTabPickerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38288D3FCC85DFAAB98E11CB /* NewTabPickerController.swift */; };
@@ -161,6 +163,7 @@
 		70F73173468B21D2CA4D246A /* Cockpit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cockpit.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		74BE78FCB3DB52BC2A92457F /* MonacoEditorViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoEditorViewController.swift; sourceTree = "<group>"; };
 		8EA676EB67971DEACE962407 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		94F0C60A1B62CDCA2DA73007 /* ApplicationMenuTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApplicationMenuTests.swift; sourceTree = "<group>"; };
 		957D0FDA811FE85865AA5EF4 /* CockpitAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CockpitAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		967DA6F781A08A3775427A27 /* CoreText.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreText.framework; path = System/Library/Frameworks/CoreText.framework; sourceTree = SDKROOT; };
 		A0BFB39C38A17E2083706555 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -178,6 +181,7 @@
 		CA5E864EDF8F667F282B715A /* WorkspaceWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceWindowController.swift; sourceTree = "<group>"; };
 		CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabCommandController.swift; sourceTree = "<group>"; };
 		DFD547040C5A1D676AFBC840 /* ContentHostController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentHostController.swift; sourceTree = "<group>"; };
+		E76CD11BE762112041BA4638 /* ApplicationMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApplicationMenu.swift; sourceTree = "<group>"; };
 		E7CC18242186F71956E15599 /* CockpitPTYKeeper */ = {isa = PBXFileReference; includeInIndex = 0; path = CockpitPTYKeeper; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -256,6 +260,7 @@
 			isa = PBXGroup;
 			children = (
 				A0BFB39C38A17E2083706555 /* AppDelegate.swift */,
+				E76CD11BE762112041BA4638 /* ApplicationMenu.swift */,
 				DFD547040C5A1D676AFBC840 /* ContentHostController.swift */,
 				C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */,
 				1F0C98BDF4F40288231C6311 /* ConversationDeletionController.swift */,
@@ -377,6 +382,7 @@
 		FFA0B107F09BC2BE194062CE /* CockpitAppTests */ = {
 			isa = PBXGroup;
 			children = (
+				94F0C60A1B62CDCA2DA73007 /* ApplicationMenuTests.swift */,
 				6ACE0572E53CC95FD08436FB /* AppTestScaffoldTests.swift */,
 				345DA9F403FADE69A83C8512 /* ConversationCommandControllerTests.swift */,
 				C896509ED3B6739751194E83 /* ConversationDeletionControllerTests.swift */,
@@ -652,6 +658,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				995B04F1AC75CFBAC5087DE1 /* AppDelegate.swift in Sources */,
+				A8BD698235ABF0B21BAC7D3F /* ApplicationMenu.swift in Sources */,
 				7F13BCE3D62D913A6C051792 /* ContentHostController.swift in Sources */,
 				22EA011AF83B130CF389F9D3 /* ConversationCommandController.swift in Sources */,
 				147E86D04E3990D13FB285BF /* ConversationDeletionController.swift in Sources */,
@@ -697,6 +704,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				67CC75FC105853537B5FC897 /* AppTestScaffoldTests.swift in Sources */,
+				7A33D7A0C1A2BA7CE86F041B /* ApplicationMenuTests.swift in Sources */,
 				68E85917A1DEAC817192DAF1 /* ConversationCommandControllerTests.swift in Sources */,
 				72E5AA0CAC1FCF86D0811CB6 /* ConversationDeletionControllerTests.swift in Sources */,
 				38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */,
