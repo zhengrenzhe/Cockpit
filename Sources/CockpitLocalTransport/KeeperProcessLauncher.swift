@@ -16,6 +16,38 @@ public struct KeeperProcessLauncher: Sendable {
     public static let spawnFlags =
         Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
 
+    @_spi(CockpitTerminalSupervisorComposition)
+    public static func siblingExecutablePath(named name: String) throws -> String {
+        var buffer = [CChar](repeating: 0, count: 4_096)
+        let count = proc_pidpath(getpid(), &buffer, UInt32(buffer.count))
+        guard count > 0 else {
+            throw KeeperLaunchFailure(operation: "proc_pidpath", code: errno)
+        }
+        return try siblingExecutablePath(
+            named: name,
+            currentExecutablePath: String(
+                decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+                as: UTF8.self
+            )
+        )
+    }
+
+    @_spi(CockpitTerminalSupervisorComposition)
+    public static func siblingExecutablePath(
+        named name: String,
+        currentExecutablePath: String
+    ) throws -> String {
+        guard currentExecutablePath.hasPrefix("/"),
+              !name.isEmpty,
+              name == URL(fileURLWithPath: name).lastPathComponent else {
+            throw KeeperLaunchFailure(operation: "resolve-sibling", code: EINVAL)
+        }
+        return URL(fileURLWithPath: currentExecutablePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent(name)
+            .path
+    }
+
     public let executablePath: String
 
     public init(executablePath: String) {

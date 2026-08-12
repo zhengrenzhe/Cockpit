@@ -3,7 +3,16 @@ import Foundation
 import Testing
 import CockpitTerminalCore
 import CockpitTypes
-@testable import CockpitLocalTransport
+@_spi(CockpitTerminalSupervisorComposition) @testable import CockpitLocalTransport
+
+@Test func keeperSiblingPathUsesTheActualExecutableInsteadOfRelativeArgumentZero() throws {
+    let path = try KeeperProcessLauncher.siblingExecutablePath(
+        named: "CockpitPTYKeeper",
+        currentExecutablePath: "/Applications/Cockpit.app/Contents/Resources/CockpitTerminalSupervisor"
+    )
+
+    #expect(path == "/Applications/Cockpit.app/Contents/Resources/CockpitPTYKeeper")
+}
 
 @Test func keeperSpawnFlagsCreateIndependentSessionAndCloseUndeclaredDescriptors() {
     #expect(

@@ -786,10 +786,14 @@ guard unsafeBitCast(previousSIGCHLDHandler, to: Int.self) != -1 else {
     throw KeeperLaunchFailure(operation: "signal(SIGCHLD)", code: errno)
 }
 _ = umask(S_IRWXG | S_IRWXO)
-let ownExecutable = URL(fileURLWithPath: arguments[0]).standardizedFileURL
-let keeperExecutable = optionalValue(after: "--keeper-executable", in: arguments)
-    ?? ownExecutable.deletingLastPathComponent()
-        .appendingPathComponent("CockpitPTYKeeper").path
+let keeperExecutable: String
+if let configuredKeeper = optionalValue(after: "--keeper-executable", in: arguments) {
+    keeperExecutable = configuredKeeper
+} else {
+    keeperExecutable = try KeeperProcessLauncher.siblingExecutablePath(
+        named: "CockpitPTYKeeper"
+    )
+}
 let runtimeDirectory = optionalValue(after: "--runtime-directory", in: arguments)
     ?? "/private/tmp/cockpit.\(geteuid())/terminal"
 
