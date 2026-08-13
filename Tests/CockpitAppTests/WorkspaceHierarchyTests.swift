@@ -46,6 +46,37 @@ final class WorkspaceHierarchyTests: XCTestCase {
         XCTAssertEqual(monacoDescendants(in: root).count, 1)
     }
 
+    func testThreeColumnsOwnIndependentFortyEightPointHeadersAndTwentyFourPointFooters() throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        let windowController = fixture.makeWindowController()
+        windowController.loadWindow()
+        let root = windowController.workspaceSplitViewController
+        windowController.window?.setContentSize(NSSize(width: 1_440, height: 900))
+        windowController.showWindow(nil)
+        root.view.layoutSubtreeIfNeeded()
+
+        let left = try XCTUnwrap(root.sidebarController.view as? WorkspaceColumnView)
+        let center = try XCTUnwrap(root.tabStripController.view as? WorkspaceColumnView)
+        let right = try XCTUnwrap(root.fileTreeController.view as? WorkspaceColumnView)
+        for column in [left, center, right] {
+            XCTAssertEqual(column.headerHeightConstraint.constant, 48)
+            XCTAssertEqual(column.footerHeightConstraint.constant, 24)
+        }
+        XCTAssertTrue(center.headerContainer.isDescendant(of: root.tabStripController.view))
+        XCTAssertFalse(center.headerContainer.isDescendant(of: root.fileTreeController.view))
+        XCTAssertEqual(right.headerContainer.identifier?.rawValue, "workspace-files-header")
+        XCTAssertEqual(root.sidebarController.view.frame.width, 238, accuracy: 1)
+        XCTAssertEqual(root.fileTreeController.view.frame.width, 236, accuracy: 1)
+
+        let chromeButtons = descendantButtons(in: root.view).filter {
+            $0.identifier?.rawValue.hasPrefix("workspace-chrome-") == true
+        }
+        XCTAssertFalse(chromeButtons.isEmpty)
+        XCTAssertTrue(chromeButtons.allSatisfy {
+            !($0.accessibilityLabel() ?? "").isEmpty
+        })
+    }
+
     func testProjectRowWithoutConversationIsSelectableAndFileTreeFollowsActiveEnvironment() async throws {
         let fixture = try WorkspaceHierarchyFixture()
         let windowController = fixture.makeWindowController()

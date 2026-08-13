@@ -5,6 +5,9 @@ typealias FileTreeProviderFactory = @MainActor (ActiveContext) -> FileTreeProvid
 
 @MainActor
 final class WorkspaceSplitViewController: NSSplitViewController {
+    private static let initialSidebarWidth: CGFloat = 238
+    private static let initialFileTreeWidth: CGFloat = 236
+
     let sidebarController: WorkspaceSidebarController
     let tabStripController: TabStripController
     let contentHostController: ContentHostController
@@ -53,17 +56,30 @@ final class WorkspaceSplitViewController: NSSplitViewController {
         )
         super.init(nibName: nil, bundle: nil)
 
+        sidebarController.preferredContentSize = NSSize(
+            width: Self.initialSidebarWidth,
+            height: 900
+        )
+        fileTreeController.preferredContentSize = NSSize(
+            width: Self.initialFileTreeWidth,
+            height: 900
+        )
+
         let sidebar = NSSplitViewItem(sidebarWithViewController: sidebarController)
-        sidebar.minimumThickness = 180
+        sidebar.minimumThickness = Self.initialSidebarWidth
         sidebar.maximumThickness = 420
+        sidebar.holdingPriority = .defaultHigh
         let center = NSSplitViewItem(viewController: tabStripController)
         center.minimumThickness = 420
+        center.holdingPriority = .defaultLow
         let fileTree = NSSplitViewItem(viewController: fileTreeController)
-        fileTree.minimumThickness = 220
+        fileTree.minimumThickness = Self.initialFileTreeWidth
         fileTree.maximumThickness = 520
+        fileTree.holdingPriority = .init(rawValue: NSLayoutConstraint.Priority.defaultHigh.rawValue - 1)
         addSplitViewItem(sidebar)
         addSplitViewItem(center)
         addSplitViewItem(fileTree)
+        splitView.dividerStyle = .thin
 
         viewModel.setChangeHandler { [weak self] in self?.refresh() }
     }

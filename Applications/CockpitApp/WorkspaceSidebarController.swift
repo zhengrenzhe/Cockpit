@@ -59,8 +59,29 @@ final class WorkspaceSidebarController: NSViewController,
     private let renameConversationAction: WorkspaceSidebarRenameConversationAction
     private let openNewTabAction: WorkspaceSidebarOpenNewTabAction
     private let presentError: WorkspaceSidebarErrorPresenter
-    private let addProjectButton = NSButton()
-    private let newTabButton = NSButton()
+    private let projectTitleLabel = NSTextField(labelWithString: "Cockpit")
+    private let footerStatusLabel = workspaceFooterLabel("No project")
+    private lazy var addProjectButton = workspaceSymbolButton(
+        symbolName: "folder.badge.plus",
+        accessibilityLabel: "Open Project",
+        identifier: "workspace-chrome-open-project",
+        target: self,
+        action: #selector(addProject(_:))
+    )
+    private lazy var newConversationButton = workspaceSymbolButton(
+        symbolName: "bubble.left.and.bubble.right.fill",
+        accessibilityLabel: "New Conversation",
+        identifier: "workspace-chrome-new-conversation",
+        target: self,
+        action: #selector(newConversation(_:))
+    )
+    private lazy var newTabButton = workspaceSymbolButton(
+        symbolName: "plus.square",
+        accessibilityLabel: "New Tab",
+        identifier: "workspace-chrome-new-tab",
+        target: self,
+        action: #selector(newTab(_:))
+    )
     private var commandInFlight = false
     private var renameInFlight: Set<ConversationID> = []
 
@@ -111,37 +132,46 @@ final class WorkspaceSidebarController: NSViewController,
         scrollView.documentView = outlineView
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        addProjectButton.title = "Add Project"
-        addProjectButton.target = self
-        addProjectButton.action = #selector(addProject(_:))
         addProjectButton.identifier = NSUserInterfaceItemIdentifier("workspace-add-project")
-        let newConversation = NSButton(
-            title: "New Conversation",
-            target: self,
-            action: #selector(newConversation(_:))
+        newConversationButton.identifier = NSUserInterfaceItemIdentifier(
+            "workspace-new-conversation"
         )
-        newConversation.identifier = NSUserInterfaceItemIdentifier("workspace-new-conversation")
-        newTabButton.title = "New Tab"
-        newTabButton.target = self
-        newTabButton.action = #selector(newTab(_:))
         newTabButton.identifier = NSUserInterfaceItemIdentifier("workspace-new-tab")
+        newConversationButton.isEnabled = false
         newTabButton.isEnabled = false
-        let actions = NSStackView(views: [addProjectButton, newConversation, newTabButton])
-        actions.orientation = .horizontal
-        actions.spacing = 6
-        actions.translatesAutoresizingMaskIntoConstraints = false
 
-        let root = NSView()
-        root.addSubview(actions)
-        root.addSubview(scrollView)
+        projectTitleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        projectTitleLabel.textColor = .labelColor
+        projectTitleLabel.lineBreakMode = .byTruncatingTail
+        projectTitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let trafficLightSpace = NSView()
+        trafficLightSpace.translatesAutoresizingMaskIntoConstraints = false
+        trafficLightSpace.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        let header = NSStackView(views: [
+            trafficLightSpace,
+            projectTitleLabel,
+            addProjectButton,
+            newConversationButton,
+            newTabButton,
+        ])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 5
+        header.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 7)
+        for button in [addProjectButton, newConversationButton, newTabButton] {
+            button.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        }
+
+        let root = WorkspaceColumnView(
+            identifier: "workspace-column-left",
+            headerIdentifier: "workspace-project-header",
+            header: header,
+            content: scrollView,
+            footer: footerStatusLabel
+        )
         NSLayoutConstraint.activate([
-            actions.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
-            actions.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -8),
-            actions.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
-            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: actions.bottomAnchor, constant: 8),
-            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 1),
         ])
         view = root
     }
@@ -149,7 +179,12 @@ final class WorkspaceSidebarController: NSViewController,
     func update(projects: WorkspaceSnapshot, activeContext: ActiveContext?) {
         self.projects = projects
         addProjectButton.isEnabled = projects.isEmpty
+        newConversationButton.isEnabled = activeContext != nil
         newTabButton.isEnabled = activeContext != nil
+        projectTitleLabel.stringValue = projects.first?.displayName ?? "Cockpit"
+        footerStatusLabel.stringValue = projects.isEmpty
+            ? "  NO PROJECT"
+            : "  \(projects.count) PROJECT\(projects.count == 1 ? "" : "S")"
         selectableItems = Set(projects.flatMap { project in
             [.project(project.projectID)]
                 + project.conversations.map { .conversation($0.id) }

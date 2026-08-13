@@ -62,6 +62,17 @@ final class FileTreeViewController: NSViewController,
     )
 
     let outlineView = NSOutlineView()
+    private let emptyStateLabel = NSTextField(
+        labelWithString: "Open a project to browse files"
+    )
+    private let footerStatusLabel = workspaceFooterLabel("No project")
+    private lazy var refreshButton = workspaceSymbolButton(
+        symbolName: "arrow.clockwise",
+        accessibilityLabel: "Refresh Files",
+        identifier: "workspace-chrome-refresh-files",
+        target: self,
+        action: #selector(refreshFiles(_:))
+    )
     private let relocationCoordinator: any FileRelocationCoordinating
     private var rootNodes: [FileTreeNode] = []
     private var nodesByIdentity: [FileTreeEntryIdentity: FileTreeNode] = [:]
@@ -102,7 +113,43 @@ final class FileTreeViewController: NSViewController,
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.documentView = outlineView
-        view = scrollView
+
+        emptyStateLabel.font = .systemFont(ofSize: 12)
+        emptyStateLabel.textColor = .secondaryLabelColor
+        emptyStateLabel.alignment = .center
+        emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(scrollView)
+        content.addSubview(emptyStateLabel)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: content.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            emptyStateLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            emptyStateLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            emptyStateLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+        ])
+
+        let title = NSTextField(labelWithString: "FILES")
+        title.font = .systemFont(ofSize: 11, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+        let spacer = NSView()
+        let header = NSStackView(views: [title, spacer, refreshButton])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 6
+        header.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 8)
+        refreshButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        view = WorkspaceColumnView(
+            identifier: "workspace-column-right",
+            headerIdentifier: "workspace-files-header",
+            header: header,
+            content: content,
+            footer: footerStatusLabel
+        )
+        setWorkspaceAvailable(false)
     }
 
     func activate(
@@ -125,7 +172,25 @@ final class FileTreeViewController: NSViewController,
         latestRevision = 0
         lastError = nil
         outlineView.reloadData()
+        setWorkspaceAvailable(true)
         loadDirectory(.root, activationID: id)
+    }
+
+    func setWorkspaceAvailable(_ available: Bool) {
+        loadViewIfNeeded()
+        emptyStateLabel.isHidden = available
+        outlineView.enclosingScrollView?.isHidden = !available
+        refreshButton.isEnabled = available
+        footerStatusLabel.stringValue = available ? "  LOCAL FILES" : "  NO PROJECT"
+    }
+
+    @objc private func refreshFiles(_ sender: NSButton) {
+        guard let providerBinding, let activeContext, let acceptsGeneration else { return }
+        activate(
+            providerBinding,
+            context: activeContext,
+            acceptsGeneration: acceptsGeneration
+        )
     }
 
     func commitRename(source: RelativePath, newName: String) async throws {

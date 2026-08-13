@@ -30,6 +30,7 @@
 		17E1FAF124AB3699D39183E8 /* FileTreeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72199350E653181BD3EB3C4 /* FileTreeViewController.swift */; };
 		212557A2ACC955D30965D047 /* CockpitLocalTransport in Frameworks */ = {isa = PBXBuildFile; productRef = 29A3733E9D6777F50A36E911 /* CockpitLocalTransport */; };
 		22EA011AF83B130CF389F9D3 /* ConversationCommandController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8D131C4C3CE2E3C6A86C30B /* ConversationCommandController.swift */; };
+		2A1EB9CC7DCE3A914C17CBCB /* WorkspaceChromeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2385F57849DC9C8D85188937 /* WorkspaceChromeView.swift */; };
 		351D3D324BAED80562181E32 /* CockpitWorkspace in Frameworks */ = {isa = PBXBuildFile; productRef = 6B63A056B655604A5CAB68B6 /* CockpitWorkspace */; };
 		38B6225A90DCD722926532CA /* GhosttyTerminalViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B19ED79EFC14EC118B543F41 /* GhosttyTerminalViewTests.swift */; };
 		39069795D81C4857832CB0D5 /* WorkspaceWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA5E864EDF8F667F282B715A /* WorkspaceWindowController.swift */; };
@@ -136,6 +137,7 @@
 		1183768045AE445F258A4859 /* TabCommandControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabCommandControllerTests.swift; sourceTree = "<group>"; };
 		1CB666BCCFF83A0B17532068 /* TerminalTabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTabViewController.swift; sourceTree = "<group>"; };
 		1F0C98BDF4F40288231C6311 /* ConversationDeletionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationDeletionController.swift; sourceTree = "<group>"; };
+		2385F57849DC9C8D85188937 /* WorkspaceChromeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChromeView.swift; sourceTree = "<group>"; };
 		23AAD691375B8C8DC385B733 /* GhosttyTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalView.swift; sourceTree = "<group>"; };
 		263DA7B80F345C7A4A093699 /* MonacoBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonacoBridge.swift; sourceTree = "<group>"; };
 		2BF59ED429382282C6713FC1 /* WorkspaceHierarchyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceHierarchyTests.swift; sourceTree = "<group>"; };
@@ -271,6 +273,7 @@
 				C4A08688480DC135C04F862D /* ServiceStatusViewModel.swift */,
 				CB994DB4EA130F6E99C7AB59 /* TabCommandController.swift */,
 				C230093E1E264CC2FD374D62 /* TabStripController.swift */,
+				2385F57849DC9C8D85188937 /* WorkspaceChromeView.swift */,
 				5760D618B16CD0E88EF12499 /* WorkspaceSidebarController.swift */,
 				57A7D9649155671F2B78038C /* WorkspaceSplitViewController.swift */,
 				66551CF10D010C7EAD2F7ECF /* WorkspaceViewModel.swift */,
@@ -675,6 +678,7 @@
 				A1340526403B5B92EFF4314D /* TabCommandController.swift in Sources */,
 				CE310A5B431632FB0D2FA014 /* TabStripController.swift in Sources */,
 				07FECF87EDC303623C2C031A /* TerminalTabViewController.swift in Sources */,
+				2A1EB9CC7DCE3A914C17CBCB /* WorkspaceChromeView.swift in Sources */,
 				B35FEE05419E4A6A32CCC004 /* WorkspaceSidebarController.swift in Sources */,
 				F61FCBEC5572862FE710A9E1 /* WorkspaceSplitViewController.swift in Sources */,
 				75C6C1CD346F5630A004DC72 /* WorkspaceViewModel.swift in Sources */,
