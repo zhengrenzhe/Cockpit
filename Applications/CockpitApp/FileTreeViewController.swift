@@ -89,6 +89,10 @@ final class FileTreeViewController: NSViewController,
 
     private(set) var providerEnvironmentID: EnvironmentID?
     private(set) var lastError: Error?
+    var isShowingEmptyState: Bool {
+        loadViewIfNeeded()
+        return !emptyStateLabel.isHidden
+    }
 
     init(relocationCoordinator: any FileRelocationCoordinating) {
         self.relocationCoordinator = relocationCoordinator

@@ -9,6 +9,70 @@ import CockpitTypes
 
 @MainActor
 final class WorkspaceHierarchyTests: XCTestCase {
+    func testWelcomeWaitsForExplicitOpenProjectAction() async throws {
+        var openCount = 0
+        let controller = WelcomeViewController {
+            openCount += 1
+        }
+        controller.loadViewIfNeeded()
+        XCTAssertEqual(openCount, 0)
+
+        let button = try XCTUnwrap(
+            descendantButtons(in: controller.view).first {
+                $0.identifier?.rawValue == "welcome-open-project"
+            }
+        )
+        button.performClick(nil)
+        guard await waitUntil({ openCount == 1 }) else { return }
+        XCTAssertEqual(openCount, 1)
+    }
+
+    func testZeroProjectRefreshShowsWelcomeAndEmptyFilesUntilWorkspaceLoads() async throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        let root = fixture.makeWindowController().workspaceSplitViewController
+        root.loadViewIfNeeded()
+
+        root.refresh()
+        XCTAssertTrue(root.isShowingWelcome)
+        XCTAssertFalse(root.welcomeController.view.isHidden)
+        XCTAssertTrue(root.fileTreeController.isShowingEmptyState)
+        let disabledActions = descendantButtons(in: root.sidebarController.view).filter {
+            ["workspace-new-conversation", "workspace-new-tab"]
+                .contains($0.identifier?.rawValue)
+        }
+        XCTAssertEqual(disabledActions.count, 2)
+        XCTAssertTrue(disabledActions.allSatisfy { !$0.isEnabled })
+
+        try await fixture.viewModel.loadWorkspace()
+        root.refresh()
+        XCTAssertFalse(root.isShowingWelcome)
+        XCTAssertTrue(root.welcomeController.view.isHidden)
+    }
+
+    func testWindowUsesIntegratedChromeDefaultGeometryAndRestorableFrames() throws {
+        let visibleFrame = NSRect(x: 0, y: 0, width: 1_920, height: 1_080)
+        XCTAssertEqual(
+            WorkspaceWindowGeometry.defaultFrame(visibleFrame: visibleFrame),
+            NSRect(x: 240, y: 90, width: 1_440, height: 900)
+        )
+        XCTAssertTrue(WorkspaceWindowGeometry.isRestorable(
+            NSRect(x: 100, y: 100, width: 1_440, height: 900),
+            screens: [visibleFrame]
+        ))
+        XCTAssertFalse(WorkspaceWindowGeometry.isRestorable(
+            NSRect(x: 3_000, y: 100, width: 1_440, height: 900),
+            screens: [visibleFrame]
+        ))
+
+        let fixture = try WorkspaceHierarchyFixture()
+        let window = try XCTUnwrap(fixture.makeWindowController().window)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+        XCTAssertEqual(window.titleVisibility, .hidden)
+        XCTAssertTrue(window.titlebarAppearsTransparent)
+        XCTAssertEqual(window.title, "Cockpit")
+        XCTAssertEqual(window.contentMinSize, NSSize(width: 960, height: 640))
+    }
+
     func testSidebarAllowsOnlyTheSinglePhaseOneProject() throws {
         let fixture = try WorkspaceHierarchyFixture()
         let controller = WorkspaceSidebarController(viewModel: fixture.viewModel)

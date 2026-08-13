@@ -12,6 +12,9 @@ final class WorkspaceSplitViewController: NSSplitViewController {
     let tabStripController: TabStripController
     let contentHostController: ContentHostController
     let fileTreeController: FileTreeViewController
+    let welcomeController: WelcomeViewController
+
+    private(set) var isShowingWelcome = false
 
     private let viewModel: WorkspaceViewModel
     private let fileTreeProviderFactory: FileTreeProviderFactory
@@ -54,7 +57,13 @@ final class WorkspaceSplitViewController: NSSplitViewController {
         fileTreeController = FileTreeViewController(
             relocationCoordinator: relocationCoordinator
         )
+        welcomeController = WelcomeViewController { [weak viewModel] in
+            guard let viewModel else { throw CancellationError() }
+            _ = try await viewModel.addProject()
+        }
         super.init(nibName: nil, bundle: nil)
+
+        tabStripController.addChild(welcomeController)
 
         sidebarController.preferredContentSize = NSSize(
             width: Self.initialSidebarWidth,
@@ -87,6 +96,8 @@ final class WorkspaceSplitViewController: NSSplitViewController {
     required init?(coder: NSCoder) { nil }
 
     func refresh() {
+        let showingWelcome = viewModel.projects.isEmpty
+        setWelcomeVisible(showingWelcome)
         sidebarController.update(
             projects: viewModel.projects,
             activeContext: viewModel.activeContext
@@ -97,9 +108,15 @@ final class WorkspaceSplitViewController: NSSplitViewController {
             activeContext: viewModel.activeContext
         )
 
-        guard let active = viewModel.activeContext,
-              providerGeneration != active.generation
-        else { return }
+        guard !showingWelcome,
+              let active = viewModel.activeContext
+        else {
+            providerGeneration = nil
+            fileTreeController.setWorkspaceAvailable(false)
+            return
+        }
+
+        guard providerGeneration != active.generation else { return }
         providerGeneration = active.generation
         let binding = fileTreeProviderFactory(active)
         fileTreeController.activate(
@@ -110,5 +127,40 @@ final class WorkspaceSplitViewController: NSSplitViewController {
                 return await viewModel.accepts(generation: generation)
             }
         )
+    }
+
+    private func setWelcomeVisible(_ visible: Bool) {
+        tabStripController.loadViewIfNeeded()
+        welcomeController.loadViewIfNeeded()
+        guard let column = tabStripController.view as? WorkspaceColumnView else {
+            preconditionFailure("Tab strip must use WorkspaceColumnView")
+        }
+        if welcomeController.view.superview !== column.contentContainer {
+            welcomeController.view.translatesAutoresizingMaskIntoConstraints = false
+            column.contentContainer.addSubview(welcomeController.view)
+            NSLayoutConstraint.activate([
+                welcomeController.view.leadingAnchor.constraint(
+                    equalTo: column.contentContainer.leadingAnchor
+                ),
+                welcomeController.view.trailingAnchor.constraint(
+                    equalTo: column.contentContainer.trailingAnchor
+                ),
+                welcomeController.view.topAnchor.constraint(
+                    equalTo: column.contentContainer.topAnchor
+                ),
+                welcomeController.view.bottomAnchor.constraint(
+                    equalTo: column.contentContainer.bottomAnchor
+                ),
+            ])
+        }
+        welcomeController.view.isHidden = !visible
+        if visible {
+            column.contentContainer.addSubview(
+                welcomeController.view,
+                positioned: .above,
+                relativeTo: nil
+            )
+        }
+        isShowingWelcome = visible
     }
 }
