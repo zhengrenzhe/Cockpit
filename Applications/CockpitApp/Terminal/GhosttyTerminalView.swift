@@ -3,10 +3,22 @@ import CockpitGhostty
 import CockpitTerminalCore
 import CockpitTypes
 
+struct GhosttyRendererLayout: Equatable {
+    let columns: UInt32
+    let rows: UInt32
+    let cellWidth: Double
+    let cellHeight: Double
+}
+
 @MainActor
 protocol GhosttyRendererDriving: AnyObject {
     func apply(_ frame: Data) throws -> Bool
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout?
     func setVisible(_ visible: Bool) -> Bool
     func tearDown()
 }
@@ -40,9 +52,28 @@ final class GhosttyRendererDriver: GhosttyRendererDriving {
         return result == 1
     }
 
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool {
-        guard let renderer else { return false }
-        return cockpit_ghostty_renderer_resize(renderer, width, height, scale) == 1
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        guard let renderer else { return nil }
+        var grid = cockpit_ghostty_grid_t()
+        guard cockpit_ghostty_renderer_resize(
+            renderer,
+            width,
+            height,
+            scale,
+            fontPoints,
+            &grid
+        ) == 1 else { return nil }
+        return GhosttyRendererLayout(
+            columns: grid.columns,
+            rows: grid.rows,
+            cellWidth: grid.cell_width,
+            cellHeight: grid.cell_height
+        )
     }
 
     func setVisible(_ visible: Bool) -> Bool {
@@ -59,6 +90,8 @@ final class GhosttyRendererDriver: GhosttyRendererDriving {
 
 @MainActor
 final class GhosttyTerminalView: NSView, @preconcurrency NSTextInputClient {
+    private static let terminalFontPoints = 13.0
+
     private struct PendingFrame {
         let frame: TerminalOutputFrame
         var nextFragmentIndex = 0
@@ -79,9 +112,11 @@ final class GhosttyTerminalView: NSView, @preconcurrency NSTextInputClient {
     private var markedTextStorage = NSAttributedString()
     private var markedSelection = NSRange(location: 0, length: 0)
     private var interpretingKeyEvent: NSEvent?
+    private var lastGrid: TerminalResize?
     private nonisolated(unsafe) var occlusionObserver: NSObjectProtocol?
 
     var inputHandler: ((TerminalInput.Payload) -> Void)?
+    var gridHandler: ((TerminalResize) -> Void)?
 
     var isTerminalActive = false {
         didSet { refreshRendererVisibility() }
@@ -314,6 +349,7 @@ final class GhosttyTerminalView: NSView, @preconcurrency NSTextInputClient {
         lastAppliedSequence = 0
         hasSessionViewport = false
         hasFinalArchiveViewport = false
+        lastGrid = nil
         cancelPresentationRetry()
         rendererWantsVisible = false
         rendererIsVisible = false
@@ -414,7 +450,23 @@ final class GhosttyTerminalView: NSView, @preconcurrency NSTextInputClient {
         let width = UInt32(max(0, min(CGFloat(UInt32.max), bounds.width * scale)))
         let height = UInt32(max(0, min(CGFloat(UInt32.max), bounds.height * scale)))
         guard let renderer else { return }
-        let presented = renderer.resize(width: width, height: height, scale: scale)
+        let layout = renderer.resize(
+            width: width,
+            height: height,
+            scale: scale,
+            fontPoints: Self.terminalFontPoints
+        )
+        let presented = layout != nil
+        if let layout,
+           let grid = try? TerminalResize(
+               validatingColumns: layout.columns,
+               rows: layout.rows
+           ),
+           grid != lastGrid
+        {
+            lastGrid = grid
+            gridHandler?(grid)
+        }
         if rendererWantsVisible {
             rendererIsVisible = presented
             if rendererShouldBeVisible, hasSessionViewport, !presented {

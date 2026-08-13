@@ -18,6 +18,12 @@ extern "C" {
 typedef struct cockpit_ghostty_vt cockpit_ghostty_vt_t;
 typedef struct cockpit_ghostty_renderer cockpit_ghostty_renderer_t;
 typedef struct {
+  uint32_t columns;
+  uint32_t rows;
+  double cell_width;
+  double cell_height;
+} cockpit_ghostty_grid_t;
+typedef struct {
   const uint8_t *bytes;
   size_t length;
 } cockpit_ghostty_bytes_t;
@@ -96,7 +102,7 @@ COCKPIT_GHOSTTY_API int cockpit_ghostty_renderer_apply(
     cockpit_ghostty_renderer_t *, const uint8_t *, size_t);
 COCKPIT_GHOSTTY_API int cockpit_ghostty_renderer_resize(
     cockpit_ghostty_renderer_t *, uint32_t pixels_w, uint32_t pixels_h,
-    double scale);
+    double scale, double font_points, cockpit_ghostty_grid_t *grid);
 COCKPIT_GHOSTTY_API int cockpit_ghostty_renderer_set_visible(
     cockpit_ghostty_renderer_t *, bool);
 

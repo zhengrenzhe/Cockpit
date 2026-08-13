@@ -121,7 +121,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9faf8c1b014
 --- /dev/null
 +++ b/src/cockpit/renderer.m
-@@ -0,0 +1,940 @@
+@@ -0,0 +1,987 @@
 +#import <AppKit/AppKit.h>
 +#import <Metal/Metal.h>
 +#import <QuartzCore/CAMetalLayer.h>
@@ -193,6 +193,9 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  uint32_t pixels_w;
 +  uint32_t pixels_h;
 +  double scale;
++  CGFloat cell_width;
++  CGFloat cell_height;
++  CGFloat font_size;
 +  bool has_viewport;
 +  bool wants_visible;
 +  bool visible;
@@ -673,6 +676,9 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  destination->pixels_w = source->pixels_w;
 +  destination->pixels_h = source->pixels_h;
 +  destination->scale = source->scale;
++  destination->cell_width = source->cell_width;
++  destination->cell_height = source->cell_height;
++  destination->font_size = source->font_size;
 +  destination->has_viewport = source->has_viewport;
 +  destination->wants_visible = source->wants_visible;
 +  destination->visible = source->visible;
@@ -783,9 +789,40 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  return renderer->upload_texture != nil && renderer->offscreen_texture != nil;
 +}
 +
++static bool calculate_grid(uint32_t pixels_w, uint32_t pixels_h, double scale,
++                           double font_points, cockpit_ghostty_grid_t *grid,
++                           CGFloat *cell_width, CGFloat *cell_height,
++                           CGFloat *font_size) {
++  if (pixels_w == 0 || pixels_h == 0 || !isfinite(scale) || scale <= 0 ||
++      !isfinite(font_points) || font_points <= 0 || grid == NULL)
++    return false;
++  CGFloat pixel_font_size = (CGFloat)(font_points * scale);
++  NSFont *font = [NSFont monospacedSystemFontOfSize:pixel_font_size
++                                            weight:NSFontWeightRegular];
++  if (font == nil) return false;
++  CGFloat measured_width = [@"M" sizeWithAttributes:@{
++    NSFontAttributeName : font
++  }].width;
++  CGFloat measured_height = font.ascender - font.descender + font.leading;
++  CGFloat resolved_width = ceil(measured_width);
++  CGFloat resolved_height = ceil(measured_height);
++  if (!isfinite(resolved_width) || !isfinite(resolved_height) ||
++      resolved_width < 1 || resolved_height < 1)
++    return false;
++  uint32_t columns = (uint32_t)fmax(1.0, floor(pixels_w / resolved_width));
++  uint32_t rows = (uint32_t)fmax(1.0, floor(pixels_h / resolved_height));
++  *grid = (cockpit_ghostty_grid_t){columns, rows, resolved_width,
++                                   resolved_height};
++  *cell_width = resolved_width;
++  *cell_height = resolved_height;
++  *font_size = pixel_font_size;
++  return true;
++}
++
 +static bool render_viewport(cockpit_ghostty_renderer_t *renderer) {
 +  if (!renderer->has_viewport || renderer->rows == 0 ||
-+      renderer->columns == 0)
++      renderer->columns == 0 || renderer->cell_width < 1 ||
++      renderer->cell_height < 1 || renderer->font_size < 1)
 +    return false;
 +  NSUInteger width = renderer->pixels_w;
 +  NSUInteger height = renderer->pixels_h;
@@ -830,9 +867,9 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +  [ns_color((cockpit_rgb_t){0, 0, 0}, 1.0) setFill];
 +  NSRectFill(NSMakeRect(0, 0, width, height));
 +
-+  CGFloat cell_width = (CGFloat)width / renderer->columns;
-+  CGFloat cell_height = (CGFloat)height / renderer->rows;
-+  CGFloat font_size = fmax(1.0, cell_height * 0.72);
++  CGFloat cell_width = renderer->cell_width;
++  CGFloat cell_height = renderer->cell_height;
++  CGFloat font_size = renderer->font_size;
 +  cockpit_rgb_t default_foreground = {229, 229, 229};
 +  cockpit_rgb_t default_background = {0, 0, 0};
 +  for (size_t i = 0; i < renderer->cell_count; ++i) {
@@ -1030,11 +1067,21 @@ index 0000000000000000000000000000000000000000..02a64b11a3506e084f379e2788e0f9fa
 +
 +int cockpit_ghostty_renderer_resize(cockpit_ghostty_renderer_t *renderer,
 +                                    uint32_t pixels_w, uint32_t pixels_h,
-+                                    double scale) {
-+  if (renderer == NULL || !isfinite(scale) || scale <= 0) return -1;
++                                    double scale, double font_points,
++                                    cockpit_ghostty_grid_t *grid) {
++  CGFloat cell_width = 0;
++  CGFloat cell_height = 0;
++  CGFloat font_size = 0;
++  if (renderer == NULL ||
++      !calculate_grid(pixels_w, pixels_h, scale, font_points, grid,
++                      &cell_width, &cell_height, &font_size))
++    return -1;
 +  renderer->pixels_w = pixels_w;
 +  renderer->pixels_h = pixels_h;
 +  renderer->scale = scale;
++  renderer->cell_width = cell_width;
++  renderer->cell_height = cell_height;
++  renderer->font_size = font_size;
 +  renderer->layer.contentsScale = scale;
 +  renderer->layer.drawableSize = CGSizeMake(pixels_w, pixels_h);
 +  renderer->upload_texture = nil;

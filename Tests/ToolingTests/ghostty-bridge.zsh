@@ -33,6 +33,11 @@ missing=()
 [[ -f "$project_spec" ]] || missing+=("project.yml")
 (( ${#missing[@]} == 0 )) || fail "missing Task 11 inputs: ${(j:, :)missing}"
 
+/usr/bin/grep -Fq 'cockpit_ghostty_grid_t' "$header" || \
+  fail "renderer header does not expose fixed-cell grid metrics"
+/usr/bin/grep -Fq 'double font_points, cockpit_ghostty_grid_t *grid' "$header" || \
+  fail "renderer resize does not accept fixed font points and return grid metrics"
+
 temp_root=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/cockpit-ghostty-bridge.XXXXXX")
 temp_root=${temp_root:A}
 trap '/bin/rm -rf -- "$temp_root"' EXIT INT TERM
@@ -925,6 +930,9 @@ int main(int argc, char **argv) {
     retainedView = view;
     renderer = cockpit_ghostty_renderer_create((__bridge void *)view, 2.0);
     assert(renderer != NULL);
+    cockpit_ghostty_grid_t grid = {0};
+    assert(cockpit_ghostty_renderer_resize(renderer, 1280, 960, 2.0, 13.0, &grid) == 1);
+    assert(grid.columns > 0 && grid.rows > 0);
     view = nil;
     assert(retainedView != nil);
     assert(retainedView.wantsLayer);
@@ -939,10 +947,10 @@ int main(int argc, char **argv) {
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)snapshot.bytes, snapshot.length) == 1);
     assert(cockpit_ghostty_renderer_set_visible(renderer, true) == 1);
     assert(!layer.hidden);
-    assert(cockpit_ghostty_renderer_resize(renderer, UINT32_MAX, UINT32_MAX, 1.0) == 0);
+    assert(cockpit_ghostty_renderer_resize(renderer, UINT32_MAX, UINT32_MAX, 1.0, 13.0, &grid) == 0);
     assert(layer.hidden);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)delta.bytes, delta.length) == 0);
-    assert(cockpit_ghostty_renderer_resize(renderer, 1280, 960, 2.0) == 1);
+    assert(cockpit_ghostty_renderer_resize(renderer, 1280, 960, 2.0, 13.0, &grid) == 1);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)delta.bytes, delta.length) == 1);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)delta.bytes, delta.length) == -1);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)scrollback.bytes, scrollback.length) == 1);
@@ -974,9 +982,16 @@ int main(int argc, char **argv) {
     uint8_t invalid[] = {'N', 'O', 'P', 'E'};
     assert(cockpit_ghostty_renderer_apply(renderer, invalid, sizeof(invalid)) == -1);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)snapshot.bytes, 16 * 1024 * 1024 + 1) == -1);
-    assert(cockpit_ghostty_renderer_resize(renderer, 800, 600, 1.5) == 1);
+    cockpit_ghostty_grid_t compact_grid = {0};
+    assert(cockpit_ghostty_renderer_resize(renderer, 800, 600, 1.5, 13.0, &compact_grid) == 1);
+    cockpit_ghostty_grid_t expanded_grid = {0};
+    assert(cockpit_ghostty_renderer_resize(renderer, 1200, 900, 1.5, 13.0, &expanded_grid) == 1);
+    assert(compact_grid.cell_width == expanded_grid.cell_width);
+    assert(compact_grid.cell_height == expanded_grid.cell_height);
+    assert(expanded_grid.columns > compact_grid.columns);
+    assert(expanded_grid.rows > compact_grid.rows);
     assert(layer.contentsScale == 1.5);
-    assert(layer.drawableSize.width == 800 && layer.drawableSize.height == 600);
+    assert(layer.drawableSize.width == 1200 && layer.drawableSize.height == 900);
     assert(cockpit_ghostty_renderer_set_visible(renderer, false) == 1);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)snapshot.bytes, snapshot.length) == 1);
     id<MTLDevice> retainedDevice = layer.device;
@@ -989,10 +1004,10 @@ int main(int argc, char **argv) {
     assert(!layer.hidden);
     assert(cockpit_ghostty_renderer_apply(renderer, (const uint8_t *)delta.bytes, delta.length) == 1);
     layer.device = nil;
-    assert(cockpit_ghostty_renderer_resize(renderer, 640, 480, 1.0) == 0);
+    assert(cockpit_ghostty_renderer_resize(renderer, 640, 480, 1.0, 13.0, &grid) == 0);
     assert(layer.hidden);
     layer.device = retainedDevice;
-    assert(cockpit_ghostty_renderer_resize(renderer, 640, 480, 1.0) == 1);
+    assert(cockpit_ghostty_renderer_resize(renderer, 640, 480, 1.0, 13.0, &grid) == 1);
     assert(!layer.hidden);
     cockpit_ghostty_renderer_destroy(renderer);
     renderer = NULL;

@@ -69,6 +69,9 @@ final class TerminalTabViewController: NSViewController {
             terminalView.inputHandler = { [weak self] payload in
                 self?.enqueueInput(payload)
             }
+            terminalView.gridHandler = { [weak self] grid in
+                self?.enqueueInput(.resize(grid))
+            }
         }
     }
 

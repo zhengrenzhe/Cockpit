@@ -9,6 +9,27 @@ import CockpitTypes
 
 @MainActor
 final class GhosttyTerminalViewTests: XCTestCase {
+    func testResizeKeepsThirteenPointCellMetricsAndPublishesOnlyChangedGrid() throws {
+        let renderer = GridMetricsGhosttyRenderer()
+        let view = GhosttyTerminalView(renderer: renderer)
+        var grids: [TerminalResize] = []
+        view.gridHandler = { grids.append($0) }
+
+        view.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+        view.layout()
+        view.layout()
+        view.frame = NSRect(x: 0, y: 0, width: 1_200, height: 900)
+        view.layout()
+
+        XCTAssertEqual(renderer.fontPoints, [13, 13, 13])
+        XCTAssertEqual(renderer.cellMetrics.count, 3)
+        XCTAssertTrue(renderer.cellMetrics.dropFirst().allSatisfy {
+            $0 == renderer.cellMetrics.first
+        })
+        XCTAssertEqual(grids.map(\.columns), [100, 150])
+        XCTAssertEqual(grids.map(\.rows), [37, 56])
+    }
+
     func testTerminalViewAcceptsFirstResponderAndMouseDownFocusesIt() throws {
         let view = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
         let window = TestOcclusionWindow(contentView: view)
@@ -1020,7 +1041,14 @@ private final class RecordingGhosttyRenderer: GhosttyRendererDriving {
         operations.append("apply:\(String(decoding: frame, as: UTF8.self))")
         return true
     }
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool { true }
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        GhosttyRendererLayout(columns: 80, rows: 24, cellWidth: 8, cellHeight: 16)
+    }
     func setVisible(_ visible: Bool) -> Bool {
         visibility.append(visible)
         operations.append("visible:\(visible)")
@@ -1028,6 +1056,38 @@ private final class RecordingGhosttyRenderer: GhosttyRendererDriving {
     }
     func tearDown() {}
     func resetOperations() { operations.removeAll(keepingCapacity: true) }
+}
+
+@MainActor
+private final class GridMetricsGhosttyRenderer: GhosttyRendererDriving {
+    struct CellMetrics: Equatable {
+        let width: Double
+        let height: Double
+    }
+
+    private(set) var fontPoints: [Double] = []
+    private(set) var cellMetrics: [CellMetrics] = []
+
+    func apply(_ frame: Data) throws -> Bool { true }
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        self.fontPoints.append(fontPoints)
+        let cellWidth = 8 * scale
+        let cellHeight = 16 * scale
+        cellMetrics.append(.init(width: cellWidth, height: cellHeight))
+        return GhosttyRendererLayout(
+            columns: UInt32(Double(width) / cellWidth),
+            rows: UInt32(Double(height) / cellHeight),
+            cellWidth: cellWidth,
+            cellHeight: cellHeight
+        )
+    }
+    func setVisible(_ visible: Bool) -> Bool { true }
+    func tearDown() {}
 }
 
 @MainActor
@@ -1109,7 +1169,14 @@ private final class FailingSecondFragmentGhosttyRenderer: GhosttyRendererDriving
         return true
     }
 
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool { true }
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        GhosttyRendererLayout(columns: 80, rows: 24, cellWidth: 8, cellHeight: 16)
+    }
     func setVisible(_ visible: Bool) -> Bool {
         visibility.append(visible)
         return true
@@ -1128,7 +1195,14 @@ private final class FailOncePresentationGhosttyRenderer: GhosttyRendererDriving 
         return presentationAttempts > 1
     }
 
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool { true }
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        GhosttyRendererLayout(columns: 80, rows: 24, cellWidth: 8, cellHeight: 16)
+    }
     func setVisible(_ visible: Bool) -> Bool {
         visibility.append(visible)
         return true
@@ -1144,7 +1218,14 @@ private final class DrawingCountGhosttyRenderer: GhosttyRendererDriving {
         presentationCount += 1
         return true
     }
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool { true }
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        GhosttyRendererLayout(columns: 80, rows: 24, cellWidth: 8, cellHeight: 16)
+    }
     func setVisible(_ visible: Bool) -> Bool {
         if visible { presentationCount += 1 }
         return true
@@ -1162,7 +1243,14 @@ private final class AlwaysFailPresentationGhosttyRenderer: GhosttyRendererDrivin
         return false
     }
 
-    func resize(width: UInt32, height: UInt32, scale: Double) -> Bool { true }
+    func resize(
+        width: UInt32,
+        height: UInt32,
+        scale: Double,
+        fontPoints: Double
+    ) -> GhosttyRendererLayout? {
+        GhosttyRendererLayout(columns: 80, rows: 24, cellWidth: 8, cellHeight: 16)
+    }
     func setVisible(_ visible: Bool) -> Bool { true }
     func tearDown() {}
 }
