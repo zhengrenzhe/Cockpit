@@ -440,6 +440,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             switchingTo: profileID
                         )
                     },
+                    requestContext: {
+                        try RequestContext(
+                            validating: .current,
+                            clientInstanceID: clientInstanceID,
+                            windowID: windowID,
+                            workspaceContextID: active.contextID,
+                            environmentID: active.environmentID,
+                            activeContextGeneration: active.generation,
+                            requestID: RequestID()
+                        )
+                    },
                     beforeHandlingAttached: beforeHandlingAttached
                 )
             }

@@ -58,7 +58,7 @@ final class GhosttyRendererDriver: GhosttyRendererDriving {
 }
 
 @MainActor
-final class GhosttyTerminalView: NSView {
+final class GhosttyTerminalView: NSView, @preconcurrency NSTextInputClient {
     private struct PendingFrame {
         let frame: TerminalOutputFrame
         var nextFragmentIndex = 0
@@ -76,7 +76,12 @@ final class GhosttyTerminalView: NSView {
     private var rendererIsVisible = false
     private var presentationRetryTask: Task<Void, Never>?
     private var presentationRetryID: UUID?
+    private var markedTextStorage = NSAttributedString()
+    private var markedSelection = NSRange(location: 0, length: 0)
+    private var interpretingKeyEvent: NSEvent?
     private nonisolated(unsafe) var occlusionObserver: NSObjectProtocol?
+
+    var inputHandler: ((TerminalInput.Payload) -> Void)?
 
     var isTerminalActive = false {
         didSet { refreshRendererVisibility() }
@@ -109,6 +114,134 @@ final class GhosttyTerminalView: NSView {
 
     override var isHidden: Bool {
         didSet { refreshRendererVisibility() }
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) {
+            switch event.keyCode {
+            case 0x09:
+                paste(nil)
+            case 0x08:
+                break
+            default:
+                super.keyDown(with: event)
+            }
+            return
+        }
+        if let physicalKey = Self.specialPhysicalKeys[event.keyCode] {
+            emitKey(logicalKey: 0, physicalKey: physicalKey, event: event)
+            return
+        }
+        if flags.contains(.control),
+           let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first,
+           let physicalKey = Self.printablePhysicalKeys[event.keyCode]
+        {
+            emitKey(logicalKey: scalar.value, physicalKey: physicalKey, event: event)
+            return
+        }
+        interpretingKeyEvent = event
+        interpretKeyEvents([event])
+        interpretingKeyEvent = nil
+    }
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        let committed: String
+        if let attributed = string as? NSAttributedString {
+            committed = attributed.string
+        } else if let plain = string as? String {
+            committed = plain
+        } else {
+            committed = String(describing: string)
+        }
+        unmarkText()
+        guard !committed.isEmpty else { return }
+        inputHandler?(.text(committed))
+    }
+
+    override func doCommand(by selector: Selector) {
+        let name = NSStringFromSelector(selector)
+        guard let physicalKey = Self.commandPhysicalKeys[name] else { return }
+        if let event = interpretingKeyEvent {
+            emitKey(logicalKey: 0, physicalKey: physicalKey, event: event)
+        } else if let key = try? TerminalKeyEvent(
+            validatingLogicalKey: 0,
+            physicalKey: physicalKey,
+            modifiers: 0,
+            action: .press
+        ) {
+            inputHandler?(.key(key))
+        }
+    }
+
+    func setMarkedText(
+        _ string: Any,
+        selectedRange: NSRange,
+        replacementRange: NSRange
+    ) {
+        if let attributed = string as? NSAttributedString {
+            markedTextStorage = attributed
+        } else if let plain = string as? String {
+            markedTextStorage = NSAttributedString(string: plain)
+        } else {
+            markedTextStorage = NSAttributedString(string: String(describing: string))
+        }
+        markedSelection = selectedRange
+    }
+
+    func unmarkText() {
+        markedTextStorage = NSAttributedString()
+        markedSelection = NSRange(location: 0, length: 0)
+    }
+
+    func selectedRange() -> NSRange {
+        hasMarkedText() ? markedSelection : NSRange(location: 0, length: 0)
+    }
+
+    func markedRange() -> NSRange {
+        guard hasMarkedText() else { return NSRange(location: NSNotFound, length: 0) }
+        return NSRange(location: 0, length: markedTextStorage.length)
+    }
+
+    func hasMarkedText() -> Bool { markedTextStorage.length > 0 }
+
+    func attributedSubstring(
+        forProposedRange range: NSRange,
+        actualRange: NSRangePointer?
+    ) -> NSAttributedString? {
+        guard hasMarkedText() else { return nil }
+        let available = NSRange(location: 0, length: markedTextStorage.length)
+        let intersection = NSIntersectionRange(range, available)
+        guard intersection.length > 0 else { return nil }
+        actualRange?.pointee = intersection
+        return markedTextStorage.attributedSubstring(from: intersection)
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+
+    func firstRect(
+        forCharacterRange range: NSRange,
+        actualRange: NSRangePointer?
+    ) -> NSRect {
+        actualRange?.pointee = hasMarkedText() ? markedRange() : NSRange(location: 0, length: 0)
+        let local = NSRect(x: 0, y: 0, width: 1, height: 18)
+        guard let window else { return local }
+        return window.convertToScreen(convert(local, to: nil))
+    }
+
+    func characterIndex(for point: NSPoint) -> Int { 0 }
+
+    @objc func paste(_ sender: Any?) {
+        guard let string = NSPasteboard.general.string(forType: .string),
+              !string.isEmpty else { return }
+        inputHandler?(.paste(string))
     }
 
     override func viewDidMoveToWindow() {
@@ -289,6 +422,65 @@ final class GhosttyTerminalView: NSView {
             }
         }
     }
+
+    private func emitKey(logicalKey: UInt32, physicalKey: UInt32, event: NSEvent) {
+        guard let key = try? TerminalKeyEvent(
+            validatingLogicalKey: logicalKey,
+            physicalKey: physicalKey,
+            modifiers: Self.terminalModifiers(event.modifierFlags),
+            action: event.isARepeat ? .repeat : .press
+        ) else { return }
+        inputHandler?(.key(key))
+    }
+
+    private static func terminalModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        let independent = flags.intersection(.deviceIndependentFlagsMask)
+        var result: UInt32 = 0
+        if independent.contains(.shift) { result |= 1 << 0 }
+        if independent.contains(.control) { result |= 1 << 1 }
+        if independent.contains(.option) { result |= 1 << 2 }
+        if independent.contains(.command) { result |= 1 << 3 }
+        if independent.contains(.capsLock) { result |= 1 << 4 }
+        if independent.contains(.numericPad) { result |= 1 << 5 }
+        return result
+    }
+
+    private static let specialPhysicalKeys: [UInt16: UInt32] = [
+        0x24: 0x28,
+        0x30: 0x2B,
+        0x35: 0x29,
+        0x33: 0x2A,
+        0x75: 0x4C,
+        0x7B: 0x50,
+        0x7C: 0x4F,
+        0x7D: 0x51,
+        0x7E: 0x52,
+        0x73: 0x4A,
+        0x77: 0x4D,
+        0x74: 0x4B,
+        0x79: 0x4E,
+        0x7A: 0x3A,
+    ]
+
+    private static let printablePhysicalKeys: [UInt16: UInt32] = [
+        0x08: 0x06,
+    ]
+
+    private static let commandPhysicalKeys: [String: UInt32] = [
+        "insertNewline:": 0x28,
+        "insertTab:": 0x2B,
+        "cancelOperation:": 0x29,
+        "deleteBackward:": 0x2A,
+        "deleteForward:": 0x4C,
+        "moveLeft:": 0x50,
+        "moveRight:": 0x4F,
+        "moveDown:": 0x51,
+        "moveUp:": 0x52,
+        "moveToBeginningOfDocument:": 0x4A,
+        "moveToEndOfDocument:": 0x4D,
+        "pageUp:": 0x4B,
+        "pageDown:": 0x4E,
+    ]
 
     private func schedulePresentationRetry() {
         guard presentationRetryTask == nil,

@@ -216,6 +216,26 @@ public actor TerminalAttachmentController {
     }
 
     public func send(_ input: TerminalInput) async throws {
+        try await send(
+            input.payload,
+            context: input.context,
+            expectedSessionID: input.terminalSessionID
+        )
+    }
+
+    @_spi(CockpitTerminalApp)
+    public func send(
+        _ payload: TerminalInput.Payload,
+        context: RequestContext
+    ) async throws {
+        try await send(payload, context: context, expectedSessionID: nil)
+    }
+
+    private func send(
+        _ payload: TerminalInput.Payload,
+        context: RequestContext,
+        expectedSessionID: TerminalSessionID?
+    ) async throws {
         guard let active else { throw TerminalAttachmentError.notAttached }
         try await active.inputGate.acquire()
         defer { active.inputGate.release() }
@@ -223,20 +243,20 @@ public actor TerminalAttachmentController {
         guard self.active === active, !active.retired else {
             throw CancellationError()
         }
-        guard input.terminalSessionID == active.sessionID else {
+        if let expectedSessionID, expectedSessionID != active.sessionID {
             throw TerminalStreamError.sessionMismatch
         }
-        guard input.context.clientInstanceID == clientInstanceID,
+        guard context.clientInstanceID == clientInstanceID,
               let lease = active.inputLease,
               let sequence = active.nextInputSequence else {
             throw TerminalStreamError.inputLeaseRequired
         }
         let outgoing = try TerminalInput(
-            validatingContext: input.context,
-            terminalSessionID: input.terminalSessionID,
+            validatingContext: context,
+            terminalSessionID: active.sessionID,
             inputLeaseID: lease.leaseID,
             inputSequence: sequence,
-            payload: input.payload
+            payload: payload
         )
         let acknowledged = try await active.connection.send(outgoing)
         guard self.active?.generation == active.generation else {

@@ -12,6 +12,7 @@ typealias TerminalRestartPort = @MainActor @Sendable (
     TerminalSessionID,
     AgentProfileID?
 ) async throws -> Void
+typealias TerminalRequestContextPort = @MainActor @Sendable () throws -> RequestContext
 
 @MainActor
 final class TerminalTabViewController: NSViewController {
@@ -25,11 +26,15 @@ final class TerminalTabViewController: NSViewController {
     private let sessionList: TerminalSessionListPort?
     private let archiveOpen: TerminalArchiveOpenPort?
     private let restart: TerminalRestartPort?
+    private let requestContext: TerminalRequestContextPort?
     private let beforeHandlingAttached: (@MainActor @Sendable (TerminalSessionID) async -> Void)?
     private var eventTask: Task<Void, Never>?
     private var finalizationTask: Task<Void, Never>?
     private var restartTask: Task<Void, Never>?
     private var restartTaskID: UUID?
+    private var inputGeneration = UUID()
+    private var inputTail: Task<Void, Never>?
+    private var inputTasks: [UUID: Task<Void, Never>] = [:]
     private var lifecycleRequestID: UUID?
     private var currentSessionID: TerminalSessionID?
     private var presentedSession: ClientTerminalSession?
@@ -41,6 +46,7 @@ final class TerminalTabViewController: NSViewController {
     private let exitStatusLabel = NSTextField(labelWithString: "")
     private let restartButton = NSButton(title: "Restart", target: nil, action: nil)
     private let switchAgentButton = NSButton(title: "Switch Agent", target: nil, action: nil)
+    private let inputStatusLabel = NSTextField(wrappingLabelWithString: "")
 
     init(
         attachmentController: TerminalAttachmentController,
@@ -48,6 +54,7 @@ final class TerminalTabViewController: NSViewController {
         sessionList: TerminalSessionListPort? = nil,
         archiveOpen: TerminalArchiveOpenPort? = nil,
         restart: TerminalRestartPort? = nil,
+        requestContext: TerminalRequestContextPort? = nil,
         beforeHandlingAttached: (@MainActor @Sendable (TerminalSessionID) async -> Void)? = nil
     ) {
         self.attachmentController = attachmentController
@@ -55,8 +62,14 @@ final class TerminalTabViewController: NSViewController {
         self.sessionList = sessionList
         self.archiveOpen = archiveOpen
         self.restart = restart
+        self.requestContext = requestContext
         self.beforeHandlingAttached = beforeHandlingAttached
         super.init(nibName: nil, bundle: nil)
+        if requestContext != nil {
+            terminalView.inputHandler = { [weak self] payload in
+                self?.enqueueInput(payload)
+            }
+        }
     }
 
     convenience init(
@@ -90,6 +103,7 @@ final class TerminalTabViewController: NSViewController {
     override func loadView() {
         view = terminalView
         installExitOverlay()
+        installInputStatus()
     }
 
     override func viewDidAppear() {
@@ -111,6 +125,7 @@ final class TerminalTabViewController: NSViewController {
         eventTask?.cancel()
         finalizationTask?.cancel()
         restartTask?.cancel()
+        inputTasks.values.forEach { $0.cancel() }
         let terminalView = terminalView
         Task { @MainActor in terminalView.tearDownRenderer() }
         let attachmentController = attachmentController
@@ -118,6 +133,7 @@ final class TerminalTabViewController: NSViewController {
     }
 
     func detach() {
+        resetInputQueue()
         lifecycleRequestID = nil
         currentSessionID = nil
         pendingAttachRequest = nil
@@ -148,6 +164,7 @@ final class TerminalTabViewController: NSViewController {
         sessionID: TerminalSessionID,
         lastAcknowledgedSequence: UInt64?
     ) async throws {
+        resetInputQueue()
         await startEvents()
         let requestID = UUID()
         lifecycleRequestID = requestID
@@ -380,6 +397,72 @@ final class TerminalTabViewController: NSViewController {
             exitOverlay.centerYAnchor.constraint(equalTo: terminalView.centerYAnchor),
         ])
         exitOverlay.isHidden = true
+    }
+
+    private func installInputStatus() {
+        guard inputStatusLabel.superview == nil else { return }
+        inputStatusLabel.identifier = NSUserInterfaceItemIdentifier("terminal-input-status")
+        inputStatusLabel.textColor = .systemRed
+        inputStatusLabel.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9)
+        inputStatusLabel.drawsBackground = true
+        inputStatusLabel.maximumNumberOfLines = 2
+        inputStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        terminalView.addSubview(inputStatusLabel)
+        NSLayoutConstraint.activate([
+            inputStatusLabel.leadingAnchor.constraint(equalTo: terminalView.leadingAnchor, constant: 12),
+            inputStatusLabel.trailingAnchor.constraint(lessThanOrEqualTo: terminalView.trailingAnchor, constant: -12),
+            inputStatusLabel.bottomAnchor.constraint(equalTo: terminalView.bottomAnchor, constant: -10),
+        ])
+        inputStatusLabel.isHidden = true
+    }
+
+    private func enqueueInput(_ payload: TerminalInput.Payload) {
+        guard requestContext != nil else { return }
+        let taskID = UUID()
+        let generation = inputGeneration
+        let predecessor = inputTail
+        let task = Task { @MainActor [weak self] in
+            if let predecessor { await predecessor.value }
+            guard let self,
+                  self.inputGeneration == generation,
+                  !Task.isCancelled,
+                  let requestContext = self.requestContext else {
+                self?.finishInputTask(taskID, generation: generation)
+                return
+            }
+            do {
+                try await self.attachmentController.send(
+                    payload,
+                    context: requestContext()
+                )
+                guard self.inputGeneration == generation else { return }
+                self.inputStatusLabel.stringValue = ""
+                self.inputStatusLabel.isHidden = true
+            } catch is CancellationError {
+            } catch {
+                guard self.inputGeneration == generation else { return }
+                self.inputStatusLabel.stringValue = error.localizedDescription
+                self.inputStatusLabel.isHidden = false
+            }
+            self.finishInputTask(taskID, generation: generation)
+        }
+        inputTasks[taskID] = task
+        inputTail = task
+    }
+
+    private func finishInputTask(_ taskID: UUID, generation: UUID) {
+        guard inputGeneration == generation else { return }
+        inputTasks.removeValue(forKey: taskID)
+        if inputTasks.isEmpty { inputTail = nil }
+    }
+
+    private func resetInputQueue() {
+        inputGeneration = UUID()
+        inputTasks.values.forEach { $0.cancel() }
+        inputTasks.removeAll(keepingCapacity: false)
+        inputTail = nil
+        inputStatusLabel.stringValue = ""
+        inputStatusLabel.isHidden = true
     }
 
     private func showFinalState(_ session: ClientTerminalSession) {

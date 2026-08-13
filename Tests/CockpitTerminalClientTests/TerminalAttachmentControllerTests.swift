@@ -290,6 +290,44 @@ import CockpitTypes
     #expect(await control.releasedLeases == [lease.leaseID])
 }
 
+@Test func terminalAttachmentPayloadSendUsesActiveLeaseAndSequence() async throws {
+    let clientID = ClientInstanceID()
+    let sessionID = TerminalSessionID()
+    let lease = try InputLeaseGrant(
+        validatingLeaseID: InputLeaseID(),
+        holderViewerID: ViewerID(clientID.rawValue),
+        sequenceBase: 73,
+        capabilities: [.input]
+    )
+    let connection = RecordingTerminalDataConnection()
+    let controller = TerminalAttachmentController(
+        clientInstanceID: clientID,
+        requestedCapabilities: [.view, .input],
+        controlTransport: RecordingTerminalControlTransport(lease: lease),
+        dataTransport: RecordingTerminalDataTransport(connection: connection)
+    )
+    let context = try RequestContext(
+        validating: .current,
+        clientInstanceID: clientID,
+        windowID: WindowID(),
+        workspaceContextID: .project(ProjectID()),
+        environmentID: EnvironmentID(),
+        activeContextGeneration: 1,
+        requestID: RequestID()
+    )
+
+    try await controller.attach(sessionID: sessionID, lastAcknowledgedSequence: nil)
+    try await controller.send(.text("echo cockpit\n"), context: context)
+
+    let sent = try #require(await connection.sentInputs.first)
+    #expect(sent.context == context)
+    #expect(sent.terminalSessionID == sessionID)
+    #expect(sent.inputLeaseID == lease.leaseID)
+    #expect(sent.inputSequence == 73)
+    #expect(sent.payload == .text("echo cockpit\n"))
+    await controller.detach()
+}
+
 @Test func terminalAttachmentRoutesSignalAndTerminateThroughTheCurrentControlLease() async throws {
     let sessionID = TerminalSessionID()
     let viewerID = ViewerID()

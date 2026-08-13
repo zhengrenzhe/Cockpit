@@ -9,6 +9,198 @@ import CockpitTypes
 
 @MainActor
 final class GhosttyTerminalViewTests: XCTestCase {
+    func testTerminalViewAcceptsFirstResponderAndMouseDownFocusesIt() throws {
+        let view = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
+        let window = TestOcclusionWindow(contentView: view)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+
+        XCTAssertTrue(view.acceptsFirstResponder)
+        view.mouseDown(with: event)
+        XCTAssertTrue(window.firstResponder === view)
+    }
+
+    func testCommittedAndMarkedTextEmitExactlyOnce() {
+        let view = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
+        var payloads: [TerminalInput.Payload] = []
+        view.inputHandler = { payloads.append($0) }
+
+        view.setMarkedText(
+            "你",
+            selectedRange: NSRange(location: 1, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        XCTAssertTrue(view.hasMarkedText())
+        XCTAssertEqual(payloads, [])
+
+        view.insertText(
+            "你好",
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertEqual(payloads, [.text("你好")])
+    }
+
+    func testCommandVPastesOneNonemptyLiteralAndEmptyPasteboardEmitsNothing() throws {
+        let view = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
+        var payloads: [TerminalInput.Payload] = []
+        view.inputHandler = { payloads.append($0) }
+        let pasteboard = NSPasteboard.general
+        let previous = pasteboard.string(forType: .string)
+        defer {
+            pasteboard.clearContents()
+            if let previous { pasteboard.setString(previous, forType: .string) }
+        }
+
+        pasteboard.clearContents()
+        pasteboard.setString("paste cockpit", forType: .string)
+        view.keyDown(with: try keyEvent(keyCode: 0x09, characters: "v", modifiers: [.command]))
+        pasteboard.clearContents()
+        view.keyDown(with: try keyEvent(keyCode: 0x09, characters: "v", modifiers: [.command]))
+
+        XCTAssertEqual(payloads, [.paste("paste cockpit")])
+    }
+
+    func testSpecialKeysMapToLiteralUSBHIDUsagesAndModifiers() throws {
+        let view = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
+        var payloads: [TerminalInput.Payload] = []
+        view.inputHandler = { payloads.append($0) }
+        let cases: [(UInt16, String, UInt32)] = [
+            (0x24, "\r", 0x28),
+            (0x30, "\t", 0x2B),
+            (0x35, "\u{1B}", 0x29),
+            (0x33, "\u{7F}", 0x2A),
+            (0x75, "\u{7F}", 0x4C),
+            (0x7B, "", 0x50),
+            (0x7C, "", 0x4F),
+            (0x7D, "", 0x51),
+            (0x7E, "", 0x52),
+            (0x73, "", 0x4A),
+            (0x77, "", 0x4D),
+            (0x74, "", 0x4B),
+            (0x79, "", 0x4E),
+            (0x7A, "", 0x3A),
+        ]
+        for (keyCode, characters, _) in cases {
+            view.keyDown(with: try keyEvent(
+                keyCode: keyCode,
+                characters: characters,
+                modifiers: [.shift, .option]
+            ))
+        }
+
+        let keys = payloads.compactMap { payload -> TerminalKeyEvent? in
+            guard case let .key(key) = payload else { return nil }
+            return key
+        }
+        XCTAssertEqual(keys.map(\.physicalKey), cases.map(\.2))
+        XCTAssertEqual(keys.map(\.logicalKey), Array(repeating: 0, count: cases.count))
+        XCTAssertEqual(keys.map(\.modifiers), Array(repeating: 0b101, count: cases.count))
+        XCTAssertEqual(keys.map(\.action), Array(repeating: .press, count: cases.count))
+    }
+
+    func testControlCEmitsKeyAndCommandCWithoutSelectionEmitsNothing() throws {
+        let view = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
+        var payloads: [TerminalInput.Payload] = []
+        view.inputHandler = { payloads.append($0) }
+
+        view.keyDown(with: try keyEvent(keyCode: 0x08, characters: "c", modifiers: [.control]))
+        view.keyDown(with: try keyEvent(keyCode: 0x08, characters: "c", modifiers: [.command]))
+
+        XCTAssertEqual(payloads.count, 1)
+        guard case let .key(key) = try XCTUnwrap(payloads.first) else {
+            return XCTFail("expected Control-C key payload")
+        }
+        XCTAssertEqual(key.logicalKey, 0x63)
+        XCTAssertEqual(key.physicalKey, 0x06)
+        XCTAssertEqual(key.modifiers, 0b10)
+        XCTAssertEqual(key.action, .press)
+    }
+
+    func testTerminalTabSerializesTextPasteResizeAndClearsInlineInputError() async throws {
+        let clientID = ClientInstanceID()
+        let sessionID = TerminalSessionID()
+        let connection = SerialTerminalDataConnection()
+        let terminalView = GhosttyTerminalView(renderer: RecordingGhosttyRenderer())
+        let controller = TerminalAttachmentController(
+            clientInstanceID: clientID,
+            requestedCapabilities: [.view, .input, .resize],
+            controlTransport: ImmediateTerminalControlTransport(),
+            dataTransport: SerialTerminalDataTransport(connection: connection)
+        )
+        let tab = TerminalTabViewController(
+            attachmentController: controller,
+            terminalView: terminalView,
+            requestContext: {
+                try RequestContext(
+                    validating: .current,
+                    clientInstanceID: clientID,
+                    windowID: WindowID(),
+                    workspaceContextID: .project(ProjectID()),
+                    environmentID: EnvironmentID(),
+                    activeContextGeneration: 1,
+                    requestID: RequestID()
+                )
+            }
+        )
+        tab.loadViewIfNeeded()
+        try await tab.attach(sessionID: sessionID, lastAcknowledgedSequence: nil)
+
+        terminalView.inputHandler?(.text("first"))
+        terminalView.inputHandler?(.paste("second"))
+        terminalView.inputHandler?(.resize(
+            try TerminalResize(validatingColumns: 120, rows: 40)
+        ))
+        for _ in 0..<200 where !(await connection.firstSendIsBlocked) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let firstSendIsBlocked = await connection.firstSendIsBlocked
+        XCTAssertTrue(firstSendIsBlocked)
+        await connection.releaseFirstSend()
+        for _ in 0..<200 where await connection.payloads.count < 3 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let orderedPayloads = await connection.payloads
+        XCTAssertEqual(
+            orderedPayloads,
+            [
+                .text("first"),
+                .paste("second"),
+                .resize(try TerminalResize(validatingColumns: 120, rows: 40)),
+            ]
+        )
+
+        let status: NSTextField = try XCTUnwrap(descendant(
+            in: tab.view,
+            identifier: "terminal-input-status"
+        ))
+        await connection.failNextPayload(.paste("bad"))
+        terminalView.inputHandler?(.paste("bad"))
+        for _ in 0..<200 where status.isHidden {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertFalse(status.isHidden)
+        XCTAssertFalse(status.stringValue.isEmpty)
+
+        terminalView.inputHandler?(.text("recovered"))
+        for _ in 0..<200 where !status.isHidden {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(status.isHidden)
+        let recoveredPayloads = await connection.payloads
+        XCTAssertEqual(Array(recoveredPayloads.suffix(2)), [.paste("bad"), .text("recovered")])
+        tab.detach()
+    }
+
     func testInactiveViewerBuffersLatestFrameWithoutDrawingAndFlushesOnResume() throws {
         let renderer = RecordingGhosttyRenderer()
         let view = GhosttyTerminalView(renderer: renderer)
@@ -781,6 +973,26 @@ final class GhosttyTerminalViewTests: XCTestCase {
 }
 
 @MainActor
+private func keyEvent(
+    keyCode: UInt16,
+    characters: String,
+    modifiers: NSEvent.ModifierFlags = []
+) throws -> NSEvent {
+    try XCTUnwrap(NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: modifiers,
+        timestamp: 0,
+        windowNumber: 0,
+        context: nil,
+        characters: characters,
+        charactersIgnoringModifiers: characters,
+        isARepeat: false,
+        keyCode: keyCode
+    ))
+}
+
+@MainActor
 private final class TestOcclusionWindow: NSWindow {
     var testOcclusionState: NSWindow.OcclusionState = []
 
@@ -1021,6 +1233,62 @@ private struct ImmediateTerminalDataTransport: TerminalDataTransport {
         lastAcknowledgedSequence: UInt64?
     ) async throws -> any TerminalDataConnection {
         connection
+    }
+}
+
+private struct SerialTerminalDataTransport: TerminalDataTransport {
+    let connection: SerialTerminalDataConnection
+
+    func attach(
+        authorization: TerminalAttachAuthorization,
+        lastAcknowledgedSequence: UInt64?
+    ) async throws -> any TerminalDataConnection {
+        connection
+    }
+}
+
+private enum SerialTerminalInputError: Error { case rejected }
+
+private actor SerialTerminalDataConnection: TerminalDataConnection {
+    private var outputWaiter: CheckedContinuation<TerminalOutputFrame?, Never>?
+    private var firstSendWaiter: CheckedContinuation<Void, Never>?
+    private var payloadToFail: TerminalInput.Payload?
+    private(set) var payloads: [TerminalInput.Payload] = []
+
+    var firstSendIsBlocked: Bool { firstSendWaiter != nil }
+
+    func nextOutput() async throws -> TerminalOutputFrame? {
+        await withCheckedContinuation { outputWaiter = $0 }
+    }
+
+    func send(_ input: TerminalInput) async throws -> UInt64 {
+        payloads.append(input.payload)
+        if payloads.count == 1 {
+            await withCheckedContinuation { firstSendWaiter = $0 }
+        }
+        if payloadToFail == input.payload {
+            payloadToFail = nil
+            throw SerialTerminalInputError.rejected
+        }
+        return input.inputSequence
+    }
+
+    func setVisible(_ visible: Bool) async throws {}
+
+    func detach() async {
+        firstSendWaiter?.resume()
+        firstSendWaiter = nil
+        outputWaiter?.resume(returning: nil)
+        outputWaiter = nil
+    }
+
+    func releaseFirstSend() {
+        firstSendWaiter?.resume()
+        firstSendWaiter = nil
+    }
+
+    func failNextPayload(_ payload: TerminalInput.Payload) {
+        payloadToFail = payload
     }
 }
 
