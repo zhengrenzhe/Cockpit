@@ -100,6 +100,40 @@ public actor DocumentClientController {
         return snapshot
     }
 
+    @discardableResult
+    public func restore(
+        documentID: DocumentID,
+        in environmentID: EnvironmentID,
+        requestWriteAccess: Bool
+    ) async throws -> DocumentSnapshot {
+        let controlID = try await acquireControl()
+        defer { releaseControl(controlID) }
+        try Task.checkCancellation()
+        let snapshot = try await transport.snapshot(documentID: documentID)
+        try Task.checkCancellation()
+        guard snapshot.documentID == documentID,
+              snapshot.environmentID == environmentID
+        else { throw DocumentProtocolError.invalidValue }
+        self.environmentID = environmentID
+        path = snapshot.relativePath
+        authoritativeSnapshot = snapshot
+        if requestWriteAccess {
+            let acquired = try await transport.acquireEditLease(
+                documentID: documentID,
+                client: clientInstanceID
+            )
+            try Task.checkCancellation()
+            lease = acquired
+            let ready = try snapshotWithLease(snapshot, lease: acquired)
+            authoritativeSnapshot = ready
+            state = .ready(ready)
+        } else {
+            lease = nil
+            state = .readOnly(snapshot)
+        }
+        return snapshot
+    }
+
     public func submit(_ changes: [UTF16TextEdit]) async throws -> EditAcknowledgement {
         try Task.checkCancellation()
         let id = UUID()

@@ -45,6 +45,7 @@ typealias TabDirtyFileCloseDecisionPort = @MainActor @Sendable (
 
 @MainActor
 protocol TabCommanding: FileRelocationCoordinating {
+    func selectFileTab(_ tab: WorkspaceTab, in active: ActiveContext) async throws
     func createTab(
         for option: NewTabPickerOption,
         tabID: TabID,
@@ -156,6 +157,133 @@ final class TabCommandController: TabCommanding {
 
     var pendingRelocationTokens: [MonacoRelocationToken] {
         pendingRelocations.values.sorted { $0.id.description < $1.id.description }
+    }
+
+    func selectFileTab(_ tab: WorkspaceTab, in active: ActiveContext) async throws {
+        guard case let .file(documentID) = tab.kind else {
+            throw WorkspaceViewModelError.invalidTabKind
+        }
+        await acquireFileLifecycle()
+        defer { releaseFileLifecycle() }
+        try Task.checkCancellation()
+
+        let reference = DocumentReference(
+            contextID: active.contextID,
+            tabID: tab.id,
+            documentID: documentID
+        )
+        if let session = bridge.resolver.session(documentID: documentID),
+           let controller = controllersByDocumentID[documentID],
+           session.controller === controller,
+           session.lastAuthoritativeEnvironmentID == active.environmentID,
+           session.references.contains(where: {
+               $0.workspaceContextID == active.contextID && $0.tabID == tab.id
+           }),
+           viewerRegistrations[reference] != nil
+        {
+            try await bridge.select(
+                contextID: active.contextID,
+                tabID: tab.id,
+                documentID: documentID
+            )
+            return
+        }
+
+        if let session = bridge.resolver.session(documentID: documentID),
+           let controller = controllersByDocumentID[documentID],
+           session.controller === controller,
+           session.lastAuthoritativeEnvironmentID == active.environmentID,
+           let path = session.lastAuthoritativePath
+        {
+            let transport = try documentTransportFactory(active)
+            try await transport.retainViewer(documentID: documentID)
+            do {
+                try await bridge.resolver.retain(
+                    contextID: active.contextID,
+                    tabID: tab.id,
+                    documentID: documentID,
+                    controller: controller,
+                    language: Self.languageIdentifier(for: path)
+                )
+                try await bridge.select(
+                    contextID: active.contextID,
+                    tabID: tab.id,
+                    documentID: documentID
+                )
+            } catch {
+                try? await bridge.resolver.release(
+                    contextID: active.contextID,
+                    tabID: tab.id,
+                    documentID: documentID
+                )
+                await transport.releaseViewer(documentID: documentID)
+                await transport.closeDocument(documentID: documentID)
+                throw error
+            }
+            viewerRegistrations[reference] = DocumentViewerRegistration(
+                transport: transport,
+                isControllerTransport: false
+            )
+            return
+        }
+
+        let transport = try documentTransportFactory(active)
+        let controller = DocumentClientController(
+            clientInstanceID: clientInstanceID,
+            transport: transport
+        )
+        let snapshot: DocumentSnapshot
+        do {
+            snapshot = try await controller.restore(
+                documentID: documentID,
+                in: active.environmentID,
+                requestWriteAccess: true
+            )
+        } catch {
+            await controller.close()
+            throw error
+        }
+        guard snapshot.documentID == documentID,
+              snapshot.environmentID == active.environmentID
+        else {
+            await controller.close()
+            throw DocumentProtocolError.invalidValue
+        }
+        do {
+            try await transport.retainViewer(documentID: documentID)
+            try await bridge.resolver.retain(
+                contextID: active.contextID,
+                tabID: tab.id,
+                documentID: documentID,
+                controller: controller,
+                language: Self.languageIdentifier(for: snapshot.relativePath)
+            )
+            try await bridge.select(
+                contextID: active.contextID,
+                tabID: tab.id,
+                documentID: documentID
+            )
+        } catch {
+            try? await bridge.resolver.release(
+                contextID: active.contextID,
+                tabID: tab.id,
+                documentID: documentID
+            )
+            await transport.releaseViewer(documentID: documentID)
+            await controller.close()
+            throw error
+        }
+        viewerRegistrations[reference] = DocumentViewerRegistration(
+            transport: transport,
+            isControllerTransport: true
+        )
+        let locator = DocumentLocator(
+            workspaceRootIdentity: active.workspaceRootIdentity,
+            path: snapshot.relativePath
+        )
+        documentIDsByLocator[locator] = documentID
+        locatorsByDocumentID[documentID, default: []].insert(locator)
+        controllersByDocumentID[documentID] = controller
     }
 
     func createTab(

@@ -295,6 +295,49 @@ final class TabCommandControllerTests: XCTestCase {
         XCTAssertEqual(secondCloseCount, 1)
     }
 
+    func testPersistedFileTabRestoresByDocumentIDBeforeMonacoSelection() async throws {
+        let fixture = try TabCommandFixture()
+        let documentID = DocumentID()
+        let tabID = TabID()
+        let path = try RelativePath("Sources/Persisted.swift")
+        let transport = try TabDocumentTransport(
+            snapshot: fixture.snapshot(
+                documentID: documentID,
+                environmentID: fixture.project.environmentID,
+                path: path,
+                dirtyState: .clean
+            ),
+            clientID: fixture.clientInstanceID
+        )
+        let controller = fixture.makeController(documentFactory: { _ in transport })
+        let tab = try WorkspaceTab(record: TabRecord(
+            validatingID: tabID,
+            resource: .file(documentID),
+            fileViewState: .initial()
+        ))
+
+        try await controller.selectFileTab(tab, in: fixture.project)
+
+        let snapshotDocumentIDs = await transport.snapshotDocumentIDs()
+        let openRequestCount = await transport.openRequests().count
+        let retainedDocumentIDs = await transport.retainedDocumentIDs()
+        XCTAssertEqual(snapshotDocumentIDs, [documentID])
+        XCTAssertEqual(openRequestCount, 0)
+        XCTAssertEqual(retainedDocumentIDs, [documentID])
+        let session = try XCTUnwrap(fixture.bridge.resolver.session(documentID: documentID))
+        XCTAssertEqual(session.lastAuthoritativeEnvironmentID, fixture.project.environmentID)
+        XCTAssertEqual(session.lastAuthoritativePath, path)
+        XCTAssertEqual(session.language, "swift")
+        XCTAssertEqual(
+            fixture.bridge.resolver.selectedReference,
+            MonacoDocumentReference(
+                workspaceContextID: fixture.project.contextID,
+                tabID: tabID,
+                documentID: documentID
+            )
+        )
+    }
+
     func testDirtyLastViewerCancelKeepsReferenceAndSaveUsesObservedFingerprint() async throws {
         let fixture = try TabCommandFixture()
         let documentID = DocumentID()
@@ -1424,6 +1467,8 @@ private actor TabDocumentTransport: DocumentDataTransport {
     private var openPaused = false
     private var openPauseWaiter: CheckedContinuation<Void, Never>?
     private var openResumeWaiter: CheckedContinuation<Void, Never>?
+    private var openedPaths: [(EnvironmentID, RelativePath)] = []
+    private var snapshotIDs: [DocumentID] = []
 
     init(snapshot: DocumentSnapshot, clientID: ClientInstanceID) throws {
         current = snapshot
@@ -1450,6 +1495,7 @@ private actor TabDocumentTransport: DocumentDataTransport {
         in environmentID: EnvironmentID,
         at path: RelativePath
     ) async throws -> DocumentSnapshot {
+        openedPaths.append((environmentID, path))
         if pauseOpen {
             pauseOpen = false
             openPaused = true
@@ -1462,6 +1508,7 @@ private actor TabDocumentTransport: DocumentDataTransport {
     }
 
     func snapshot(documentID: DocumentID) throws -> DocumentSnapshot {
+        snapshotIDs.append(documentID)
         if remainingSnapshotFailures > 0 {
             remainingSnapshotFailures -= 1
             throw DocumentProtocolError.recoveryRequired
@@ -1521,6 +1568,8 @@ private actor TabDocumentTransport: DocumentDataTransport {
     func closeCount() -> Int { closes }
     func retainedDocumentIDs() -> [DocumentID] { retained }
     func releasedDocumentIDs() -> [DocumentID] { released }
+    func snapshotDocumentIDs() -> [DocumentID] { snapshotIDs }
+    func openRequests() -> [(EnvironmentID, RelativePath)] { openedPaths }
 }
 
 @MainActor

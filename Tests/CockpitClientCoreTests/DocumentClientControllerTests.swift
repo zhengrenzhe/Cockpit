@@ -32,6 +32,34 @@ import CockpitTypes
     #expect(await transport.flushedSequences == [2])
 }
 
+@Test func documentClientControllerRestoresExistingDocumentFromSnapshotWithoutOpeningPath() async throws {
+    let fixture = try ClientDocumentFixture()
+    let transport = RecordingDocumentDataTransport(snapshot: fixture.snapshot, lease: fixture.lease)
+    let controller = DocumentClientController(
+        clientInstanceID: fixture.clientID,
+        transport: transport
+    )
+
+    let restored = try await controller.restore(
+        documentID: fixture.snapshot.documentID,
+        in: fixture.environmentID,
+        requestWriteAccess: true
+    )
+
+    #expect(restored == fixture.snapshot)
+    #expect(await transport.snapshotRequests == [fixture.snapshot.documentID])
+    #expect(await transport.openRequests.isEmpty)
+    #expect(await transport.leaseRequests == [fixture.snapshot.documentID])
+    guard case let .ready(ready) = await controller.state else {
+        Issue.record("Expected restored writable document to be ready")
+        return
+    }
+    #expect(ready.documentID == fixture.snapshot.documentID)
+    #expect(ready.environmentID == fixture.environmentID)
+    #expect(ready.relativePath == fixture.path)
+    #expect(ready.currentLease == fixture.lease)
+}
+
 @Test func documentClientControllerStopsOnAuthoritativeErrorUntilSnapshotReplacement() async throws {
     let fixture = try ClientDocumentFixture()
     let transport = RecordingDocumentDataTransport(snapshot: fixture.snapshot, lease: fixture.lease)
@@ -538,6 +566,9 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
     private var droppedDiscardReply: ClientDroppedReply?
     private var discardBlockWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseDiscardBlock: CheckedContinuation<Void, Never>?
+    private(set) var openRequests: [(EnvironmentID, RelativePath)] = []
+    private(set) var snapshotRequests: [DocumentID] = []
+    private(set) var leaseRequests: [DocumentID] = []
 
     init(snapshot: DocumentSnapshot, lease: EditLease) {
         authoritativeSnapshot = snapshot
@@ -545,12 +576,19 @@ private actor RecordingDocumentDataTransport: DocumentDataTransport {
     }
 
     func openDocument(in environmentID: EnvironmentID, at path: RelativePath) -> DocumentSnapshot {
-        authoritativeSnapshot
+        openRequests.append((environmentID, path))
+        return authoritativeSnapshot
     }
 
-    func snapshot(documentID: DocumentID) -> DocumentSnapshot { authoritativeSnapshot }
+    func snapshot(documentID: DocumentID) -> DocumentSnapshot {
+        snapshotRequests.append(documentID)
+        return authoritativeSnapshot
+    }
 
-    func acquireEditLease(documentID: DocumentID, client: ClientInstanceID) -> EditLease { lease }
+    func acquireEditLease(documentID: DocumentID, client: ClientInstanceID) -> EditLease {
+        leaseRequests.append(documentID)
+        return lease
+    }
 
     func transferEditLease(documentID: DocumentID, from leaseID: EditLeaseID, to client: ClientInstanceID) -> EditLease {
         lease

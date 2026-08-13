@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 import CockpitClientCore
 import CockpitHostCore
+import CockpitProtocol
 import CockpitTerminalCore
 import CockpitTypes
 @testable import Cockpit
@@ -204,6 +205,91 @@ final class WorkspaceViewModelTests: XCTestCase {
                 ),
             ]
         )
+    }
+
+    func testPersistedFileSelectionRoutesThroughRestoreAwareTabCommandsAndLatestIntentWins() async throws {
+        let fixture = try WorkspaceModelFixture()
+        let seed = fixture.makeViewModel()
+        try await seed.loadWorkspace()
+        try await seed.selectContext(.project(fixture.project.projectID))
+
+        let firstTab = try await seed.openNewTabPicker()
+        let firstDocument = DocumentID()
+        try await seed.replaceNewTabPicker(firstTab, with: .file(firstDocument))
+        let secondTab = try await seed.openNewTabPicker()
+        let secondDocument = DocumentID()
+        try await seed.replaceNewTabPicker(secondTab, with: .file(secondDocument))
+        try await seed.selectTab(firstTab)
+
+        let commands = RecordingWorkspaceTabCommands()
+        let legacySelection = RecordingFileSelection()
+        let rebuilt = fixture.makeViewModel(
+            tabCommands: commands,
+            fileSelection: legacySelection.select
+        )
+        try await rebuilt.loadWorkspace()
+        try await rebuilt.selectContext(.project(fixture.project.projectID))
+
+        XCTAssertEqual(commands.selectedFileTabIDs, [firstTab])
+        XCTAssertEqual(legacySelection.requests, [])
+        XCTAssertEqual(rebuilt.selectedTabID, firstTab)
+
+        commands.pauseNextFileSelection()
+        let stale = Task { try await rebuilt.selectTab(secondTab) }
+        await commands.waitUntilFileSelectionPaused()
+        try await rebuilt.selectTab(firstTab)
+        commands.resumeFileSelection()
+
+        await XCTAssertThrowsErrorAsync(CancellationError.self) {
+            try await stale.value
+        }
+        XCTAssertEqual(commands.selectedFileTabIDs, [firstTab, secondTab, firstTab])
+        XCTAssertEqual(rebuilt.selectedTabID, firstTab)
+        XCTAssertEqual(rebuilt.currentTabs.map(\.id), [firstTab, secondTab])
+    }
+
+    func testExplicitMissingDocumentRemovesStaleTabButValidationFailurePreservesIt() async throws {
+        let missingFixture = try WorkspaceModelFixture()
+        let missingSeed = missingFixture.makeViewModel()
+        try await missingSeed.loadWorkspace()
+        try await missingSeed.selectContext(.project(missingFixture.project.projectID))
+        let missingTab = try await missingSeed.openNewTabPicker()
+        try await missingSeed.replaceNewTabPicker(missingTab, with: .file(DocumentID()))
+
+        let missingCommands = RecordingWorkspaceTabCommands()
+        missingCommands.fileSelectionError = DocumentProtocolError.fileMissing
+        let missingRebuilt = missingFixture.makeViewModel(tabCommands: missingCommands)
+        try await missingRebuilt.loadWorkspace()
+        do {
+            _ = try await missingRebuilt.selectContext(.project(missingFixture.project.projectID))
+            XCTFail("expected readable missing-file error")
+        } catch let error as WorkspaceViewModelError {
+            XCTAssertEqual(error, .fileMissing(path: nil))
+            XCTAssertEqual(error.localizedDescription, "The file no longer exists in this project.")
+        }
+        let missingTabs = try await missingRebuilt.tabs(
+            for: .project(missingFixture.project.projectID)
+        )
+        XCTAssertEqual(missingTabs, [])
+
+        let invalidFixture = try WorkspaceModelFixture()
+        let invalidSeed = invalidFixture.makeViewModel()
+        try await invalidSeed.loadWorkspace()
+        try await invalidSeed.selectContext(.project(invalidFixture.project.projectID))
+        let invalidTab = try await invalidSeed.openNewTabPicker()
+        try await invalidSeed.replaceNewTabPicker(invalidTab, with: .file(DocumentID()))
+
+        let invalidCommands = RecordingWorkspaceTabCommands()
+        invalidCommands.fileSelectionError = DocumentProtocolError.invalidValue
+        let invalidRebuilt = invalidFixture.makeViewModel(tabCommands: invalidCommands)
+        try await invalidRebuilt.loadWorkspace()
+        await XCTAssertThrowsErrorAsync(DocumentProtocolError.self) {
+            _ = try await invalidRebuilt.selectContext(.project(invalidFixture.project.projectID))
+        }
+        let invalidTabs = try await invalidRebuilt.tabs(
+            for: .project(invalidFixture.project.projectID)
+        )
+        XCTAssertEqual(invalidTabs.map(\.id), [invalidTab])
     }
 
     func testConcurrentPickerMutationsSerializeTheWholeDurableReadModifySave() async throws {
@@ -879,12 +965,14 @@ private final class RecordingWorkspaceTabCommands: TabCommanding {
     var createdKind: WorkspaceTabKind = .shell(TerminalSessionID())
     var reattachedKind: WorkspaceTabKind = .shell(TerminalSessionID())
     var restartedKind: WorkspaceTabKind = .codex(TerminalSessionID())
+    var fileSelectionError: Error?
     var closeResult = true
     var finalizeError: Error?
     private(set) var createCalls: [CreateCall] = []
     private(set) var relocations: [Relocation] = []
     private(set) var reattachExclusions: [Set<TerminalSessionID>] = []
     private(set) var restartCalls: [RestartCall] = []
+    private(set) var selectedFileTabIDs: [TabID] = []
     private(set) var preparedCloseTabIDs: [TabID] = []
     private(set) var finalizedCloseTabIDs: [TabID] = []
     private var pausePrepareClose = false
@@ -903,6 +991,38 @@ private final class RecordingWorkspaceTabCommands: TabCommanding {
     private var restartPaused = false
     private var restartPauseWaiter: CheckedContinuation<Void, Never>?
     private var restartResumeWaiter: CheckedContinuation<Void, Never>?
+    private var pauseFileSelection = false
+    private var fileSelectionPaused = false
+    private var fileSelectionPauseWaiter: CheckedContinuation<Void, Never>?
+    private var fileSelectionResumeWaiter: CheckedContinuation<Void, Never>?
+
+    func selectFileTab(_ tab: WorkspaceTab, in active: ActiveContext) async throws {
+        guard case .file = tab.kind else {
+            throw WorkspaceViewModelError.invalidTabKind
+        }
+        selectedFileTabIDs.append(tab.id)
+        if let fileSelectionError { throw fileSelectionError }
+        if pauseFileSelection {
+            pauseFileSelection = false
+            fileSelectionPaused = true
+            fileSelectionPauseWaiter?.resume()
+            fileSelectionPauseWaiter = nil
+            await withCheckedContinuation { fileSelectionResumeWaiter = $0 }
+            fileSelectionPaused = false
+        }
+    }
+
+    func pauseNextFileSelection() { pauseFileSelection = true }
+
+    func waitUntilFileSelectionPaused() async {
+        if fileSelectionPaused { return }
+        await withCheckedContinuation { fileSelectionPauseWaiter = $0 }
+    }
+
+    func resumeFileSelection() {
+        fileSelectionResumeWaiter?.resume()
+        fileSelectionResumeWaiter = nil
+    }
 
     func createTab(
         for option: NewTabPickerOption,

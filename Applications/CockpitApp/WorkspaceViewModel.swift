@@ -15,6 +15,18 @@ enum WorkspaceViewModelError: Error, Equatable {
     case tabCommandUnavailable
     case commandInFlight
     case staleTerminalSession
+    case fileMissing(path: RelativePath?)
+}
+
+extension WorkspaceViewModelError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .fileMissing:
+            "The file no longer exists in this project."
+        default:
+            nil
+        }
+    }
 }
 
 private enum WorkspaceCommandAdmission: Hashable {
@@ -434,9 +446,9 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         let tabs = try workspaceTabs(from: state.tabs)
         if let selectedTabID = state.selectedTabID,
            let selectedTab = tabs.first(where: { $0.id == selectedTabID }),
-           case let .file(documentID) = selectedTab.kind
+           case .file = selectedTab.kind
         {
-            try await fileSelection(selected.contextID, selectedTabID, documentID)
+            try await selectFileTab(selectedTab, in: selected)
             guard request == selectionRequest,
                   await activeContexts.accepts(generation: selected.generation)
             else { throw CancellationError() }
@@ -567,8 +579,8 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         guard let tab = currentTabs.first(where: { $0.id == tabID }) else {
             throw WorkspaceViewModelError.tabNotFound
         }
-        if case let .file(documentID) = tab.kind {
-            try await fileSelection(active.contextID, tabID, documentID)
+        if case .file = tab.kind {
+            try await selectFileTab(tab, in: active)
         }
         guard request == tabSelectionRequest else { throw CancellationError() }
         try await requireAccepted(active)
@@ -588,6 +600,48 @@ final class WorkspaceViewModel: FileRelocationCoordinating {
         }
         let publication = reserveTabStatePublication(for: state.key)
         guard request == tabSelectionRequest else { throw CancellationError() }
+        await publishCurrentState(state, in: active, publication: publication)
+    }
+
+    private func selectFileTab(_ tab: WorkspaceTab, in active: ActiveContext) async throws {
+        do {
+            if let tabCommands {
+                try await tabCommands.selectFileTab(tab, in: active)
+                return
+            }
+            guard case let .file(documentID) = tab.kind else {
+                throw WorkspaceViewModelError.invalidTabKind
+            }
+            try await fileSelection(active.contextID, tab.id, documentID)
+        } catch DocumentProtocolError.fileMissing {
+            try await removeStaleFileTab(tab, in: active)
+            throw WorkspaceViewModelError.fileMissing(path: nil)
+        }
+    }
+
+    private func removeStaleFileTab(_ tab: WorkspaceTab, in active: ActiveContext) async throws {
+        guard case .file = tab.kind else {
+            throw WorkspaceViewModelError.invalidTabKind
+        }
+        let initial = try await state(for: active.contextID)
+        let state = try await stateCoordinator.mutate(
+            key: initial.key,
+            initial: initial
+        ) { state in
+            guard let index = state.tabs.firstIndex(where: { $0.id == tab.id }) else {
+                throw WorkspaceViewModelError.tabNotFound
+            }
+            state.tabs.remove(at: index)
+            let selected = state.selectedTabID == tab.id
+                ? state.tabs.first?.id
+                : state.selectedTabID
+            state = try Self.replacing(
+                state,
+                tabs: state.tabs,
+                selectedTabID: selected
+            )
+        }
+        let publication = reserveTabStatePublication(for: state.key)
         await publishCurrentState(state, in: active, publication: publication)
     }
 
