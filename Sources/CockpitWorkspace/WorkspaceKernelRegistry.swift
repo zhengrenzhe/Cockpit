@@ -232,6 +232,7 @@ public actor WorkspaceKernelRegistry: WorkspaceKernelRegistering {
         try await registry.registerViewer(
             connectionID: connectionID,
             contextID: binding.workspaceContextID,
+            clientInstanceID: binding.clientInstanceID,
             documentID: documentID
         )
     }

@@ -238,6 +238,26 @@ public actor DocumentActor {
         return lease
     }
 
+    public func releaseEditLease(client: ClientInstanceID) async {
+        await enterOperation()
+        defer { leaveOperation() }
+        guard let lease = currentLease,
+              lease.clientInstanceID == client
+        else { return }
+        do {
+            let replacement = try replacingMetadata(editLeaseID: .some(nil))
+            try await metadataRepository.compareAndSetDocumentMetadata(
+                replacement,
+                expectedDocumentVersion: metadata.documentVersion,
+                expectedEditLeaseID: lease.id
+            )
+            metadata = replacement
+            currentLease = nil
+        } catch {
+            recoveryRequired = true
+        }
+    }
+
     public func transferEditLease(from leaseID: EditLeaseID, to client: ClientInstanceID) async throws -> EditLease {
         await enterOperation()
         defer { leaveOperation() }

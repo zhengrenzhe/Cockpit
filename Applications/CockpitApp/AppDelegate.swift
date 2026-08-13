@@ -201,6 +201,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var phaseOneReceiptURL: URL?
     private var phaseOneReceipt: PhaseOneAppReceipt?
     private var phaseOneScenario: PhaseOneAppScenarioConfiguration?
+    private var applicationTerminationTask: Task<Void, Never>?
+    private var applicationTerminationPrepared = false
 
     static func main() {
         let application = NSApplication.shared
@@ -453,7 +455,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     },
                     beforeHandlingAttached: beforeHandlingAttached
                 )
-            }
+            },
+            frameStore: .production
         )
         self.hostClient = hostClient
         self.monacoController = monacoController
@@ -559,6 +562,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         monacoController?.tearDown()
         let hostClient = hostClient
         Task { await hostClient?.disconnect() }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if applicationTerminationPrepared || workspaceWindowController == nil {
+            return .terminateNow
+        }
+        guard applicationTerminationTask == nil,
+              let workspaceWindowController
+        else { return .terminateLater }
+        applicationTerminationTask = Task { @MainActor [weak self, weak sender] in
+            await workspaceWindowController.prepareForApplicationTermination()
+            guard let self else { return }
+            applicationTerminationPrepared = true
+            applicationTerminationTask = nil
+            sender?.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

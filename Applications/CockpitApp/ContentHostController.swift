@@ -10,6 +10,7 @@ typealias TerminalContentControllerFactory = @MainActor (
 @MainActor
 protocol TerminalContentRetiring: AnyObject {
     func detach()
+    func detachAndWait() async
 }
 
 extension TerminalTabViewController: TerminalContentRetiring {}
@@ -128,6 +129,17 @@ final class ContentHostController: NSViewController {
         let retiredPickerIDs = pickerControllers.keys.filter { !pickerIDs.contains($0) }
         for tabID in retiredPickerIDs {
             guard let controller = pickerControllers.removeValue(forKey: tabID) else { continue }
+            retire(controller)
+        }
+    }
+
+    func detachTerminalsForApplicationTermination() async {
+        let controllers = Array(terminalControllers.values.map(\.controller))
+        terminalControllers.removeAll(keepingCapacity: false)
+        for controller in controllers {
+            if let terminal = controller as? any TerminalContentRetiring {
+                await terminal.detachAndWait()
+            }
             retire(controller)
         }
     }

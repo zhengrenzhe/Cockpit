@@ -237,7 +237,7 @@ final class TabCommandController: TabCommanding {
             snapshot = try await controller.restore(
                 documentID: documentID,
                 in: active.environmentID,
-                requestWriteAccess: true
+                requestWriteAccess: false
             )
         } catch {
             await controller.close()
@@ -251,6 +251,13 @@ final class TabCommandController: TabCommanding {
         }
         do {
             try await transport.retainViewer(documentID: documentID)
+            let writableSnapshot = try await controller.resynchronize(
+                requestWriteAccess: true
+            )
+            guard writableSnapshot.documentID == documentID,
+                  writableSnapshot.environmentID == active.environmentID,
+                  writableSnapshot.relativePath == snapshot.relativePath
+            else { throw DocumentProtocolError.invalidValue }
             try await bridge.resolver.retain(
                 contextID: active.contextID,
                 tabID: tab.id,
@@ -701,7 +708,7 @@ final class TabCommandController: TabCommanding {
             snapshot = try await controller.open(
                 in: active.environmentID,
                 at: selection.path,
-                requestWriteAccess: true
+                requestWriteAccess: false
             )
         } catch {
             await controller.close()
@@ -715,6 +722,13 @@ final class TabCommandController: TabCommanding {
         }
         do {
             try await transport.retainViewer(documentID: snapshot.documentID)
+            let writableSnapshot = try await controller.resynchronize(
+                requestWriteAccess: true
+            )
+            guard writableSnapshot.documentID == snapshot.documentID,
+                  writableSnapshot.environmentID == active.environmentID,
+                  writableSnapshot.relativePath == selection.path
+            else { throw DocumentProtocolError.invalidValue }
             try await bridge.resolver.retain(
                 contextID: active.contextID,
                 tabID: tabID,

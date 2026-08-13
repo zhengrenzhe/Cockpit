@@ -321,9 +321,14 @@ final class TabCommandControllerTests: XCTestCase {
         let snapshotDocumentIDs = await transport.snapshotDocumentIDs()
         let openRequestCount = await transport.openRequests().count
         let retainedDocumentIDs = await transport.retainedDocumentIDs()
-        XCTAssertEqual(snapshotDocumentIDs, [documentID])
+        let lifecycleEvents = await transport.lifecycleEvents()
+        XCTAssertEqual(snapshotDocumentIDs, [documentID, documentID])
         XCTAssertEqual(openRequestCount, 0)
         XCTAssertEqual(retainedDocumentIDs, [documentID])
+        XCTAssertEqual(
+            lifecycleEvents,
+            ["snapshot", "retain", "snapshot", "acquire"]
+        )
         let session = try XCTUnwrap(fixture.bridge.resolver.session(documentID: documentID))
         XCTAssertEqual(session.lastAuthoritativeEnvironmentID, fixture.project.environmentID)
         XCTAssertEqual(session.lastAuthoritativePath, path)
@@ -335,6 +340,40 @@ final class TabCommandControllerTests: XCTestCase {
                 tabID: tabID,
                 documentID: documentID
             )
+        )
+    }
+
+    func testNewFileRegistersViewerBeforeRequestingWriteLease() async throws {
+        let fixture = try TabCommandFixture()
+        let documentID = DocumentID()
+        let path = try RelativePath("Sources/New.swift")
+        let transport = try TabDocumentTransport(
+            snapshot: fixture.snapshot(
+                documentID: documentID,
+                environmentID: fixture.project.environmentID,
+                path: path,
+                dirtyState: .clean
+            ),
+            clientID: fixture.clientInstanceID
+        )
+        let controller = fixture.makeController(
+            documentFactory: TabDocumentFactory(transport: transport).make,
+            filePicker: TabFilePicker(values: [
+                TabFileSelection(path: path, language: "swift"),
+            ]).pick
+        )
+
+        let result = try await controller.createTab(
+            for: .file,
+            tabID: TabID(),
+            in: fixture.project
+        )
+
+        XCTAssertEqual(result, .file(documentID))
+        let lifecycleEvents = await transport.lifecycleEvents()
+        XCTAssertEqual(
+            lifecycleEvents,
+            ["open", "retain", "snapshot", "acquire"]
         )
     }
 
@@ -1469,6 +1508,7 @@ private actor TabDocumentTransport: DocumentDataTransport {
     private var openResumeWaiter: CheckedContinuation<Void, Never>?
     private var openedPaths: [(EnvironmentID, RelativePath)] = []
     private var snapshotIDs: [DocumentID] = []
+    private var lifecycle: [String] = []
 
     init(snapshot: DocumentSnapshot, clientID: ClientInstanceID) throws {
         current = snapshot
@@ -1495,6 +1535,7 @@ private actor TabDocumentTransport: DocumentDataTransport {
         in environmentID: EnvironmentID,
         at path: RelativePath
     ) async throws -> DocumentSnapshot {
+        lifecycle.append("open")
         openedPaths.append((environmentID, path))
         if pauseOpen {
             pauseOpen = false
@@ -1508,6 +1549,7 @@ private actor TabDocumentTransport: DocumentDataTransport {
     }
 
     func snapshot(documentID: DocumentID) throws -> DocumentSnapshot {
+        lifecycle.append("snapshot")
         snapshotIDs.append(documentID)
         if remainingSnapshotFailures > 0 {
             remainingSnapshotFailures -= 1
@@ -1516,7 +1558,10 @@ private actor TabDocumentTransport: DocumentDataTransport {
         return current
     }
 
-    func acquireEditLease(documentID: DocumentID, client: ClientInstanceID) -> EditLease { lease }
+    func acquireEditLease(documentID: DocumentID, client: ClientInstanceID) -> EditLease {
+        lifecycle.append("acquire")
+        return lease
+    }
     func transferEditLease(
         documentID: DocumentID,
         from leaseID: EditLeaseID,
@@ -1543,7 +1588,10 @@ private actor TabDocumentTransport: DocumentDataTransport {
         discards += 1
         return current
     }
-    func retainViewer(documentID: DocumentID) { retained.append(documentID) }
+    func retainViewer(documentID: DocumentID) {
+        lifecycle.append("retain")
+        retained.append(documentID)
+    }
     func releaseViewer(documentID: DocumentID) { released.append(documentID) }
     func closeDocument(documentID: DocumentID) { closes += 1 }
 
@@ -1570,6 +1618,7 @@ private actor TabDocumentTransport: DocumentDataTransport {
     func releasedDocumentIDs() -> [DocumentID] { released }
     func snapshotDocumentIDs() -> [DocumentID] { snapshotIDs }
     func openRequests() -> [(EnvironmentID, RelativePath)] { openedPaths }
+    func lifecycleEvents() -> [String] { lifecycle }
 }
 
 @MainActor

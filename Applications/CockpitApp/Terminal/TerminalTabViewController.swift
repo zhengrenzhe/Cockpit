@@ -136,6 +136,16 @@ final class TerminalTabViewController: NSViewController {
     }
 
     func detach() {
+        prepareForDetachment()
+        Task { await attachmentController.detach() }
+    }
+
+    func detachAndWait() async {
+        prepareForDetachment()
+        await attachmentController.detach()
+    }
+
+    private func prepareForDetachment() {
         resetInputQueue()
         lifecycleRequestID = nil
         currentSessionID = nil
@@ -152,7 +162,6 @@ final class TerminalTabViewController: NSViewController {
         exitOverlay.isHidden = true
         eventTask?.cancel()
         eventTask = nil
-        Task { await attachmentController.detach() }
     }
 
     func signal(_ signal: TerminalSignal) async throws -> Int32 {

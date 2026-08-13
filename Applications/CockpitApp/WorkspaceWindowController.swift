@@ -36,18 +36,91 @@ enum WorkspaceWindowGeometry {
 }
 
 @MainActor
+struct WorkspaceWindowFrameStore {
+    private let loadValue: () -> String?
+    private let saveValue: (String) -> Void
+
+    init(defaults: UserDefaults) {
+        loadValue = {
+            defaults.string(forKey: WorkspaceWindowGeometry.autosaveName)
+        }
+        saveValue = {
+            defaults.set($0, forKey: WorkspaceWindowGeometry.autosaveName)
+        }
+    }
+
+    private init(
+        loadValue: @escaping () -> String?,
+        saveValue: @escaping (String) -> Void
+    ) {
+        self.loadValue = loadValue
+        self.saveValue = saveValue
+    }
+
+    static var production: Self {
+        Self(defaults: .standard)
+    }
+
+    static var disabled: Self {
+        Self(loadValue: { nil }, saveValue: { _ in })
+    }
+
+    func restoredFrame(screens: [NSRect]) -> NSRect? {
+        guard let value = loadValue() else { return nil }
+        let frame = NSRectFromString(value)
+        guard WorkspaceWindowGeometry.isRestorable(frame, screens: screens) else {
+            return nil
+        }
+        return frame
+    }
+
+    func save(_ frame: NSRect) {
+        saveValue(NSStringFromRect(frame))
+    }
+}
+
+@MainActor
+private final class WorkspaceWindowFramePersistence: NSObject, NSWindowDelegate {
+    private let store: WorkspaceWindowFrameStore
+
+    init(store: WorkspaceWindowFrameStore) {
+        self.store = store
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        save(notification)
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        save(notification)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        save(notification)
+    }
+
+    private func save(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        store.save(window.frame)
+    }
+}
+
+@MainActor
 final class WorkspaceWindowController: NSWindowController {
     let viewModel: WorkspaceViewModel
     let workspaceSplitViewController: WorkspaceSplitViewController
+    private let framePersistence: WorkspaceWindowFramePersistence
 
     init(
         viewModel: WorkspaceViewModel,
         monacoController: MonacoEditorViewController,
         relocationCoordinator: any FileRelocationCoordinating,
         fileTreeProviderFactory: @escaping FileTreeProviderFactory,
-        terminalControllerFactory: @escaping TerminalContentControllerFactory
+        terminalControllerFactory: @escaping TerminalContentControllerFactory,
+        frameStore: WorkspaceWindowFrameStore = .disabled
     ) {
         self.viewModel = viewModel
+        framePersistence = WorkspaceWindowFramePersistence(store: frameStore)
         workspaceSplitViewController = WorkspaceSplitViewController(
             viewModel: viewModel,
             monacoController: monacoController,
@@ -70,17 +143,15 @@ final class WorkspaceWindowController: NSWindowController {
         window.contentMinSize = WorkspaceWindowGeometry.minimumContentSize
         window.isRestorable = true
         window.contentViewController = workspaceSplitViewController
-        let restored = window.setFrameUsingName(WorkspaceWindowGeometry.autosaveName)
         let screenFrames = NSScreen.screens.map(\.visibleFrame)
-        if !restored || !WorkspaceWindowGeometry.isRestorable(
-            window.frame,
-            screens: screenFrames
-        ) {
+        if let restoredFrame = frameStore.restoredFrame(screens: screenFrames) {
+            window.setFrame(restoredFrame, display: false)
+        } else {
             window.setContentSize(defaultFrame.size)
             window.center()
         }
-        window.setFrameAutosaveName(WorkspaceWindowGeometry.autosaveName)
         super.init(window: window)
+        window.delegate = framePersistence
     }
 
     required init?(coder: NSCoder) { nil }
@@ -90,5 +161,10 @@ final class WorkspaceWindowController: NSWindowController {
         showWindow(nil)
         try await viewModel.loadWorkspace()
         workspaceSplitViewController.refresh()
+    }
+
+    func prepareForApplicationTermination() async {
+        await workspaceSplitViewController.contentHostController
+            .detachTerminalsForApplicationTermination()
     }
 }

@@ -202,9 +202,7 @@ public struct WorkspaceHostDataPlaneService: HostDataPlaneServing {
         _ operation: @Sendable (DocumentActor) async throws -> T
     ) async throws -> T {
         try await withDocumentOperation(binding: binding) { registry in
-            guard let document = await registry.document(id: documentID) else {
-                throw HostDataPlaneServiceError.documentNotOpen
-            }
+            let document = try await registry.restoreDocument(id: documentID)
             return try await operation(document)
         }
     }

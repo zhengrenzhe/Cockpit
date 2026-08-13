@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import ServiceManagement
 import CockpitLocalTransport
@@ -5,6 +6,7 @@ import CockpitLocalTransport
 protocol LaunchAgentService {
     var status: SMAppService.Status { get }
     func register() throws
+    func unregister() throws
 }
 
 extension SMAppService: LaunchAgentService {}
@@ -59,6 +61,9 @@ struct ProductionLaunchAgentRegistrar {
     ]
 
     private let serviceFactory: (String) throws -> any LaunchAgentService
+    private let currentRevision: (() throws -> String)?
+    private let registeredRevision: (() -> String?)?
+    private let storeRegisteredRevision: ((String) -> Void)?
 
     init(
         serviceFactory: @escaping (String) throws -> any LaunchAgentService = {
@@ -66,24 +71,54 @@ struct ProductionLaunchAgentRegistrar {
         }
     ) {
         self.serviceFactory = serviceFactory
+        currentRevision = nil
+        registeredRevision = nil
+        storeRegisteredRevision = nil
+    }
+
+    init(
+        currentRevision: @escaping () throws -> String,
+        registeredRevision: @escaping () -> String?,
+        storeRegisteredRevision: @escaping (String) -> Void,
+        serviceFactory: @escaping (String) throws -> any LaunchAgentService
+    ) {
+        self.serviceFactory = serviceFactory
+        self.currentRevision = currentRevision
+        self.registeredRevision = registeredRevision
+        self.storeRegisteredRevision = storeRegisteredRevision
+    }
+
+    static func production() -> Self {
+        Self(
+            currentRevision: ProductionLaunchAgentRevision.current,
+            registeredRevision: {
+                UserDefaults.standard.string(
+                    forKey: ProductionLaunchAgentRevision.preferencesKey
+                )
+            },
+            storeRegisteredRevision: {
+                UserDefaults.standard.set(
+                    $0,
+                    forKey: ProductionLaunchAgentRevision.preferencesKey
+                )
+            },
+            serviceFactory: { SMAppService.agent(plistName: $0) }
+        )
     }
 
     func registerRequiredServices() throws {
+        let revision = try currentRevision?()
+        let refreshEnabledServices = revision.map { registeredRevision?() != $0 } ?? false
         for plistName in Self.requiredPlistNames {
             let service = try serviceFactory(plistName)
             let status = service.status
             switch status {
             case .enabled:
-                continue
+                guard refreshEnabledServices else { continue }
+                try service.unregister()
+                try register(service, plistName: plistName)
             case .notRegistered, .notFound:
-                try service.register()
-                let registeredStatus = service.status
-                guard registeredStatus == .enabled else {
-                    throw ProductionLaunchAgentRegistrationError.unavailable(
-                        plistName: plistName,
-                        status: registeredStatus
-                    )
-                }
+                try register(service, plistName: plistName)
             case .requiresApproval:
                 throw ProductionLaunchAgentRegistrationError.unavailable(
                     plistName: plistName,
@@ -96,13 +131,55 @@ struct ProductionLaunchAgentRegistrar {
                 )
             }
         }
+        if let revision {
+            storeRegisteredRevision?(revision)
+        }
+    }
+
+    private func register(
+        _ service: any LaunchAgentService,
+        plistName: String
+    ) throws {
+        try service.register()
+        let registeredStatus = service.status
+        guard registeredStatus == .enabled else {
+            throw ProductionLaunchAgentRegistrationError.unavailable(
+                plistName: plistName,
+                status: registeredStatus
+            )
+        }
+    }
+}
+
+private enum ProductionLaunchAgentRevision {
+    static let preferencesKey = "ProductionLaunchAgentExecutableRevision.v1"
+    private static let artifactRelativePaths = [
+        "Contents/Library/LaunchAgents/dev.cockpit.host.plist",
+        "Contents/Library/LaunchAgents/dev.cockpit.terminal.plist",
+        "Contents/Resources/CockpitHost",
+        "Contents/Resources/CockpitPTYKeeper",
+        "Contents/Resources/CockpitTerminalSupervisor",
+    ]
+
+    static func current() throws -> String {
+        var hasher = SHA256()
+        for relativePath in artifactRelativePaths {
+            let artifactURL = Bundle.main.bundleURL.appendingPathComponent(relativePath)
+            let artifact = try Data(contentsOf: artifactURL, options: .mappedIfSafe)
+            hasher.update(data: Data(relativePath.utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: artifact)
+        }
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 }
 
 func registerProductionLaunchAgents(
     serviceNamespace: XPCServiceNamespace,
     registration: () throws -> Void = {
-        try ProductionLaunchAgentRegistrar().registerRequiredServices()
+        try ProductionLaunchAgentRegistrar.production().registerRequiredServices()
     }
 ) throws {
     guard serviceNamespace.description.isEmpty else { return }

@@ -73,6 +73,22 @@ final class WorkspaceHierarchyTests: XCTestCase {
         XCTAssertEqual(window.contentMinSize, NSSize(width: 960, height: 640))
     }
 
+    func testWindowFrameStoreRestoresOnlyFramesOnCurrentScreens() throws {
+        let suiteName = "dev.cockpit.window-frame-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = WorkspaceWindowFrameStore(defaults: defaults)
+        let visibleFrame = NSRect(x: 0, y: 0, width: 1_920, height: 1_080)
+        let savedFrame = NSRect(x: 220, y: 120, width: 1_208, height: 900)
+
+        store.save(savedFrame)
+
+        XCTAssertEqual(store.restoredFrame(screens: [visibleFrame]), savedFrame)
+        XCTAssertNil(store.restoredFrame(screens: [
+            NSRect(x: 3_000, y: 0, width: 1_920, height: 1_080),
+        ]))
+    }
+
     func testSidebarAllowsOnlyTheSinglePhaseOneProject() throws {
         let fixture = try WorkspaceHierarchyFixture()
         let controller = WorkspaceSidebarController(viewModel: fixture.viewModel)
@@ -286,6 +302,45 @@ final class WorkspaceHierarchyTests: XCTestCase {
 
         XCTAssertEqual(secondController.detachCount, 1)
         XCTAssertNil(secondController.parent)
+    }
+
+    func testApplicationTerminationWaitsForEveryCachedTerminalToDetach() async throws {
+        let fixture = try WorkspaceHierarchyFixture()
+        let recorder = RecordingTerminalControllerFactory()
+        let content = ContentHostController(
+            monacoController: fixture.monacoController,
+            clientInstanceID: ClientInstanceID(),
+            terminalControllerFactory: { tab, _, _ in
+                recorder.makeController(for: tab)
+            },
+            newTabPickerChoice: { _, _, _ in },
+            newTabPickerCancellation: { _, _ in }
+        )
+        let active = try fixture.project.resolvedContext.active(generation: 1)
+        let first = try WorkspaceTab(
+            record: TabRecord(
+                validatingID: TabID(),
+                resource: .terminal(TerminalSessionID()),
+                terminalKind: .shell,
+                fileViewState: nil
+            )
+        )
+        let second = try WorkspaceTab(
+            record: TabRecord(
+                validatingID: TabID(),
+                resource: .terminal(TerminalSessionID()),
+                terminalKind: .codex,
+                fileViewState: nil
+            )
+        )
+        content.show(first, in: active)
+        content.show(second, in: active)
+        XCTAssertEqual(recorder.controllers.count, 2)
+
+        await content.detachTerminalsForApplicationTermination()
+
+        XCTAssertEqual(recorder.controllers.map(\.detachAndWaitCount), [1, 1])
+        XCTAssertTrue(recorder.controllers.allSatisfy { $0.parent == nil })
     }
 
     func testNewTabPickerButtonsRouteExactTabContextChoiceAndCancel() async throws {
@@ -1323,6 +1378,7 @@ private final class RecordingTerminalContentController: NSViewController,
 {
     let sessionID: TerminalSessionID
     private(set) var detachCount = 0
+    private(set) var detachAndWaitCount = 0
 
     init(sessionID: TerminalSessionID) {
         self.sessionID = sessionID
@@ -1334,6 +1390,8 @@ private final class RecordingTerminalContentController: NSViewController,
     override func loadView() { view = NSView() }
 
     func detach() { detachCount += 1 }
+
+    func detachAndWait() async { detachAndWaitCount += 1 }
 }
 
 @MainActor

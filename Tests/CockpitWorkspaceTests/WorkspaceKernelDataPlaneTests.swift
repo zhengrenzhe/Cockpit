@@ -126,6 +126,117 @@ import CockpitTypes
     #expect(states[0].liveViewerContexts.isEmpty)
 }
 
+@Test func workspaceKernelDataPlaneRestoresPersistedDirtyDocumentByIDAfterKernelRestart() async throws {
+    let fixture = try await WorkspaceDataPlaneFixture()
+    defer { fixture.remove() }
+    let opened = try await fixture.service.openDocument(
+        binding: fixture.binding,
+        at: fixture.path
+    )
+    let lease = try await fixture.service.acquireEditLease(
+        binding: fixture.binding,
+        documentID: opened.documentID
+    )
+    _ = try await fixture.service.apply(
+        binding: fixture.binding,
+        transaction: EditTransaction(
+            validatingDocumentID: opened.documentID,
+            editLeaseID: lease.id,
+            baseVersion: opened.documentVersion,
+            clientSequence: 1,
+            changes: [try UTF16TextEdit(
+                validatingOffset: 3,
+                length: 0,
+                replacement: "d"
+            )]
+        )
+    )
+
+    let restartedRegistry = WorkspaceKernelRegistry(
+        documentLocatorUpdater: fixture.repository,
+        documentMetadataRepository: fixture.repository,
+        documentRecoveryRoot: fixture.recoveryRoot
+    )
+    await restartedRegistry.register(
+        environmentID: fixture.environmentID,
+        root: ResolvedProjectRoot(
+            canonicalAbsolutePath: fixture.root.path,
+            canonicalRootIdentity: fixture.root.path,
+            gitCommonDirectory: nil,
+            accessToken: WorkspaceDataPlaneRootToken()
+        )
+    )
+    let restartedService = WorkspaceHostDataPlaneService(
+        workspaceService: fixture.workspace,
+        kernelRegistry: restartedRegistry
+    )
+
+    let restored = try await restartedService.snapshot(
+        binding: fixture.binding,
+        documentID: opened.documentID
+    )
+
+    #expect(restored.documentID == opened.documentID)
+    #expect(restored.environmentID == fixture.environmentID)
+    #expect(restored.relativePath == fixture.path)
+    #expect(restored.text == "abcd")
+    #expect(restored.documentVersion == 1)
+    #expect(restored.persistedVersion == 0)
+    #expect(restored.lastAcceptedClientSequence == 1)
+    #expect(restored.dirtyState == .dirty)
+    #expect(restored.currentLease == nil)
+}
+
+@Test func workspaceKernelDataPlaneReleasesClientLeaseOnlyAfterItsFinalViewerDisconnects() async throws {
+    let fixture = try await WorkspaceDataPlaneFixture()
+    defer { fixture.remove() }
+    let firstConnection = UUID()
+    let secondConnection = UUID()
+    let opened = try await fixture.service.openDocument(
+        binding: fixture.binding,
+        at: fixture.path
+    )
+    try await fixture.service.registerDocumentViewer(
+        connectionID: firstConnection,
+        binding: fixture.binding,
+        documentID: opened.documentID
+    )
+    try await fixture.service.registerDocumentViewer(
+        connectionID: secondConnection,
+        binding: fixture.binding,
+        documentID: opened.documentID
+    )
+    _ = try await fixture.service.acquireEditLease(
+        binding: fixture.binding,
+        documentID: opened.documentID
+    )
+    let replacementBinding = try HostDataPlaneBinding(
+        validatingClientInstanceID: ClientInstanceID(),
+        windowID: WindowID(),
+        workspaceContextID: fixture.contextID,
+        environmentID: fixture.environmentID,
+        activeContextGeneration: fixture.binding.activeContextGeneration
+    )
+
+    await fixture.service.removeDocumentViewer(
+        connectionID: firstConnection,
+        documentID: opened.documentID
+    )
+    await #expect(throws: DocumentProtocolError.leaseHeld) {
+        _ = try await fixture.service.acquireEditLease(
+            binding: replacementBinding,
+            documentID: opened.documentID
+        )
+    }
+
+    await fixture.service.removeDocumentViewers(connectionID: secondConnection)
+    let replacement = try await fixture.service.acquireEditLease(
+        binding: replacementBinding,
+        documentID: opened.documentID
+    )
+    #expect(replacement.clientInstanceID == replacementBinding.clientInstanceID)
+}
+
 @Test func conversationDeletionReservationDrainsAdmittedEditAndBlocksLaterDataPlaneWork() async throws {
     let fixture = try await WorkspaceDataPlaneFixture()
     defer { fixture.remove() }

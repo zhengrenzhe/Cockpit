@@ -4,6 +4,88 @@ import CockpitLocalTransport
 @testable import Cockpit
 
 final class ProductionLaunchAgentRegistrarTests: XCTestCase {
+    func testChangedExecutableRevisionRefreshesEnabledServices() throws {
+        let events = RegistrationEvents()
+        let terminal = RecordingLaunchAgent(
+            plistName: "dev.cockpit.terminal.plist",
+            status: .enabled,
+            events: events
+        )
+        let host = RecordingLaunchAgent(
+            plistName: "dev.cockpit.host.plist",
+            status: .enabled,
+            events: events
+        )
+        let services: [String: RecordingLaunchAgent] = [
+            terminal.plistName: terminal,
+            host.plistName: host,
+        ]
+        var registeredRevision: String? = "old-revision"
+        let registrar = ProductionLaunchAgentRegistrar(
+            currentRevision: { "new-revision" },
+            registeredRevision: { registeredRevision },
+            storeRegisteredRevision: { registeredRevision = $0 },
+            serviceFactory: { plistName in
+                try XCTUnwrap(services[plistName])
+            }
+        )
+
+        try registrar.registerRequiredServices()
+
+        XCTAssertEqual(
+            events.values,
+            [
+                .status(terminal.plistName),
+                .unregister(terminal.plistName),
+                .register(terminal.plistName),
+                .status(terminal.plistName),
+                .status(host.plistName),
+                .unregister(host.plistName),
+                .register(host.plistName),
+                .status(host.plistName),
+            ]
+        )
+        XCTAssertEqual(registeredRevision, "new-revision")
+    }
+
+    func testMatchingExecutableRevisionLeavesEnabledServicesRunning() throws {
+        let events = RegistrationEvents()
+        let terminal = RecordingLaunchAgent(
+            plistName: "dev.cockpit.terminal.plist",
+            status: .enabled,
+            events: events
+        )
+        let host = RecordingLaunchAgent(
+            plistName: "dev.cockpit.host.plist",
+            status: .enabled,
+            events: events
+        )
+        let services: [String: RecordingLaunchAgent] = [
+            terminal.plistName: terminal,
+            host.plistName: host,
+        ]
+        var registeredRevision: String? = "current-revision"
+        let registrar = ProductionLaunchAgentRegistrar(
+            currentRevision: { "current-revision" },
+            registeredRevision: { registeredRevision },
+            storeRegisteredRevision: { registeredRevision = $0 },
+            serviceFactory: { plistName in
+                try XCTUnwrap(services[plistName])
+            }
+        )
+
+        try registrar.registerRequiredServices()
+
+        XCTAssertEqual(
+            events.values,
+            [
+                .status(terminal.plistName),
+                .status(host.plistName),
+            ]
+        )
+        XCTAssertEqual(registeredRevision, "current-revision")
+    }
+
     func testRegistersTerminalBeforeHostAndRequiresBothToBecomeEnabled() throws {
         let events = RegistrationEvents()
         let terminal = RecordingLaunchAgent(
@@ -134,6 +216,7 @@ final class ProductionLaunchAgentRegistrarTests: XCTestCase {
 private final class RegistrationEvents {
     enum Event: Equatable {
         case status(String)
+        case unregister(String)
         case register(String)
     }
 
@@ -168,5 +251,10 @@ private final class RecordingLaunchAgent: LaunchAgentService {
     func register() throws {
         events.values.append(.register(plistName))
         currentStatus = .enabled
+    }
+
+    func unregister() throws {
+        events.values.append(.unregister(plistName))
+        currentStatus = .notRegistered
     }
 }

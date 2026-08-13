@@ -91,6 +91,11 @@ private enum OpenRequestState {
     case cancelled
 }
 
+private struct DocumentViewerRegistration: Sendable {
+    let contextID: WorkspaceContextID
+    let clientInstanceID: ClientInstanceID
+}
+
 public actor DocumentRegistry {
     private let environmentID: EnvironmentID
     private let documentServing: any DocumentServing
@@ -112,7 +117,7 @@ public actor DocumentRegistry {
     private var openWaiters: [DocumentOpenWaiter] = []
     private var recoveryRequired = false
     private var viewerDocumentsByConnection: [
-        UUID: [DocumentID: WorkspaceContextID]
+        UUID: [DocumentID: DocumentViewerRegistration]
     ] = [:]
     private var activeDocumentOperations: [UUID: WorkspaceContextID?] = [:]
     private var documentOperationWaiters: [DocumentOperationWaiter] = []
@@ -156,20 +161,37 @@ public actor DocumentRegistry {
         byID[id]
     }
 
+    public func restoreDocument(id: DocumentID) async throws -> DocumentActor {
+        try requireOperational()
+        if let document = byID[id] { return document }
+        guard let metadata = try await metadataRepository.loadDocument(id: id),
+              metadata.environmentID == environmentID
+        else { throw HostDataPlaneServiceError.documentNotOpen }
+        let document = try await open(at: metadata.relativePath)
+        let snapshot = await document.snapshot()
+        guard snapshot.documentID == id,
+              snapshot.environmentID == environmentID
+        else { throw WorkspaceRepositoryError.invalidStoredValue }
+        return document
+    }
+
     var pendingDocumentOperationCount: Int { documentOperationWaiters.count }
     var pendingDeletionReservationCount: Int { deletionWaiters.count }
 
     public func registerViewer(
         connectionID: UUID,
         contextID: WorkspaceContextID,
+        clientInstanceID: ClientInstanceID,
         documentID: DocumentID
     ) async throws {
         let lease = try await acquireOperation(contextID: contextID)
         do {
-            guard byID[documentID] != nil else {
-                throw HostDataPlaneServiceError.documentNotOpen
-            }
-            viewerDocumentsByConnection[connectionID, default: [:]][documentID] = contextID
+            _ = try await restoreDocument(id: documentID)
+            viewerDocumentsByConnection[connectionID, default: [:]][documentID] =
+                DocumentViewerRegistration(
+                    contextID: contextID,
+                    clientInstanceID: clientInstanceID
+                )
             releaseOperation(lease)
         } catch {
             releaseOperation(lease)
@@ -179,7 +201,8 @@ public actor DocumentRegistry {
 
     public func removeViewers(connectionID: UUID) async {
         let lease = await acquireCleanupOperation()
-        viewerDocumentsByConnection.removeValue(forKey: connectionID)
+        let removed = viewerDocumentsByConnection.removeValue(forKey: connectionID) ?? [:]
+        await releaseUnviewedClientLeases(removed)
         releaseOperation(lease)
     }
 
@@ -188,11 +211,28 @@ public actor DocumentRegistry {
         documentID: DocumentID
     ) async {
         let lease = await acquireCleanupOperation()
-        viewerDocumentsByConnection[connectionID]?.removeValue(forKey: documentID)
+        let removed = viewerDocumentsByConnection[connectionID]?.removeValue(
+            forKey: documentID
+        )
         if viewerDocumentsByConnection[connectionID]?.isEmpty == true {
             viewerDocumentsByConnection.removeValue(forKey: connectionID)
         }
+        if let removed {
+            await releaseUnviewedClientLeases([documentID: removed])
+        }
         releaseOperation(lease)
+    }
+
+    private func releaseUnviewedClientLeases(
+        _ removed: [DocumentID: DocumentViewerRegistration]
+    ) async {
+        for (documentID, registration) in removed {
+            let remainsConnected = viewerDocumentsByConnection.values.contains { documents in
+                documents[documentID]?.clientInstanceID == registration.clientInstanceID
+            }
+            guard !remainsConnected, let document = byID[documentID] else { continue }
+            await document.releaseEditLease(client: registration.clientInstanceID)
+        }
     }
 
     func acquireOperation(
@@ -274,8 +314,8 @@ public actor DocumentRegistry {
         var included = documentIDs
         if let contextID {
             for viewers in viewerDocumentsByConnection.values {
-                included.formUnion(viewers.compactMap { documentID, viewerContext in
-                    viewerContext == contextID ? documentID : nil
+                included.formUnion(viewers.compactMap { documentID, registration in
+                    registration.contextID == contextID ? documentID : nil
                 })
             }
         }
@@ -299,7 +339,7 @@ public actor DocumentRegistry {
                 throw WorkspaceRepositoryError.invalidStoredValue
             }
             let contexts = Set(viewerDocumentsByConnection.values.compactMap {
-                $0[documentID]
+                $0[documentID]?.contextID
             }).subtracting(blockedViewerContexts)
             values.append(DocumentDeletionState(
                 snapshot: snapshot,

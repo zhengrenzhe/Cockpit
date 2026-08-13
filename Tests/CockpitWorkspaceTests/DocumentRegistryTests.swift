@@ -288,11 +288,13 @@ import CockpitTypes
     try await fixture.registry.registerViewer(
         connectionID: UUID(),
         contextID: firstContext,
+        clientInstanceID: ClientInstanceID(),
         documentID: snapshot.documentID
     )
     try await fixture.registry.registerViewer(
         connectionID: UUID(),
         contextID: secondContext,
+        clientInstanceID: ClientInstanceID(),
         documentID: snapshot.documentID
     )
     let expected = try await fixture.registry.deletionStates(
