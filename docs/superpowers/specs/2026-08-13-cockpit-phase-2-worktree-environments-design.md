@@ -2,7 +2,7 @@
 
 日期：2026-08-13
 
-状态：对抗修订稿，待用户复核
+状态：已确认
 
 目标版本：Host control Protocol 1.2；Host data plane Protocol 1.2；Terminal/Keeper Protocol 1.1
 
