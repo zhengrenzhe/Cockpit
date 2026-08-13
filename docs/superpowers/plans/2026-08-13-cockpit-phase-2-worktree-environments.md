@@ -18,6 +18,11 @@
 - Do not add a package dependency, change `Package.resolved`, modify Ghostty, add Git status/diff/stage/commit UI, add Search/LSP, import external worktrees, relink paths, run `git init`, delete branches, or move existing worktrees.
 - Existing Worktree Environments retain the stable capability IDs and relative path frozen at creation; Project Settings only affects future worktrees.
 - Use fd-relative, no-follow filesystem operations. Never replace Git worktree removal with `rm -rf`.
+- Cross-process authority is never a client-constructible Codable record. Host registers a cryptographically random opaque `TargetAuthorizationID` over the authenticated Host-to-Supervisor control connection; Supervisor stores the server-owned peer, connection, negotiated feature set, target, incarnation, expiry, and consumption state and rejects bare or forged records from same-UID clients.
+- Git mutation callers never pass argv. `CockpitWorkspace` owns a closed internal `GitInvocation` enum, the bounded runner, repository serialization, durable mutation-epoch callback, and exact postconditions; `CockpitHostCore` exposes only typed inspection/add/remove/refresh requests carrying `WorkspaceOperationID`.
+- Every Host command added by Tasks 7-13 updates the strict protobuf/codec, `WorkspaceCommandRequest`, `WorkspaceServing`, router, XPC client/export, `CockpitTransport`, Probe, and `Applications/CockpitHost/main.swift` composition in the same task. Every Supervisor command updates its protocol, transport, export, `TerminalSupervisorControlling`, and `Applications/CockpitTerminalSupervisor/main.swift` dispatcher in the same task.
+- A context commit has two error domains. Before the durable commit linearization point, failure aborts hidden children. At or after durable commit, failure freezes or recovers the committed generation; it never calls an uncommitted `abort`. Presentation acknowledgement is an idempotent retry and never changes selection success.
+- New executable scripts are created mode `100755`. Every script helper named in a step is defined in that script or an earlier listed file before the first RED run.
 - A failed prepare leaves the visible ActiveContext, Monaco, file tree, and terminal presentation unchanged.
 - Every behavior change follows RED -> GREEN -> focused regression before the task commit.
 - Before every commit, verify `git status --short` contains only that task's listed files; stage those files explicitly and stop on any unrelated path.
@@ -61,6 +66,8 @@
 - `Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift`: Project/Environment/Document/Terminal admission gates and drain tokens.
 - `Sources/CockpitHostCore/EnvironmentRootResolving.swift`: capability-based root-resolution protocol and resolved-root identity contract.
 - `Sources/CockpitHostCore/GitRepositoryCoordinating.swift`: typed Git inspection/mutation protocol and repository lock key.
+- `Sources/CockpitHostCore/ContextCommitRepository.swift`: persistence-neutral context commit and child-journal repository contract.
+- `Sources/CockpitHostCore/WorktreeDeletionManifestBuilding.swift`: persistence-neutral manifest builder contract consumed by deletion coordination.
 - `Sources/CockpitHostCore/WorktreeCreationCoordinator.swift`: Direct/New Branch/Existing Branch durable creation saga.
 - `Sources/CockpitHostCore/ContextCommitCoordinator.swift`: PreparedContextToken validation, durable promotion, child recovery, and supersession.
 - `Sources/CockpitHostCore/WorktreeDeletionCoordinator.swift`: decision-driven Conversation deletion and physical worktree saga.
@@ -119,10 +126,12 @@
 - Test: `Tests/CockpitPersistenceTests/WorkspaceMigrationTests.swift`
 - Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
 - Test: `Tests/CockpitPersistenceTests/SQLiteTerminalSessionRepositoryTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift`
+- Test: `Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift`
 
 **Interfaces:**
-- Produces identifiers: `CapabilityID`, `CapabilityGrantVersionID`, `WorkspaceOperationID`, `WorkspaceDecisionID`, `ContextCommitID`, `PreparedContextTokenID`.
-- Produces: `WorkspaceOperationRepository.begin(_:)`, `appendObservation(_:)`, `appendDecision(_:)`, `advance(id:from:to:)`, and `complete(id:result:)`.
+- Produces identifiers: `CapabilityID`, `CapabilityGrantVersionID`, `WorkspaceOperationID`, `WorkspaceDecisionID`, `ContextCommitID`, `PreparedContextTokenID`, `TargetAuthorizationID`, plus strict one-component `FileSystemName`.
+- Produces: `WorkspaceOperationRepository.begin(_:)`, `appendObservation(_:)`, `appendDecision(_:)`, `advance(id:from:to:)`, `complete(id:from:result:)`, and `fail(id:from:failure:)`.
 - Produces: `CapabilityRepository.importGrant(_:)`, `refreshGrant(_:)`, `retain(_:for:)`, and `release(_:for:)`.
 - Preserves Phase 1 Direct behavior through the new tables; legacy rows are neither migrated nor read.
 
@@ -132,7 +141,14 @@ Add exact round-trip tests for every new ID and reject unknown keys in the new o
 
 ```swift
 @Test func workspaceOperationIntentRejectsUnknownKeys() throws {
-    let data = Data(#"{"version":1,"kind":"renameConversation","title":"x","extra":true}"#.utf8)
+    let valid = WorkspaceOperationIntent.renameConversation(.init(
+        conversationID: literalConversationID,
+        expectedTitleRevision: 7,
+        title: "x"
+    ))
+    var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(valid)) as? [String: Any])
+    object["extra"] = true
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     #expect(throws: CockpitDomainValidationError.self) {
         try JSONDecoder().decode(WorkspaceOperationIntent.self, from: data)
     }
@@ -148,7 +164,7 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter WorkspaceModelsTests
 ```
 
-Expected: compile failure for the six missing identifiers and Phase 2 model types.
+Expected: compile failure for the seven missing identifiers, `FileSystemName`, and Phase 2 model types.
 
 - [ ] **Step 3: Add the exact shared identifiers and operation model**
 
@@ -161,6 +177,21 @@ public typealias WorkspaceOperationID = CockpitID<WorkspaceOperationScope>
 public typealias WorkspaceDecisionID = CockpitID<WorkspaceDecisionScope>
 public typealias ContextCommitID = CockpitID<ContextCommitScope>
 public typealias PreparedContextTokenID = CockpitID<PreparedContextTokenScope>
+public typealias TargetAuthorizationID = CockpitID<TargetAuthorizationScope>
+
+public struct FileSystemName: Hashable, Codable, Sendable {
+    public let bytes: Data
+
+    public init(validating bytes: Data) throws {
+        guard !bytes.isEmpty,
+              !bytes.contains(0),
+              !bytes.contains(0x2F),
+              bytes != Data(".".utf8),
+              bytes != Data("..".utf8)
+        else { throw CockpitDomainValidationError.invalidFileSystemName }
+        self.bytes = bytes
+    }
+}
 
 public enum WorkspaceOperationKind: String, Codable, Sendable {
     case addProject, updateProjectSettings, createConversation
@@ -171,8 +202,8 @@ public enum WorkspaceOperationPhase: String, Codable, Sendable {
     case prepared, targetReserved, gitRunning, gitAdded, metadataCommitted
     case targetsClaimed, resolvingDocuments, gatingAllContexts, terminatingSessions
     case quiescingEnvironment, quiescingEnvironments, validatingManifest
-    case awaitingDecision, removalAuthorized, removingWorktree, worktreeRemoved
-    case purgingMetadata, completed, needsAttention
+    case removalAuthorized, removingWorktree, worktreeRemoved
+    case purgingMetadata, completed, failed, needsAttention
 }
 
 public enum EnvironmentKind: String, Codable, Sendable {
@@ -216,6 +247,8 @@ public enum WorkspaceOperationFailure: Error, Hashable, Codable, Sendable {
     case targetBusy(conflictingOperationID: WorkspaceOperationID)
     case sourceMoved(expectedOID: String, actualOID: String)
     case identityChanged
+    case preGitReservationRecovered
+    case branchRetained(ref: String, oid: String)
     case needsAttention(reason: WorkspaceNeedsAttentionReason)
 }
 
@@ -238,6 +271,7 @@ public enum WorkspaceOperationProgress: Hashable, Codable, Sendable {
     case running(WorkspaceOperationRecord)
     case awaitingDecision(operationID: WorkspaceOperationID, observationSequence: UInt64)
     case completed(WorkspaceOperationResult)
+    case failed(operationID: WorkspaceOperationID, error: WorkspaceOperationFailure)
     case needsAttention(operationID: WorkspaceOperationID, error: WorkspaceOperationFailure)
 }
 ```
@@ -268,13 +302,15 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter SQLiteWorkspaceRepositoryTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter SQLiteTerminalSessionRepositoryTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceOperationStoreTests
 ```
 
 Expected: schema/table assertions fail against the Phase 1 migration chain.
 
 - [ ] **Step 6: Replace both migration chains with the Phase 2 baseline**
 
-Make `WorkspaceMigrations.all` and `TerminalMigrations.all` each contain one version-1 migration. Encode every table, CHECK, deferred foreign key, unique index, and admission trigger from design section 5. The workspace transaction helper must insert the operation tombstone, all live target claims, lifecycle owner, domain changes, replayable result, and `completed` phase atomically for Add Project, Direct Conversation, and rename operations.
+Make `WorkspaceMigrations.all` and `TerminalMigrations.all` each contain one version-1 migration. Encode every table, CHECK, deferred foreign key, unique index, and admission trigger from design section 5, plus the Phase 2 `environment_revocations` journal keyed by `(environment_id, incarnation)` with exact step, last error, and terminal completion. The workspace transaction helper must insert the operation tombstone, all live target claims, lifecycle owner, domain changes, replayable result, and `completed` phase atomically for Add Project, Direct Conversation, and rename operations. Every `advance`, `complete`, and `fail` validates an exact expected phase; kind-specific transition tests reject skipped, backward, and terminal-state transitions. `fail` stores the typed failure, deletes every `workspace_operation_targets` and `workspace_operation_capabilities` live row for that operation, and CASes to `failed` in one SQLite transaction only after any authorized pre-Git reservation cleanup has succeeded; replay reads the retained tombstone and returns the same failure. Schema/repository tests assert a failed operation has zero live target/capability rows and no longer blocks Project mutation or final capability collection.
 
 ```swift
 public protocol WorkspaceOperationRepository: Sendable {
@@ -288,7 +324,13 @@ public protocol WorkspaceOperationRepository: Sendable {
     ) async throws -> WorkspaceOperationRecord
     func complete(
         id: WorkspaceOperationID,
+        from expected: WorkspaceOperationPhase,
         result: WorkspaceOperationResult
+    ) async throws -> WorkspaceOperationRecord
+    func fail(
+        id: WorkspaceOperationID,
+        from expected: WorkspaceOperationPhase,
+        failure: WorkspaceOperationFailure
     ) async throws -> WorkspaceOperationRecord
 }
 
@@ -306,7 +348,14 @@ public struct CapabilityGrantImport: Hashable, Sendable {
     public let canonicalIdentity: String
 }
 
-public typealias CapabilityGrantRefresh = CapabilityGrantImport
+public struct CapabilityGrantRefresh: Hashable, Sendable {
+    public let capabilityID: CapabilityID
+    public let expectedCurrentGrantVersionID: CapabilityGrantVersionID
+    public let projectID: ProjectID
+    public let kind: CapabilityKind
+    public let bookmark: Data
+    public let canonicalIdentity: String
+}
 
 public struct CapabilityGrantReference: Hashable, Codable, Sendable {
     public let capabilityID: CapabilityID
@@ -380,6 +429,7 @@ git add -- Sources/CockpitTypes/Identifiers.swift \
   Tests/CockpitPersistenceTests/WorkspaceMigrationTests.swift \
   Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
   Tests/CockpitPersistenceTests/SQLiteTerminalSessionRepositoryTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift \
   Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift
 git commit -m "feat: install phase 2 workspace baseline"
 ```
@@ -390,15 +440,41 @@ git commit -m "feat: install phase 2 workspace baseline"
 
 **Files:**
 - Modify: `Sources/CockpitTypes/ProtocolVersion.swift`
+- Modify: `Sources/CockpitProtocol/Handshake.swift`
 - Modify: `Sources/CockpitProtocol/ProtocolNegotiator.swift`
 - Modify: `Sources/CockpitProtocol/WorkspaceMessages.swift`
 - Modify: `Sources/CockpitProtocol/HostDataPlaneMessages.swift`
 - Modify: `Sources/CockpitProtocol/DocumentMessages.swift`
 - Modify: `Sources/CockpitProtocol/TerminalMessages.swift`
-- Modify: all `.current` call sites under `Sources`, `Applications`, and `Tests`
+- Modify: `Sources/CockpitClientCore/ConnectionController.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostDataPlaneClient.swift`
+- Modify: `Applications/CockpitApp/AppDelegate.swift`
+- Modify: `Applications/CockpitApp/TabCommandController.swift`
+- Modify: `Applications/CockpitProbe/main.swift`
+- Modify: `Sources/CockpitLocalTransport/KeeperUDSClient.swift`
+- Modify: `Sources/CockpitLocalTransport/KeeperUDSServer.swift`
+- Modify: `Sources/CockpitTerminalCore/TerminalArchiveStore.swift`
+- Modify: `Sources/CockpitTerminalCore/TerminalSupervisor.swift`
 - Test: `Tests/CockpitProtocolTests/HandshakeCodecTests.swift`
 - Test: `Tests/CockpitProtocolTests/HostDataPlaneProtocolTests.swift`
 - Test: `Tests/CockpitProtocolTests/Phase1MessageTests.swift`
+- Test: `Tests/CockpitAppTests/GhosttyTerminalViewTests.swift`
+- Test: `Tests/CockpitAppTests/TabCommandControllerTests.swift`
+- Test: `Tests/CockpitClientCoreTests/ConnectionControllerTests.swift`
+- Test: `Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/KeeperUDSTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteTerminalSessionRepositoryTests.swift`
+- Test: `Tests/CockpitTerminalClientTests/TerminalAttachmentControllerTests.swift`
+- Test: `Tests/CockpitTerminalCoreTests/ContextTerminationTests.swift`
+- Test: `Tests/CockpitTerminalCoreTests/TerminalArchiveTests.swift`
+- Test: `Tests/CockpitTerminalCoreTests/TerminalReconcilerTests.swift`
+- Test: `Tests/CockpitTerminalCoreTests/TerminalStreamCoordinatorTests.swift`
 
 **Interfaces:**
 - Produces: `HostControlProtocol.current == 1.2`, `HostDataPlaneProtocol.current == 1.2`, `HostDataPlaneProtocol.legacy == 1.1`, `TerminalStreamProtocol.current == 1.1`.
@@ -452,13 +528,15 @@ public enum TerminalStreamProtocol {
 }
 
 public extension ProtocolFeature {
+    static let worktreeControl = ProtocolFeature(rawValue: "worktree-control")
+
     var minimumHostControlVersion: ProtocolVersion {
         self == .worktreeControl ? .init(major: 1, minor: 2) : .init(major: 1, minor: 1)
     }
 }
 ```
 
-Change `ProtocolNegotiator.negotiate` to accept a feature only when requested, supported, and `minimumHostControlVersion <= negotiatedVersion`. Make every codec accept an explicit family version; remove all production uses of a global `.current`.
+Change `ProtocolNegotiator.negotiate` to accept a feature only when requested, supported, and `minimumHostControlVersion <= negotiatedVersion`. Remove default protocol-version parameters from `ProtocolNegotiator`, `Handshake`, and codec factories. Make every call site pass its explicit family version; remove all production uses of the global `ProtocolVersion.current`. Before staging, run `rg -n '\.current\b' Sources Applications Tests` and classify every result as an explicit family migration or a documented non-protocol symbol such as `ActiveContextController.current()`.
 
 - [ ] **Step 4: Prove legacy bytes and Phase 1 Direct behavior remain strict**
 
@@ -477,6 +555,7 @@ Expected: all protocol suites pass; literal Phase 1 data-plane and Terminal fixt
 
 ```bash
 git add -- Sources/CockpitTypes/ProtocolVersion.swift \
+  Sources/CockpitProtocol/Handshake.swift \
   Sources/CockpitProtocol/ProtocolNegotiator.swift \
   Sources/CockpitProtocol/WorkspaceMessages.swift \
   Sources/CockpitProtocol/HostDataPlaneMessages.swift \
@@ -485,10 +564,18 @@ git add -- Sources/CockpitTypes/ProtocolVersion.swift \
   Sources/CockpitHostCore/WorkspaceService.swift \
   Sources/CockpitLocalTransport/HostXPCClient.swift \
   Sources/CockpitLocalTransport/HostXPCExport.swift \
+  Sources/CockpitLocalTransport/HostDataPlaneClient.swift \
   Sources/CockpitLocalTransport/KeeperUDSClient.swift \
   Sources/CockpitLocalTransport/KeeperUDSServer.swift \
   Sources/CockpitTerminalCore/TerminalArchiveStore.swift \
   Sources/CockpitTerminalCore/TerminalSupervisor.swift \
+  Applications/CockpitApp/AppDelegate.swift \
+  Applications/CockpitApp/TabCommandController.swift \
+  Applications/CockpitProbe/main.swift \
+  Tests/CockpitAppTests/GhosttyTerminalViewTests.swift \
+  Tests/CockpitAppTests/TabCommandControllerTests.swift \
+  Tests/CockpitClientCoreTests/ConnectionControllerTests.swift \
+  Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift \
   Tests/CockpitProtocolTests/HandshakeCodecTests.swift \
   Tests/CockpitProtocolTests/HostDataPlaneProtocolTests.swift \
   Tests/CockpitProtocolTests/Phase1MessageTests.swift \
@@ -497,9 +584,11 @@ git add -- Sources/CockpitTypes/ProtocolVersion.swift \
   Tests/CockpitLocalTransportTests/KeeperUDSTests.swift \
   Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift \
   Tests/CockpitPersistenceTests/SQLiteTerminalSessionRepositoryTests.swift \
+  Tests/CockpitTerminalClientTests/TerminalAttachmentControllerTests.swift \
   Tests/CockpitTerminalCoreTests/ContextTerminationTests.swift \
   Tests/CockpitTerminalCoreTests/TerminalArchiveTests.swift \
-  Tests/CockpitTerminalCoreTests/TerminalReconcilerTests.swift
+  Tests/CockpitTerminalCoreTests/TerminalReconcilerTests.swift \
+  Tests/CockpitTerminalCoreTests/TerminalStreamCoordinatorTests.swift
 git commit -m "feat: isolate cockpit protocol families"
 ```
 
@@ -512,6 +601,7 @@ git commit -m "feat: isolate cockpit protocol families"
 - Create: `Sources/CockpitProtocol/HostControlMessages.swift`
 - Create: `Sources/CockpitLocalTransport/HostConnectionSession.swift`
 - Modify: `Sources/CockpitLocalTransport/MachServiceListenerDelegate.swift`
+- Modify: `Sources/CockpitLocalTransport/XPCPeerValidator.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCProtocol.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
 - Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
@@ -520,19 +610,27 @@ git commit -m "feat: isolate cockpit protocol families"
 - Modify: `Applications/CockpitHost/main.swift`
 - Modify: `Applications/CockpitProbe/main.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceTerminalService.swift`
+- Modify: `Sources/CockpitHostCore/TerminalSupervisorControlling.swift`
+- Modify: `Sources/CockpitLocalTransport/TerminalSupervisorControlTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCProtocol.swift`
+- Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift`
+- Modify: `Sources/CockpitTerminalCore/TerminalSupervisor.swift`
+- Modify: `Applications/CockpitTerminalSupervisor/main.swift`
 - Test: `Tests/CockpitProtocolTests/HandshakeCodecTests.swift`
 - Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
 - Test: `Tests/CockpitLocalTransportTests/XPCClientTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/XPCPeerValidatorTests.swift`
 - Test: `Tests/CockpitHostCoreTests/HostHandshakeHandlerTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift`
 
 **Interfaces:**
-- Produces: `BootstrapResponseEnvelope`, `HostControlRequestEnvelope<Command>`, `HostControlResponseEnvelope<Payload>`, `HostControlBusinessError`, and `TargetAuthorization`.
-- Produces actor: `HostConnectionSession.handle(_:) async -> HostControlResponseEnvelope`.
+- Produces: `BootstrapResponseEnvelope`, non-generic wire `HostControlRequestEnvelope`, non-generic wire `HostControlResponseEnvelope`, typed client request/decode helpers, `HostControlBusinessError`, and opaque `TargetAuthorizationID`.
+- Produces actor: `HostConnectionSession.handle(_ request: HostControlRequestEnvelope) async -> HostControlResponseEnvelope`.
 - Every physical XPC connection owns one session and one request cache; no session object is shared across connections.
 
 - [ ] **Step 1: Write failing bootstrap, connection, and duplicate-request tests**
 
-Test all five boundaries: command before handshake, duplicate handshake, old connection ID after reconnect, two simultaneous identical RequestIDs, and identical RequestID with a different canonical digest.
+Test all connection boundaries: command before handshake, duplicate handshake, old connection ID after reconnect, two simultaneous identical RequestIDs, and identical RequestID with a different canonical digest. Directly connect a same-UID fixture to Supervisor and submit both a bare random authorization ID and a client-constructed forged record; both are rejected before target access. Register one Host-owned authorization and prove peer, connection, feature, target, incarnation, expiry and consumption mismatches independently reject it. Open two archive replay handles, consume the first fully, and prove the second still begins at byte zero and returns the complete archive.
 
 ```swift
 @Test func duplicateInFlightRequestExecutesRouterOnce() async throws {
@@ -612,14 +710,21 @@ public struct ResolvedTarget: Hashable, Sendable {
     public let incarnation: UUID
 }
 
-public struct TargetAuthorization: Hashable, Codable, Sendable {
+public struct RegisteredTargetAuthorization: Hashable, Sendable {
+    public let id: TargetAuthorizationID
     public let peerIdentityDigest: String
     public let connectionID: ConnectionID
+    public let authorizedFeatures: Set<ProtocolFeature>
     public let environmentKind: EnvironmentKind
     public let contextID: WorkspaceContextID
     public let environmentID: EnvironmentID
     public let incarnation: UUID
     public let expiresAtUnixMilliseconds: UInt64
+    public let consumed: Bool
+}
+
+public struct TargetAuthorizationTicket: Hashable, Codable, Sendable {
+    public let authorizationID: TargetAuthorizationID
 }
 
 public protocol HostControlCommandValue: Sendable {}
@@ -642,11 +747,11 @@ public actor HostConnectionSession {
 }
 ```
 
-Set `.inFlight(digest, waiters)` before the first `await`. On invalidation, fail waiters, revoke connection-owned prepared tokens/tickets, close cached archive master FDs, and reject all later requests. `MachServiceListenerDelegate` must create this actor and an export per accepted connection.
+Set `.inFlight(digest, waiters)` before the first `await`. On invalidation, fail waiters, revoke connection-owned prepared tokens/tickets, close cached authenticated archive parent/root descriptor leases, and reject all later requests. `MachServiceListenerDelegate` must create this actor and an export per accepted connection.
 
 - [ ] **Step 5: Gate every command by server-owned metadata and resolved target**
 
-Add a static command descriptor table with `minimumHostControlVersion` and required features. Resolve Context/Environment before issuing data-plane, terminal, archive, or client-state authority. Worktree targets require 1.2 plus `workspace-control` and `worktree-control`. Embed peer, connection, target kind, context, environment, incarnation, and expiry in `TargetAuthorization`; Supervisor validates the same values.
+Add a static command descriptor table with `minimumHostControlVersion` and required features. Resolve Context/Environment before issuing data-plane, terminal, archive, or client-state authority. Worktree targets require 1.2 plus `workspace-control` and `worktree-control`. Host creates a cryptographically random `TargetAuthorizationID` and registers the complete server-owned record over one physical Host-to-Supervisor XPC connection. `XPCPeerValidator` reads public `NSXPCConnection.processIdentifier` and `effectiveUserIdentifier`, then calls `SecCodeCopyGuestWithAttributes` for that live PID and validates the exact CockpitHost designated requirement before the first registration. Connection invalidation atomically revokes every authorization registered by it. The Host returns only `TargetAuthorizationTicket` to the client. Supervisor binds registration to the intended client peer/connection, validates target kind, features, Context, Environment, incarnation, expiry and one-shot/replay policy, and rejects direct same-UID callers that submit a bare UUID or forged record.
 
 ```swift
 struct HostCommandDescriptor: Sendable {
@@ -659,12 +764,12 @@ func authorize(
     command: HostControlCommand,
     session: NegotiatedSession,
     resolvedTarget: ResolvedTarget?
-) throws -> TargetAuthorization?
+) async throws -> TargetAuthorizationTicket?
 ```
 
 - [ ] **Step 6: Convert Host client/export methods and archive sidecars**
 
-All workspace, ticket, terminal, and archive methods send the common request envelope and receive the common response envelope. For archive replay retain one read-only master FD, validate it, and `dup` a new sidecar per waiter/replay; never cache a previously transferred `FileHandle`.
+All workspace, ticket, terminal, and archive methods send the common request envelope and receive the common response envelope. For archive replay retain an authenticated parent/root FD plus exact leaf name and identity. Each waiter/replay performs a fresh `openat(parentFD, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)`, revalidates identity, and transfers that independent open file description. Never use `dup`, because duplicated descriptors share one file offset; never cache a previously transferred `FileHandle`.
 
 ```swift
 func request<Command: HostControlCommandValue, Payload: HostControlPayloadValue>(
@@ -673,7 +778,11 @@ func request<Command: HostControlCommandValue, Payload: HostControlPayloadValue>
     expecting: Payload.Type
 ) async throws -> Payload
 
-func duplicateArchiveHandle(from masterFD: Int32) throws -> FileHandle
+func openIndependentArchiveHandle(
+    parentFD: Int32,
+    leafName: FileSystemName,
+    expectedIdentity: FileSystemIdentity
+) throws -> FileHandle
 ```
 
 - [ ] **Step 7: Run transport, Host, and protocol tests GREEN**
@@ -696,17 +805,26 @@ git add -- Sources/CockpitProtocol/Proto/cockpit.proto \
   Sources/CockpitProtocol/HostControlMessages.swift \
   Sources/CockpitLocalTransport/HostConnectionSession.swift \
   Sources/CockpitLocalTransport/MachServiceListenerDelegate.swift \
+  Sources/CockpitLocalTransport/XPCPeerValidator.swift \
   Sources/CockpitLocalTransport/HostXPCProtocol.swift \
   Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitLocalTransport/HostXPCClient.swift \
   Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
   Sources/CockpitHostCore/HostHandshakeHandler.swift \
   Sources/CockpitHostCore/WorkspaceTerminalService.swift \
+  Sources/CockpitHostCore/TerminalSupervisorControlling.swift \
+  Sources/CockpitLocalTransport/TerminalSupervisorControlTransport.swift \
+  Sources/CockpitLocalTransport/TerminalSupervisorXPCProtocol.swift \
+  Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift \
+  Sources/CockpitTerminalCore/TerminalSupervisor.swift \
   Applications/CockpitHost/main.swift Applications/CockpitProbe/main.swift \
+  Applications/CockpitTerminalSupervisor/main.swift \
   Tests/CockpitProtocolTests/HandshakeCodecTests.swift \
   Tests/CockpitLocalTransportTests/HostXPCTests.swift \
   Tests/CockpitLocalTransportTests/XPCClientTests.swift \
-  Tests/CockpitHostCoreTests/HostHandshakeHandlerTests.swift
+  Tests/CockpitLocalTransportTests/XPCPeerValidatorTests.swift \
+  Tests/CockpitHostCoreTests/HostHandshakeHandlerTests.swift \
+  Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift
 git commit -m "feat: add connection scoped host control"
 ```
 
@@ -718,6 +836,11 @@ git commit -m "feat: add connection scoped host control"
 - Create: `Sources/CockpitHostCore/EnvironmentRootResolving.swift`
 - Create: `Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift:159-486`
+- Modify: `Sources/CockpitHostCore/WorkspaceTerminalService.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
 - Modify: `Sources/CockpitWorkspace/SecurityScopedProjectRoot.swift`
 - Create: `Sources/CockpitWorkspace/EnvironmentRootResolver.swift`
 - Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
@@ -728,6 +851,7 @@ git commit -m "feat: add connection scoped host control"
 - Test: `Tests/CockpitWorkspaceTests/WorkspaceKernelDataPlaneTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/DocumentRegistryTests.swift`
 - Test: `Tests/CockpitHostCoreTests/WorkspaceServiceTests.swift`
+- Test: `Tests/CockpitTerminalCoreTests/ContextTerminationTests.swift`
 
 **Interfaces:**
 - Produces: `EnvironmentRootResolver.resolve(environmentID:) async throws -> ResolvedEnvironmentRoot`.
@@ -769,9 +893,13 @@ public struct ResolvedEnvironmentRoot: Sendable {
     public let kind: EnvironmentKind
     public let workspaceRootPath: String
     public let workspaceRootIdentity: FileSystemIdentity
+    public let worktreeRootPath: String?
+    public let worktreeRootIdentity: FileSystemIdentity?
     public let incarnation: UUID
     public let gitCommonDirectoryPath: String?
     public let gitCommonDirectoryIdentity: FileSystemIdentity?
+    public let capabilityIDs: Set<CapabilityID>
+    public let grantVersionIDs: Set<CapabilityGrantVersionID>
     public let accessLease: any EnvironmentAccessLease
 }
 
@@ -786,7 +914,7 @@ public protocol EnvironmentRootResolving: Sendable {
 }
 ```
 
-The implementation loads the Environment and its frozen stable capability IDs, resolves the current immutable grant version, validates physical identity, enters security scope, maps `project_relative_path`, opens the final directory descriptor, and compares stored identity/incarnation before returning.
+The implementation loads the Environment and its frozen stable capability IDs and exact grant-version IDs, validates every physical identity, enters every security scope into an `EnvironmentAccessLease` that retains the actual access tokens, maps `project_relative_path`, opens both worktree and final workspace descriptors, and compares stored worktree/workspace/common-directory identities plus incarnation before returning.
 
 - [ ] **Step 4: Make kernel and Document admission incarnation-aware**
 
@@ -832,6 +960,11 @@ Then:
 git add -- Sources/CockpitHostCore/EnvironmentRootResolving.swift \
   Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift \
   Sources/CockpitHostCore/WorkspaceService.swift \
+  Sources/CockpitHostCore/WorkspaceTerminalService.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitWorkspace/SecurityScopedProjectRoot.swift \
   Sources/CockpitWorkspace/EnvironmentRootResolver.swift \
   Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift \
@@ -953,21 +1086,25 @@ git commit -m "feat: support multiple cockpit projects"
 
 **Files:**
 - Create: `Sources/CockpitHostCore/GitRepositoryCoordinating.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
 - Create: `Sources/CockpitWorkspace/DirectoryReservation.swift`
 - Create: `Sources/CockpitWorkspace/BoundedGitRunner.swift`
 - Create: `Sources/CockpitWorkspace/GitRepositoryCoordinator.swift`
+- Modify: `Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift`
+- Modify: `Applications/CockpitHost/main.swift`
 - Test: `Tests/CockpitWorkspaceTests/DirectoryReservationTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/BoundedGitRunnerTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/GitRepositoryCoordinatorTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift`
 
 **Interfaces:**
-- Produces: `BoundedGitRunner.run(_:) async throws -> GitCommandResult`.
-- Produces: `GitRepositoryCoordinator.withRepositoryLock(identity:_:)` plus inspect/add/remove/refresh methods.
+- Produces an internal closed `GitInvocation` and internal `BoundedGitRunner`; no module caller can provide argv.
+- Produces typed inspect/add/remove/refresh methods. Add/remove record the operation-bound Git mutation epoch, phase CAS, final common-directory validation, and spawn inside one repository-actor critical section.
 - Produces: operation-owned `DirectoryReservation` with descriptor, device/inode/resource identity, and exact-empty cleanup.
 
 - [ ] **Step 1: Write failing real-Git reservation and Existing Branch tests**
 
-Use a temporary repository with two commits. Test a pre-created empty target, New Branch from an exact source OID, Existing Branch from a validated short name, and postconditions for branch/OID/registration. Mutate the target pathname after reservation and assert Git still writes only through the reservation FD-bound cwd.
+Use a temporary repository with two commits. Test a pre-created empty target, New Branch from an exact source OID, Existing Branch from a validated short name, and postconditions for branch/OID/registration. Mutate the target pathname after reservation and assert Git still writes only through the reservation FD-bound cwd. Race add/remove on the same common identity and assert serialization. Replace the common-directory pathname before `gitMutationEpoch` and assert preflight rejection; replace it after the durable epoch and assert the operation records external concurrency/`needsAttention`, never compensates against the replacement repository, and preserves the exact operation ID/epoch audit. For every `...AndAdvance` journal method, pass a stale expected phase and require zero observation/phase mutation; drop the reply after commit and require idempotent replay of the one stored observation and phase.
 
 ```swift
 @Test func existingBranchUsesShortArgvAndRemainsAttached() async throws {
@@ -1003,45 +1140,49 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter BoundedGitRunnerTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter GitRepositoryCoordinatorTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceOperationStoreTests
 ```
 
 Expected: compile failure because the runner, reservation, and coordinator do not exist.
 
 - [ ] **Step 4: Implement fd-bound directory reservation**
 
-Open the authorized storage parent descriptor, validate it, create the final child with `mkdirat`, open it with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, and persist identity before Git starts. Cleanup only when the same descriptor/path identity remains operation-owned and the directory is exactly empty.
+Open the authorized storage parent descriptor, validate it, create the final child with `mkdirat`, open it with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, and persist parent identity, exact child-name bytes, child descriptor identity, and operation ownership before Git starts. Cleanup revalidates both parent and child descriptors, compares `fstatat(..., AT_SYMLINK_NOFOLLOW)` with the retained child identity, proves the child descriptor is exactly empty, and invokes only `unlinkat(parentFD, childName, AT_REMOVEDIR)`. `absolutePath` is display-only. Every FD is owned by one reference lease and closes exactly once.
 
 ```swift
-public final class DirectoryReservation: @unchecked Sendable {
-    public let absolutePath: String
-    public let directoryFD: Int32
-    public let identity: FileSystemIdentity
-    public let operationID: WorkspaceOperationID
-    public func removeIfStillOwnedAndEmpty() throws
+final class DirectoryReservation: @unchecked Sendable {
+    let absolutePath: String
+    let parentDirectory: AuthenticatedDirectoryLease
+    let childName: FileSystemName
+    let directory: AuthenticatedDirectoryLease
+    let identity: FileSystemIdentity
+    let operationID: WorkspaceOperationID
+    func removeIfStillOwnedAndEmpty() throws
 }
 
-extension DirectoryReservation: GitTargetReservation {}
+// DirectoryReservation is internal to CockpitWorkspace and is never passed
+// across the HostCore module boundary.
 ```
 
 - [ ] **Step 5: Implement `posix_spawn` execution and bounded drain**
 
-Spawn `/usr/bin/git` with `POSIX_SPAWN_SETSID`, CLOEXEC defaults, stdout/stderr pipes, and a verified direct child whose PID equals initial PGID. For target mutations call `posix_spawn_file_actions_addfchdir_np` on macOS 15-25 and `posix_spawn_file_actions_addfchdir` on macOS 26+, and pass target `.`. Drain both pipes until EOF while retaining fixed byte limits. On cancellation/timeout send TERM then KILL only to the authenticated initial PGID, then exact `waitpid(childPID, ...)` before returning.
+Spawn `/usr/bin/git` with `POSIX_SPAWN_SETSID`, CLOEXEC defaults, `GIT_TERMINAL_PROMPT=0`, deterministic locale, no shell, stdout/stderr pipes, and a direct child retained unreaped whose PID equals the initial PGID. For target mutations call `posix_spawn_file_actions_addfchdir_np` on macOS 15-25 and `posix_spawn_file_actions_addfchdir` on macOS 26+, and pass target `.`. Retain fixed byte limits and record truncation while the direct child runs. After exact `waitpid(childPID, ...)`, drain until EOF only for a fixed grace interval; if an external helper that left the initial PGID still holds a pipe, close the parent read descriptors, cancel the readers, retain the partial bytes, and set `externalHelperKeptPipeOpen`. On cancellation/timeout send TERM then KILL only to the authenticated initial PGID while the exact direct child remains unreaped, then exact `waitpid(childPID, ...)` and the same bounded post-wait drain before returning. A hook/helper that leaves the initial PGID via `setpgid` or `setsid` is classified as external behavior and is never found or signalled by global scan. Tests cover a detached helper that keeps stdout/stderr open and require bounded return without global process scanning.
 
 ```swift
-public actor BoundedGitRunner {
-    public func run(_ request: GitCommandRequest) async throws -> GitCommandResult
+actor BoundedGitRunner {
+    func run(_ invocation: GitInvocation) async throws -> GitCommandResult
 }
 
 private func terminateAndReapAuthenticatedChild(
     pid: pid_t,
-    pgid: pid_t,
-    auditToken: audit_token_t
+    pgid: pid_t
 ) async throws -> Int32
 ```
 
 - [ ] **Step 6: Implement repository serialization and mutation epoch**
 
-Key actor locks by canonical common-directory identity. Before mutation append a durable `gitMutationEpoch`, fresh-validate the common-directory pathname/identity, then immediately spawn. After Git exits, revalidate common identity, target registration, branch, and OID. Identity mismatch returns `needsAttention` and never compensates by deleting an unknown path/ref.
+Key actor locks by canonical common-directory identity. `GitRepositoryCoordinator` owns capability resolution and `DirectoryReservation`; the HostCore request contains only EnvironmentID/incarnation, its frozen storage-parent/git-root capability IDs, immutable identities, and an exact target name. Removal re-resolves those frozen capabilities and the relative child internally; it never accepts or invents a Worktree-root capability. The typed add/remove call carries `WorkspaceOperationID` and expected phase; inside the same actor critical section, it calls `GitMutationJournaling` to record reservation, append a durable `gitMutationEpoch`, and CAS the operation phase, fresh-validates the common-directory pathname/identity, then immediately spawns. The epoch is the declared boundary after which common-directory path replacement is an external concurrent mutation. After Git exits, it revalidates common identity, target registration, branch, and OID and journals the result. Identity mismatch returns `needsAttention` and never compensates by deleting an unknown path/ref. Callers cannot access a reservation or split epoch persistence, phase CAS, validation, and spawn.
 
 ```swift
 public protocol GitRepositoryCoordinating: Sendable {
@@ -1050,22 +1191,59 @@ public protocol GitRepositoryCoordinating: Sendable {
     func removeWorktree(_ request: GitRemoveWorktreeRequest) async throws -> GitWorktreeRemovalResult
     func refresh(_ request: GitRefreshRequest) async throws -> GitWorktreeSnapshot
 }
-```
 
-Define the consumed values in `GitRepositoryCoordinating.swift` so no caller passes arbitrary argv or paths:
-
-```swift
-public struct GitCommandRequest: Sendable {
-    public let arguments: [String]
-    public let workingDirectoryFD: Int32?
-    public let timeout: Duration
-    public let retainedOutputLimit: Int
+public protocol GitMutationJournaling: Sendable {
+    func recordTargetReservationAndAdvance(
+        operationID: WorkspaceOperationID,
+        identity: FileSystemIdentity,
+        from expectedPhase: WorkspaceOperationPhase,
+        to nextPhase: WorkspaceOperationPhase
+    ) async throws
+    func recordGitMutationEpochAndAdvance(
+        operationID: WorkspaceOperationID,
+        epoch: GitMutationEpoch,
+        from expectedPhase: WorkspaceOperationPhase,
+        to nextPhase: WorkspaceOperationPhase
+    ) async throws
+    func recordGitResultAndAdvance(
+        operationID: WorkspaceOperationID,
+        result: GitWorktreeResult,
+        from expectedPhase: WorkspaceOperationPhase,
+        to nextPhase: WorkspaceOperationPhase
+    ) async throws
 }
 
-public struct GitCommandResult: Hashable, Sendable {
-    public let exitStatus: Int32
-    public let standardOutput: Data
-    public let standardError: Data
+// SQLiteWorkspaceOperationStore implements each `...AndAdvance` method as one
+// SQLite transaction: validate the expected phase, append the canonical
+// observation, CAS the phase, and commit. No caller can observe an epoch or
+// reservation without its matching phase transition.
+```
+
+Define only the typed cross-module requests in `GitRepositoryCoordinating.swift`. Define `GitInvocation`, sanitized environment, argv synthesis, `GitCommandResult`, and the runner as internal values in `CockpitWorkspace` so no caller passes arbitrary argv or paths:
+
+```swift
+enum GitInvocation: Sendable {
+    case inspectRepository(GitRepositoryIdentity)
+    case addWorktree(GitAddWorktreeRequest, targetDirectoryFD: Int32)
+    case removeWorktree(GitRemoveWorktreeRequest, targetDirectoryFD: Int32)
+}
+
+enum GitTermination: Hashable, Sendable {
+    case exited(Int32)
+    case signaled(Int32)
+    case timedOut
+    case cancelled
+}
+
+struct GitCommandResult: Hashable, Sendable {
+    let arguments: [String]
+    let termination: GitTermination
+    let standardOutput: Data
+    let standardError: Data
+    let stdoutTruncated: Bool
+    let stderrTruncated: Bool
+    let directChildWasWaited: Bool
+    let externalHelperKeptPipeOpen: Bool
 }
 
 public struct GitInspectionRequest: Hashable, Sendable {
@@ -1077,22 +1255,20 @@ public struct GitRepositoryIdentity: Hashable, Codable, Sendable {
     public let commonDirectoryIdentity: FileSystemIdentity
 }
 
-public struct AuthenticatedDirectory: Sendable {
-    public let absolutePath: String
-    public let directoryFD: Int32
-    public let identity: FileSystemIdentity
-}
-
-public protocol GitTargetReservation: AnyObject, Sendable {
-    var absolutePath: String { get }
-    var directoryFD: Int32 { get }
-    var identity: FileSystemIdentity { get }
-    var operationID: WorkspaceOperationID { get }
+final class AuthenticatedDirectoryLease: @unchecked Sendable {
+    let absolutePath: String
+    let directoryFD: Int32
+    let identity: FileSystemIdentity
+    deinit { close(directoryFD) }
 }
 
 public struct GitAddWorktreeRequest: Sendable {
+    public let operationID: WorkspaceOperationID
+    public let expectedPhase: WorkspaceOperationPhase
     public let repository: GitRepositoryIdentity
-    public let reservation: any GitTargetReservation
+    public let storageParentCapabilityID: CapabilityID
+    public let gitRootCapabilityID: CapabilityID
+    public let targetName: FileSystemName
     public let sourceOID: String
     public let branch: GitWorktreeBranchIntent
 }
@@ -1103,8 +1279,15 @@ public enum GitWorktreeBranchIntent: Hashable, Sendable {
 }
 
 public struct GitRemoveWorktreeRequest: Sendable {
+    public let operationID: WorkspaceOperationID
+    public let expectedPhase: WorkspaceOperationPhase
+    public let environmentID: EnvironmentID
+    public let expectedIncarnation: UUID
     public let repository: GitRepositoryIdentity
-    public let worktreeRoot: AuthenticatedDirectory
+    public let worktreeRootIdentity: FileSystemIdentity
+    public let storageParentCapabilityID: CapabilityID
+    public let gitRootCapabilityID: CapabilityID
+    public let targetName: FileSystemName
     public let force: Bool
 }
 
@@ -1133,16 +1316,27 @@ public enum GitWorktreeRemovalResult: Hashable, Sendable {
 
 - [ ] **Step 7: Run real-Git tests GREEN and commit**
 
-Run all three filters from Step 3, then:
+Run all three filters from Step 3 plus the atomic journal test, then:
+
+```bash
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceOperationStoreTests
+```
+
+Then:
 
 ```bash
 git add -- Sources/CockpitHostCore/GitRepositoryCoordinating.swift \
+  Sources/CockpitHostCore/WorkspaceRepository.swift \
+  Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift \
   Sources/CockpitWorkspace/DirectoryReservation.swift \
   Sources/CockpitWorkspace/BoundedGitRunner.swift \
   Sources/CockpitWorkspace/GitRepositoryCoordinator.swift \
+  Applications/CockpitHost/main.swift \
   Tests/CockpitWorkspaceTests/DirectoryReservationTests.swift \
   Tests/CockpitWorkspaceTests/BoundedGitRunnerTests.swift \
-  Tests/CockpitWorkspaceTests/GitRepositoryCoordinatorTests.swift
+  Tests/CockpitWorkspaceTests/GitRepositoryCoordinatorTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift
 git commit -m "feat: add bounded git repository runner"
 ```
 
@@ -1151,17 +1345,28 @@ git commit -m "feat: add bounded git repository runner"
 ### Task 7: Add Project Worktree Settings and stable capability lifecycle
 
 **Files:**
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
+- Modify: `Applications/CockpitHost/main.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
 - Modify: `Sources/CockpitPersistence/SQLiteCapabilityStore.swift`
+- Modify: `Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift`
 - Modify: `Sources/CockpitWorkspace/SecurityScopedProjectRoot.swift`
 - Create: `Applications/CockpitApp/ProjectSettingsController.swift`
 - Modify: `Applications/CockpitApp/ProjectCommandController.swift`
 - Modify: `Applications/CockpitApp/WorkspaceSidebarController.swift`
 - Modify: `Applications/CockpitProbe/main.swift`
 - Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/WorkspaceRootHandleTests.swift`
 - Test: `Tests/CockpitAppTests/ProjectCommandControllerTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
 - Produces `WorkspaceServing.projectWorktreeSettings(projectID:)` and `updateProjectWorktreeSettings(operationID:projectID:selection:)`.
@@ -1175,7 +1380,14 @@ Test four exact transitions: first selection creates two stable capabilities; sa
 ```swift
 @Test func sameIdentityRefreshKeepsStableCapabilityID() async throws {
     let first = try await store.importGrant(fixture.firstGrant)
-    let refreshed = try await store.refreshGrant(fixture.sameIdentityReplacement)
+    let refreshed = try await store.refreshGrant(.init(
+        capabilityID: first.capabilityID,
+        expectedCurrentGrantVersionID: first.grantVersionID,
+        projectID: fixture.projectID,
+        kind: .storageParent,
+        bookmark: fixture.sameIdentityReplacement.bookmark,
+        canonicalIdentity: fixture.sameIdentityReplacement.canonicalIdentity
+    ))
     #expect(refreshed.capabilityID == first.capabilityID)
     #expect(refreshed.grantVersionID != first.grantVersionID)
 }
@@ -1188,6 +1400,8 @@ Run:
 ```bash
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter SQLiteWorkspaceRepositoryTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceOperationStoreTests
 xcodegen generate --no-env
 xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug \
   -derivedDataPath DerivedData SYMROOT="$PWD/build" \
@@ -1200,19 +1414,21 @@ Expected: no settings command/controller exists and capability identity is still
 
 - [ ] **Step 3: Implement stable capability transactions**
 
-Import the client bookmark, resolve canonical identity under security scope, and perform one transaction that finds or inserts `(project_id, kind, canonical_identity)`, inserts a new immutable grant version, and updates `current_grant_version_id`. Reject a refresh when project/kind/identity differs. Keep live capability references in `workspace_operation_capabilities`; remove them only at operation completion/needsAttention resolution.
+Import the client bookmark and resolve canonical identity under security scope before mutation. Start one `updateProjectSettings` operation with a server-canonical request digest and acquire the Project plus both capability live claims. One SQLite transaction then finds or inserts `(project_id, kind, canonical_identity)`, inserts immutable grant versions, CASes each `current_grant_version_id`, switches both `project_worktree_settings` pointers, inserts the new settings live references, releases the superseded settings references, removes the operation capability bindings, stores the replayable settings result, and CASes the operation from its exact expected phase to `completed`. Refresh requires the stable `CapabilityID`, expected current grant-version ID, Project, kind, and equal canonical identity; it rejects stale, cross-Project, cross-kind, or changed-identity requests. Crash injection before commit leaves no new grant, pointer, reference, result, or completed tombstone; reply loss replays the same stored result. Existing Environment references remain unchanged, and capability collection occurs only after the transaction proves the last live reference is gone.
 
 ```swift
-let reference = try await capabilities.importGrant(
-    CapabilityGrantImport(
-        projectID: projectID,
-        kind: .storageParent,
-        bookmark: bookmark,
-        canonicalIdentity: resolvedIdentity
-    )
-)
-try await capabilities.retain(reference.capabilityID, for: .projectSettings(projectID))
+let result = try await workspace.updateProjectSettingsAtomically(.init(
+    operationID: operationID,
+    projectID: projectID,
+    expectedSettingsRevision: current.revision,
+    storageParentGrant: resolvedStorageGrant,
+    gitRootGrant: resolvedGitRootGrant
+))
+#expect(result.operation.phase == .completed)
+#expect(result.settings.storageParentCapabilityID == result.storageReference.capabilityID)
 ```
+
+Add repository tests that stop before every statement in the settings transaction and assert all-or-nothing grant versions, current pointers, settings pointers, live references, operation bindings, result, and terminal phase. Repeat the identical request after a dropped reply and require byte-identical progress/result with no second grant version.
 
 - [ ] **Step 4: Implement the native settings sheet**
 
@@ -1245,15 +1461,25 @@ Run the commands from Step 2 plus `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 ```bash
 git add -- Sources/CockpitHostCore/WorkspaceRepository.swift \
+  Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitHostCore/WorkspaceService.swift \
   Sources/CockpitPersistence/SQLiteCapabilityStore.swift \
+  Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift \
   Sources/CockpitWorkspace/SecurityScopedProjectRoot.swift \
   Applications/CockpitApp/ProjectSettingsController.swift \
   Applications/CockpitApp/ProjectCommandController.swift \
   Applications/CockpitApp/WorkspaceSidebarController.swift Applications/CockpitProbe/main.swift \
+  Applications/CockpitHost/main.swift \
   Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift \
   Tests/CockpitWorkspaceTests/WorkspaceRootHandleTests.swift \
   Tests/CockpitAppTests/ProjectCommandControllerTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
   Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: add project worktree settings"
 ```
@@ -1263,6 +1489,13 @@ git commit -m "feat: add project worktree settings"
 ### Task 8: Implement Direct, New Branch, and Existing Branch creation sagas
 
 **Files:**
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
+- Modify: `Applications/CockpitHost/main.swift`
 - Create: `Sources/CockpitHostCore/WorktreeCreationCoordinator.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
@@ -1277,6 +1510,7 @@ git commit -m "feat: add project worktree settings"
 - Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/GitRepositoryCoordinatorTests.swift`
 - Test: `Tests/CockpitAppTests/ConversationCommandControllerTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
 - Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
@@ -1310,16 +1544,36 @@ Cover Direct, New Branch, and Existing Branch canonical digests. Assert Existing
 
 - [ ] **Step 2: Write failing crash-matrix tests**
 
-Inject a stop after each durable phase: `prepared`, `targetReserved`, `gitRunning`, `gitAdded`, and `metadataCommitted`. Restart the coordinator and assert it returns the same ConversationID/EnvironmentID/result, preserves created branch/worktree after Git started, and enters `needsAttention` rather than deleting when identity cannot be proven.
+Inject a stop after each durable phase: `prepared`, `targetReserved`, `gitRunning`, `gitAdded`, and `metadataCommitted`. For `targetReserved`, cover both an exact-empty operation-owned directory and a crash after its successful fd-relative `rmdir` but before the failure CAS. The first run removes it; either state converges to the same replayable terminal `failed(.preGitReservationRecovered)` result when Git registration is absent. For `gitRunning`, separately cover a fully matching registered worktree, a retained New Branch without a worktree, an incomplete/unknown target, and an identity mismatch. A fully matching worktree resumes metadata commit; branch-only and every ambiguous/identity-failed state preserve physical data and enter `needsAttention`. `gitAdded` and `metadataCommitted` resume to the same ConversationID/EnvironmentID/result.
 
 ```swift
-for phase in [
-    WorkspaceOperationPhase.prepared, .targetReserved, .gitRunning,
-    .gitAdded, .metadataCommitted,
-] {
-    let first = try await fixture.runUntil(phase: phase)
+let matrix: [(CreationRecoveryFixture, WorkspaceOperationProgress)] = [
+    (fixture.prepared, .completed(fixture.expectedResult)),
+    (fixture.targetReservedOwnedEmpty, .failed(
+        operationID: fixture.operationID,
+        error: .preGitReservationRecovered
+    )),
+    (fixture.targetReservedAlreadyRemoved, .failed(
+        operationID: fixture.operationID,
+        error: .preGitReservationRecovered
+    )),
+    (fixture.gitRunningFullyMatching, .completed(fixture.expectedResult)),
+    (fixture.gitRunningBranchOnly, .needsAttention(
+        operationID: fixture.operationID,
+        error: .branchRetained(ref: fixture.branchRef, oid: fixture.sourceOID)
+    )),
+    (fixture.gitRunningUnknownTarget, .needsAttention(
+        operationID: fixture.operationID,
+        error: .needsAttention(reason: .targetIdentityChanged)
+    )),
+    (fixture.gitAdded, .completed(fixture.expectedResult)),
+    (fixture.metadataCommitted, .completed(fixture.expectedResult)),
+]
+for (scenario, expected) in matrix {
+    let first = try await scenario.installCrashState()
     let recovered = try await fixture.restartAndResume(operationID: first.id)
-    #expect(recovered == .completed(fixture.expectedResult))
+    #expect(recovered == expected)
+    #expect(fixture.neverDeletedBranchOrUnknownPath)
 }
 ```
 
@@ -1338,7 +1592,7 @@ Expected: compile failure because the creation coordinator and Worktree intents 
 
 - [ ] **Step 4: Implement preparation and immutable intent capture**
 
-Under the repository lock, resolve the Project Git identity, settings capability IDs, source full OID, Existing Branch full ref/tip/occupancy, canonical target name, and `project_relative_path`. Store only the immutable intent and live capability/Project claims. New Branch derives the default slug and deterministic `-2`, `-3` conflict suffix before begin.
+Under the repository lock, resolve the Project Git identity, settings capability IDs, New Branch source `EnvironmentID`, source root/incarnation and full OID, Existing Branch full ref/tip/occupancy, canonical target name, and `project_relative_path`. Store only the immutable intent and live capability/Project claims. Before Git, re-resolve the exact source Environment/root/incarnation and compare its full OID. New Branch derives the default slug and deterministic `-2`, `-3` conflict suffix before begin.
 
 ```swift
 public enum ConversationCreationIntent: Hashable, Codable, Sendable {
@@ -1349,7 +1603,10 @@ public enum ConversationCreationIntent: Hashable, Codable, Sendable {
 
 public struct NewBranchConversationIntent: Hashable, Codable, Sendable {
     public let projectID: ProjectID
+    public let sourceEnvironmentID: EnvironmentID
+    public let repositoryIdentity: GitRepositoryIdentity
     public let title: String
+    public let targetName: FileSystemName
     public let branchShortName: String
     public let branchFullRef: String
     public let sourceOID: String
@@ -1360,7 +1617,9 @@ public struct NewBranchConversationIntent: Hashable, Codable, Sendable {
 
 public struct ExistingBranchConversationIntent: Hashable, Codable, Sendable {
     public let projectID: ProjectID
+    public let repositoryIdentity: GitRepositoryIdentity
     public let title: String
+    public let targetName: FileSystemName
     public let branchShortName: String
     public let branchFullRef: String
     public let selectedTipOID: String
@@ -1380,13 +1639,19 @@ public protocol WorktreeCreationCoordinating: Sendable {
 
 - [ ] **Step 5: Implement Git and metadata phase transitions**
 
-For Worktree modes: reserve the final target through `DirectoryReservation`; append its identity observation and CAS `targetReserved`; append/fresh-check `gitMutationEpoch`; CAS `gitRunning`; invoke fd-cwd Git add; verify common directory, registration, branch/detached state, and exact source OID; CAS `gitAdded`; verify the Project subdirectory; then one deferred SQLite transaction inserts Environment, WorktreeEnvironment, Conversation, client defaults, replayable result, and `metadataCommitted`; finally mark `completed`. Direct creation is one metadata transaction using the same operation ID.
+For Worktree modes: call the typed `GitRepositoryCoordinating.addWorktree` once. Inside its repository lock it resolves the frozen storage/Git-root capabilities, reserves the final target through `DirectoryReservation`, journals identity and `targetReserved`, appends/fresh-checks `gitMutationEpoch`, CASes `gitRunning`, invokes fd-cwd Git add, verifies common directory, registration, branch/detached state, and exact source OID, then calls `recordGitResultAndAdvance(... from: .gitRunning, to: .gitAdded)` so result observation and phase CAS are one SQLite transaction. Stale expected phase is rejected without observation; reply replay returns the already committed single result. The creation coordinator then verifies the Project subdirectory; one deferred SQLite transaction inserts Environment, WorktreeEnvironment, Conversation, client defaults, replayable result, and `metadataCommitted`; finally mark `completed`. Direct creation is one metadata transaction using the same operation ID.
 
 ```swift
-let reservation = try directoryReservations.reserve(target, operationID: operationID)
-try await operations.appendObservation(.targetReserved(operationID, reservation.identity))
-_ = try await operations.advance(id: operationID, from: .prepared, to: .targetReserved)
-let gitResult = try await git.addWorktree(request)
+let gitResult = try await git.addWorktree(.init(
+    operationID: operationID,
+    expectedPhase: .prepared,
+    repository: intent.repositoryIdentity,
+    storageParentCapabilityID: intent.storageParentCapabilityID,
+    gitRootCapabilityID: intent.gitRootCapabilityID,
+    targetName: intent.targetName,
+    sourceOID: intent.sourceOID,
+    branch: intent.branchIntent
+))
 try verify(gitResult, against: intent)
 return try await repository.commitWorktreeConversation(
     operationID: operationID,
@@ -1396,13 +1661,15 @@ return try await repository.commitWorktreeConversation(
 
 - [ ] **Step 6: Implement deterministic recovery without destructive compensation**
 
-At Host startup scan nonterminal creation operations. Before Git starts, an exact-empty owned reservation can be removed. After `gitRunning`, never delete a branch, worktree, or unknown path. Reinspect and advance when postconditions match; otherwise append the observation and enter `needsAttention`.
+At Host startup scan nonterminal creation operations. A `targetReserved` operation whose authenticated reservation is still exact, owned, empty, and unregistered removes only that directory, then performs the Task 1 atomic failure transaction: store `.preGitReservationRecovered`, delete all live Project/environment/capability bindings, and CAS `targetReserved -> failed`. If the durable reservation observation remains but the child path is already absent and Git has no registration/ref side effect, recovery performs no filesystem action and executes the same failure transaction; this closes crash-after-rmdir-before-CAS. Tests require zero live claims/bindings, successful subsequent Project mutation/final capability collection, and identical failure replay. At `gitRunning`, a fully matching registered worktree with exact target/common/workspace identity, expected branch or detached state, and exact source OID advances to `gitAdded` and completes metadata. A branch-only New Branch records its ref/OID and enters `needsAttention`; incomplete, unknown, or identity-mismatched targets also enter `needsAttention`. No post-`gitRunning` path deletes a branch, worktree, or unknown path.
 
 ```swift
 for operation in try await operations.nonterminal(kind: .createConversation) {
     switch operation.phase {
-    case .prepared, .targetReserved: try await recoverBeforeGit(operation)
-    case .gitRunning, .gitAdded, .metadataCommitted: try await recoverAfterGit(operation)
+    case .prepared: try await resumeBeforeReservation(operation)
+    case .targetReserved: try await failAndCleanExactEmptyReservation(operation)
+    case .gitRunning: try await classifyAndRecoverGitMutation(operation)
+    case .gitAdded, .metadataCommitted: try await resumeMetadataCommit(operation)
     default:
         throw WorkspaceOperationFailure.needsAttention(reason: .ambiguousGitRegistration)
     }
@@ -1446,6 +1713,12 @@ Tests/ProcessIntegrationTests/probe-json.zsh
 
 ```bash
 git add -- Sources/CockpitHostCore/WorktreeCreationCoordinator.swift \
+  Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitHostCore/WorkspaceRepository.swift Sources/CockpitHostCore/WorkspaceService.swift \
   Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift \
   Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift \
@@ -1453,9 +1726,11 @@ git add -- Sources/CockpitHostCore/WorktreeCreationCoordinator.swift \
   Applications/CockpitApp/NewConversationSheetController.swift \
   Applications/CockpitApp/ConversationCommandController.swift \
   Applications/CockpitApp/WorkspaceViewModel.swift Applications/CockpitProbe/main.swift \
+  Applications/CockpitHost/main.swift \
   Tests/CockpitHostCoreTests/WorktreeCreationCoordinatorTests.swift \
   Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
   Tests/CockpitWorkspaceTests/GitRepositoryCoordinatorTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
   Tests/CockpitAppTests/ConversationCommandControllerTests.swift \
   Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: create worktree conversations"
@@ -1469,18 +1744,31 @@ git commit -m "feat: create worktree conversations"
 - Create: `Sources/CockpitTypes/ContextCommitModels.swift`
 - Modify: `Sources/CockpitTypes/WorkspacePhase2Models.swift`
 - Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
 - Modify: `Sources/CockpitProtocol/HostDataPlaneMessages.swift`
+- Create: `Sources/CockpitHostCore/ContextCommitRepository.swift`
 - Create: `Sources/CockpitPersistence/SQLiteContextCommitStore.swift`
 - Create: `Sources/CockpitHostCore/ContextCommitCoordinator.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
 - Modify: `Sources/CockpitLocalTransport/HostDataPlaneTicket.swift`
 - Modify: `Sources/CockpitLocalTransport/HostDataPlaneServer.swift`
 - Modify: `Sources/CockpitLocalTransport/HostDataPlaneClient.swift`
 - Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
+- Modify: `Applications/CockpitHost/main.swift`
+- Modify: `Applications/CockpitProbe/main.swift`
 - Test: `Tests/CockpitTypesTests/WorkspaceModelsTests.swift`
 - Test: `Tests/CockpitProtocolTests/HostDataPlaneProtocolTests.swift`
 - Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteContextCommitStoreTests.swift`
 - Test: `Tests/CockpitHostCoreTests/ContextCommitCoordinatorTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
 - Test: `Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift`
+- Test: `Tests/CockpitWorkspaceTests/WorkspaceKernelDataPlaneTests.swift`
+- Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
 - Produces: `prepareContext`, `commitPreparedContext`, `contextCommitStatus`, `completeContextRecovery`, and `presentationCommitted` Host commands.
@@ -1508,12 +1796,15 @@ Assert data-plane 1.2 encodes exactly one of active/prepared authority, prepared
 
 - [ ] **Step 2: Write failing commit-journal crash/reply-loss tests**
 
-Test durable commit before children, reply loss, recovery epoch increment after ticket invalidation, old epoch rejection, committed-unavailable fallback, and predecessor supersession. Assert a prepared token is bound to issuer connection/peer and cannot survive connection invalidation before durable commit.
+Test durable commit before children, reply loss, recovery epoch increment after ticket invalidation, old epoch rejection, committed-unavailable fallback with owning ProjectID, complete committed-ready child authority, and predecessor supersession. Persist and round-trip all four typed child-plan cases, their logical Context/subscription/Document/viewer/session/attachment identities, typed tickets, and matching typed ready proofs; `CommittedContext.contextCommitID` must equal the token, request, navigation row, and status query ID. Create two Document viewer children and two Terminal attachment children under the same target, cross-swap their tickets, and require exact rejection; after durable reconnect, require fresh child-specific tickets and reject every old ticket. Before durable commit, assert a prepared token is bound to issuer peer, physical connection, WindowID, Context, Environment, incarnation and expiry; cross-peer, cross-connection, cross-window and expired commit calls are rejected, and issuer-connection invalidation invalidates the token. After durable commit, assert a new authenticated connection for the same peer and WindowID can query status, complete recovery, and send presentation acknowledgement; cross-peer, cross-window, wrong-current-commit, stale recovery epoch and stale handoff epoch calls remain rejected.
 
 ```swift
 @Test func durableCommitReplyLossReturnsSameRecoveryPlan() async throws {
     let first = try await fixture.commitAndDropReply()
-    let recovered = try await coordinator.status(contextCommitID: first.contextCommitID)
+    let recovered = try await coordinator.status(
+        .init(contextCommitID: first.contextCommitID, windowID: fixture.windowID),
+        caller: fixture.reconnectedSession
+    )
     #expect(recovered == .committedNeedsChildren(
         recoveryEpoch: first.recoveryEpoch,
         plan: first.childPlan
@@ -1531,6 +1822,8 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter ContextCommitCoordinatorTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteContextCommitStoreTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter HostDataPlaneTests
 ```
 
@@ -1543,22 +1836,21 @@ public struct PreparedContextToken: Hashable, Codable, Sendable {
     public let id: PreparedContextTokenID
     public let contextCommitID: ContextCommitID
     public let issuerConnectionID: ConnectionID
+    public let issuerPeerIdentityDigest: String
+    public let windowID: WindowID
     public let contextID: WorkspaceContextID
     public let environmentID: EnvironmentID
     public let incarnation: UUID
     public let proposedGeneration: UInt64
     public let stateRevision: UInt64
+    public let expiresAtUnixMilliseconds: UInt64
 }
 
 public enum ContextChildKind: String, Codable, Sendable {
-    case kernel, fileTree, document, terminal
-}
-
-public struct ContextChildPlan: Hashable, Codable, Sendable {
-    public let childID: UUID
-    public let kind: ContextChildKind
-    public let capabilityID: String
-    public let authority: HostDataPlaneAuthority?
+    case dataPlane = "data_plane"
+    case fileTree = "file_tree"
+    case documentViewer = "document_viewer"
+    case terminalAttachment = "terminal_attachment"
 }
 
 public enum HostDataPlaneAuthority: Hashable, Codable, Sendable {
@@ -1570,12 +1862,99 @@ public enum HostDataPlaneAuthority: Hashable, Codable, Sendable {
     )
 }
 
+public struct PreparedDataPlaneTicket: Hashable, Codable, Sendable {
+    public let opaqueTicket: Data
+    public let authorizationID: TargetAuthorizationID
+}
+
+public struct PreparedDocumentViewerTicket: Hashable, Codable, Sendable {
+    public let authorizationID: TargetAuthorizationID
+}
+
+public struct PreparedTerminalAttachmentTicket: Hashable, Codable, Sendable {
+    public let authorizationID: TargetAuthorizationID
+}
+
+public enum PreparedChildAuthorizationBinding: Hashable, Sendable {
+    case documentViewer(documentID: DocumentID, viewerID: ViewerID)
+    case terminalAttachment(sessionID: TerminalSessionID, attachmentID: UUID)
+}
+
+public struct RegisteredPreparedChildAuthorization: Hashable, Sendable {
+    public let authorizationID: TargetAuthorizationID
+    public let tokenID: PreparedContextTokenID
+    public let contextCommitID: ContextCommitID
+    public let childID: UUID
+    public let peerIdentityDigest: String
+    public let issuerConnectionID: ConnectionID
+    public let windowID: WindowID
+    public let contextID: WorkspaceContextID
+    public let environmentID: EnvironmentID
+    public let incarnation: UUID
+    public let binding: PreparedChildAuthorizationBinding
+    public let expiresAtUnixMilliseconds: UInt64
+    public let consumed: Bool
+}
+
+public enum ContextChildPlan: Hashable, Codable, Sendable {
+    case dataPlane(DataPlaneChildPlan)
+    case fileTree(FileTreeChildPlan)
+    case documentViewer(DocumentViewerChildPlan)
+    case terminalAttachment(TerminalAttachmentChildPlan)
+}
+
+public struct DataPlaneChildPlan: Hashable, Codable, Sendable {
+    public let childID: UUID
+    public let contextID: WorkspaceContextID
+    public let authority: HostDataPlaneAuthority
+    public let ticket: PreparedDataPlaneTicket
+}
+
+public struct FileTreeChildPlan: Hashable, Codable, Sendable {
+    public let childID: UUID
+    public let contextID: WorkspaceContextID
+    public let subscriptionID: UUID
+    public let authority: HostDataPlaneAuthority
+    public let ticket: PreparedDataPlaneTicket
+}
+
+public struct DocumentViewerChildPlan: Hashable, Codable, Sendable {
+    public let childID: UUID
+    public let documentID: DocumentID
+    public let viewerID: ViewerID
+    public let ticket: PreparedDocumentViewerTicket
+}
+
+public struct TerminalAttachmentChildPlan: Hashable, Codable, Sendable {
+    public let childID: UUID
+    public let sessionID: TerminalSessionID
+    public let attachmentID: UUID
+    public let ticket: PreparedTerminalAttachmentTicket
+}
+
 public enum ContextCommitStatus: Hashable, Codable, Sendable {
     case notCommitted
     case committedNeedsChildren(recoveryEpoch: UInt64, plan: [ContextChildPlan])
-    case committedReady(ActiveContext)
-    case committedUnavailable(EnvironmentAvailability)
+    case committedReady(CommittedContext)
+    case committedUnavailable(CommittedUnavailableContext)
     case superseded(currentContextCommitID: ContextCommitID)
+}
+
+public struct CommittedContext: Hashable, Codable, Sendable {
+    public let contextCommitID: ContextCommitID
+    public let activeContext: ActiveContext
+    public let childPlan: [ContextChildPlan]
+    public let recoveryEpoch: UInt64
+    public let handoffEpoch: UInt64
+}
+
+public struct CommittedUnavailableContext: Hashable, Codable, Sendable {
+    public let contextCommitID: ContextCommitID
+    public let contextID: WorkspaceContextID
+    public let environmentID: EnvironmentID
+    public let generation: UInt64
+    public let availability: EnvironmentAvailability
+    public let projectID: ProjectID
 }
 
 public struct ContextPrepareRequest: Hashable, Codable, Sendable {
@@ -1588,19 +1967,48 @@ public struct ContextPrepareRequest: Hashable, Codable, Sendable {
 public struct ContextCommitRequest: Hashable, Codable, Sendable {
     public let tokenID: PreparedContextTokenID
     public let contextCommitID: ContextCommitID
+    public let windowID: WindowID
     public let expectedStateRevision: UInt64
 }
 
-public struct ContextChildReadyProof: Hashable, Codable, Sendable {
+public struct ContextChildProofBinding: Hashable, Codable, Sendable {
     public let childID: UUID
-    public let kind: ContextChildKind
     public let peerIdentityDigest: String
     public let connectionID: ConnectionID
-    public let authority: HostDataPlaneAuthority
+    public let contextCommitID: ContextCommitID
+    public let handoffEpoch: UInt64
+}
+
+public enum ContextChildReadyProof: Hashable, Codable, Sendable {
+    case dataPlane(
+        binding: ContextChildProofBinding,
+        contextID: WorkspaceContextID,
+        authority: HostDataPlaneAuthority,
+        activeGeneration: UInt64
+    )
+    case fileTree(
+        binding: ContextChildProofBinding,
+        subscriptionID: UUID,
+        authority: HostDataPlaneAuthority,
+        activeGeneration: UInt64
+    )
+    case documentViewer(
+        binding: ContextChildProofBinding,
+        documentID: DocumentID,
+        viewerID: ViewerID,
+        activeAuthorityDigest: String
+    )
+    case terminalAttachment(
+        binding: ContextChildProofBinding,
+        sessionID: TerminalSessionID,
+        attachmentID: UUID,
+        activeAuthorityDigest: String
+    )
 }
 
 public struct ContextRecoveryCompletion: Hashable, Codable, Sendable {
     public let contextCommitID: ContextCommitID
+    public let windowID: WindowID
     public let recoveryEpoch: UInt64
     public let childProofs: [ContextChildReadyProof]
 }
@@ -1608,20 +2016,27 @@ public struct ContextRecoveryCompletion: Hashable, Codable, Sendable {
 public struct ContextPresentationAcknowledgement: Hashable, Codable, Sendable {
     public let contextCommitID: ContextCommitID
     public let windowID: WindowID
+    public let generation: UInt64
+    public let handoffEpoch: UInt64
+}
+
+public struct ContextCommitStatusRequest: Hashable, Codable, Sendable {
+    public let contextCommitID: ContextCommitID
+    public let windowID: WindowID
 }
 ```
 
 - [ ] **Step 5: Implement invisible prepare and durable promotion**
 
-Prepare resolves a fresh fd-backed Environment root, allocates proposed generation, registers a prepared Kernel, and issues peer/connection-bound prepared child tickets without changing navigation or visible state. Commit performs one SQLite transaction validating token/admission/current predecessor, inserts `context_commits(durablePendingChildren)`, inserts the complete child journal, updates navigation current commit/context/environment/generation, and marks the generation committed.
+Prepare resolves a fresh fd-backed Environment root, allocates proposed generation, registers a prepared Kernel, and issues peer/connection/window-bound expiring typed child tickets without changing navigation or visible state. Document and Terminal tickets are backed by `RegisteredPreparedChildAuthorization`, which binds token/commit, peer, issuer connection, WindowID, Context, Environment, incarnation, childID, expiry/consumption and exact `(DocumentID, ViewerID)` or `(TerminalSessionID, AttachmentID)` resource identity; a generic target ticket cannot substitute for them. Each WindowID has exactly one live prepared token; a new selection atomically revokes the predecessor token and all still-prepared children. `ContextCommitCoordinator` depends only on `ContextCommitRepository`; `SQLiteContextCommitStore` implements that HostCore contract from the lower `CockpitPersistence` module. Commit performs one SQLite transaction validating immutable caller peer/connection/window, token expiry, Environment incarnation, admission state and current predecessor, inserts `context_commits(durablePendingChildren)`, inserts the complete typed child journal including every logical-resource identity and ticket digest, updates navigation current commit/context/environment/generation, and marks the generation committed. That transaction transfers ownership from the ephemeral issuer connection to the durable peer identity + WindowID + current ContextCommitID. Status, recovery and presentation acknowledgement accept a new authenticated connection only when peer, WindowID, current commit, recovery epoch and handoff epoch match the journal. Recovery reissues fresh child-specific tickets from the journal; it never tries to reuse a process-local FD or old one-shot ticket.
 
 ```swift
 public protocol ContextCommitCoordinating: Sendable {
-    func prepare(_ request: ContextPrepareRequest) async throws -> PreparedContextToken
-    func commit(_ request: ContextCommitRequest) async throws -> ContextCommitStatus
-    func status(contextCommitID: ContextCommitID) async throws -> ContextCommitStatus
-    func completeRecovery(_ request: ContextRecoveryCompletion) async throws -> ContextCommitStatus
-    func presentationCommitted(_ request: ContextPresentationAcknowledgement) async throws
+    func prepare(_ request: ContextPrepareRequest, caller: NegotiatedSession) async throws -> PreparedContextToken
+    func commit(_ request: ContextCommitRequest, caller: NegotiatedSession) async throws -> ContextCommitStatus
+    func status(_ request: ContextCommitStatusRequest, caller: NegotiatedSession) async throws -> ContextCommitStatus
+    func completeRecovery(_ request: ContextRecoveryCompletion, caller: NegotiatedSession) async throws -> ContextCommitStatus
+    func presentationCommitted(_ request: ContextPresentationAcknowledgement, caller: NegotiatedSession) async throws
 }
 ```
 
@@ -1631,15 +2046,26 @@ Data-plane child state is `prepared -> promoting -> active`. During promoting, o
 
 ```swift
 public enum HostDataPlaneAuthorityState: Hashable, Sendable {
-    case prepared(HostDataPlaneAuthority)
-    case promoting(HostDataPlaneAuthority)
-    case active(HostDataPlaneAuthority)
+    case prepared(
+        tokenID: PreparedContextTokenID,
+        proposedGeneration: UInt64,
+        incarnation: UUID
+    )
+    case promoting(
+        contextCommitID: ContextCommitID,
+        activeGeneration: UInt64,
+        incarnation: UUID,
+        handoffEpoch: UInt64
+    )
+    case active(generation: UInt64, incarnation: UUID)
     case revoked
 }
 
 func acknowledgeAuthorityPromotion(
     connectionID: ConnectionID,
     contextCommitID: ContextCommitID,
+    activeGeneration: UInt64,
+    handoffEpoch: UInt64,
     recoveryEpoch: UInt64
 ) async throws
 ```
@@ -1653,6 +2079,7 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter SQLiteWorkspaceRepositoryTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter WorkspaceKernelDataPlaneTests
+Tests/ProcessIntegrationTests/probe-json.zsh
 ```
 
 Then:
@@ -1661,19 +2088,31 @@ Then:
 git add -- Sources/CockpitTypes/ContextCommitModels.swift \
   Sources/CockpitTypes/WorkspacePhase2Models.swift \
   Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
   Sources/CockpitProtocol/HostDataPlaneMessages.swift \
+  Sources/CockpitHostCore/ContextCommitRepository.swift \
   Sources/CockpitPersistence/SQLiteContextCommitStore.swift \
   Sources/CockpitHostCore/ContextCommitCoordinator.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitHostCore/WorkspaceService.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitLocalTransport/HostDataPlaneTicket.swift \
   Sources/CockpitLocalTransport/HostDataPlaneServer.swift \
   Sources/CockpitLocalTransport/HostDataPlaneClient.swift \
   Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift \
+  Applications/CockpitHost/main.swift \
+  Applications/CockpitProbe/main.swift \
   Tests/CockpitTypesTests/WorkspaceModelsTests.swift \
   Tests/CockpitProtocolTests/HostDataPlaneProtocolTests.swift \
   Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteContextCommitStoreTests.swift \
   Tests/CockpitHostCoreTests/ContextCommitCoordinatorTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
   Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift \
-  Tests/CockpitWorkspaceTests/WorkspaceKernelDataPlaneTests.swift
+  Tests/CockpitWorkspaceTests/WorkspaceKernelDataPlaneTests.swift \
+  Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: add durable context preparation"
 ```
 
@@ -1682,6 +2121,14 @@ git commit -m "feat: add durable context preparation"
 ### Task 10: Stage Monaco, file tree, and terminal children before visible context swap
 
 **Files:**
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
+- Modify: `Sources/CockpitHostCore/TerminalSupervisorControlling.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
 - Modify: `Sources/CockpitClientCore/ActiveContextController.swift:3-30`
 - Modify: `Sources/CockpitTerminalClient/TerminalAttachmentController.swift`
 - Modify: `Sources/CockpitTerminalCore/TerminalSupervisor.swift`
@@ -1690,7 +2137,11 @@ git commit -m "feat: add durable context preparation"
 - Modify: `Sources/CockpitLocalTransport/TerminalSupervisorControlTransport.swift`
 - Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCProtocol.swift`
 - Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift`
+- Modify: `Applications/CockpitHost/main.swift`
+- Modify: `Applications/CockpitTerminalSupervisor/main.swift`
+- Modify: `Applications/CockpitProbe/main.swift`
 - Create: `Applications/CockpitApp/WorkspacePresentationCoordinator.swift`
+- Create: `Applications/CockpitApp/PresentationAcknowledgementDriver.swift`
 - Modify: `Applications/CockpitApp/WorkspaceViewModel.swift`
 - Modify: `Applications/CockpitApp/ContentHostController.swift`
 - Modify: `Applications/CockpitApp/FileTreeViewController.swift`
@@ -1698,10 +2149,14 @@ git commit -m "feat: add durable context preparation"
 - Modify: `Applications/CockpitApp/Terminal/TerminalTabViewController.swift`
 - Modify: `Applications/CockpitApp/WorkspaceSplitViewController.swift`
 - Test: `Tests/CockpitClientCoreTests/ActiveContextControllerTests.swift`
+- Test: `Tests/CockpitWorkspaceTests/FileTreeProviderTests.swift`
 - Test: `Tests/CockpitTerminalClientTests/TerminalAttachmentControllerTests.swift`
 - Test: `Tests/CockpitTerminalCoreTests/TerminalSupervisorTwoPhaseTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift`
 - Test: `Tests/CockpitAppTests/WorkspaceViewModelTests.swift`
 - Test: `Tests/CockpitAppTests/WorkspaceHierarchyTests.swift`
+- Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
 - Produces: `PreparedClientContext`, `StagedWorkspacePresentation`, and `WorkspacePresentationCoordinator.select(_:)`.
@@ -1710,7 +2165,7 @@ git commit -m "feat: add durable context preparation"
 
 - [ ] **Step 1: Write failing no-visible-change and A/B/C tests**
 
-Assert target file tree, Monaco, and terminal prepare remain hidden; any prepare/commit/child failure leaves old visible controllers and old ActiveContext unchanged. Add A-visible/B-durable-not-presented/C-supersedes-B and assert `presentationCommitted(C)` releases A and B, while old IDs return `superseded(C)`.
+Assert target file tree, Monaco, and terminal prepare remain hidden; any definitely pre-commit prepare/commit failure leaves old visible controllers and old ActiveContext unchanged. Add live-first-frame, finalized-archive, and empty-final terminal readiness tests. Add A-visible/B-durable-not-presented/C-supersedes-B and assert `presentationCommitted(C)` releases A and B, while old IDs return `superseded(C)`. Drop the durable-commit reply, child-handoff reply, and presentation-ack reply independently. For commit reply loss, require zero abort calls, a same-peer/WindowID/ContextCommitID status query after reconnect, and continuation from the returned committed state. Assert no post-linearization path calls `abort`, visible success is retained, and the exact acknowledgement is retried after relaunch.
 
 ```swift
 @MainActor
@@ -1734,6 +2189,12 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter ActiveContextControllerTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter TerminalSupervisorTwoPhaseTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter ContextCommitCoordinatorTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteContextCommitStoreTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceRepositoryTests
 xcodegen generate --no-env
 xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug \
   -derivedDataPath DerivedData SYMROOT="$PWD/build" \
@@ -1748,10 +2209,10 @@ Expected: `ActiveContextController.select` mutates immediately and App child con
 - [ ] **Step 3: Replace immediate selection with prepared/current/presented state**
 
 ```swift
-public actor ActiveContextController {
+@MainActor
+public final class ActiveContextController {
     public func beginPreparation(_ token: PreparedContextToken) throws -> PreparedClientContext
-    public func recordDurableCommit(_ active: ActiveContext, commitID: ContextCommitID) throws
-    public func recordPresented(commitID: ContextCommitID) throws
+    public func recordPresented(_ active: ActiveContext, commitID: ContextCommitID)
     public func abortPreparation(tokenID: PreparedContextTokenID)
     public func current() -> ActiveContext?
 }
@@ -1761,7 +2222,7 @@ Generation remains unchanged until durable commit. A stale selection request che
 
 - [ ] **Step 4: Add hidden staging APIs to all three child families**
 
-Monaco prepares document controllers and model references without calling visible select. File tree opens the 1.2 prepared data-plane subscription without installing its view model. Terminal consumes the Host/Supervisor prepared registration and attaches without showing its view. Each staged object has exact `commitVisibility()` and `abort()` methods; abort closes subscriptions/viewers/attachments it created.
+Monaco prepares document controllers and model references without calling visible select. File tree opens the 1.2 prepared data-plane subscription without installing its view model. Terminal consumes the Host/Supervisor prepared registration and attaches without showing its view. Terminal readiness is not the current `.attached` callback: live sessions wait for the first renderable frame, finalized sessions wait for the archive snapshot, and a finalized session with no archive emits an explicit empty-final state. Each staged object has exact `commitVisibility()` and `abort()` methods; abort closes subscriptions/viewers/attachments it created.
 
 ```swift
 @MainActor
@@ -1783,7 +2244,7 @@ struct StagedWorkspacePresentation {
     let monaco: any StagedChildPresentation
     let fileTree: any StagedChildPresentation
     let terminals: [any StagedChildPresentation]
-    let commitVisibility: @MainActor () -> Void
+    let commitVisibility: @MainActor (_ recordPresented: () -> Void) -> Void
     let abort: @MainActor () -> Void
 }
 ```
@@ -1796,8 +2257,11 @@ Host registers prepared terminal authorization with ContextCommitID/token/incarn
 public struct TerminalAuthorizationRegistration: Hashable, Codable, Sendable {
     public let contextCommitID: ContextCommitID
     public let tokenID: PreparedContextTokenID
+    public let childID: UUID
+    public let windowID: WindowID
+    public let sessionID: TerminalSessionID
     public let incarnation: UUID
-    public let targetAuthorization: TargetAuthorization
+    public let ticket: PreparedTerminalAttachmentTicket
     public let attachmentID: UUID
 }
 
@@ -1807,24 +2271,56 @@ func promoteAuthorization(contextCommitID: ContextCommitID, attachmentID: UUID) 
 
 - [ ] **Step 6: Implement visible swap and predecessor release**
 
-`WorkspacePresentationCoordinator` prepares hidden children, requests durable commit, completes missing children for the returned recovery epoch, waits for `committedReady`, commits all child visibility in one MainActor turn, updates `ActiveContextController`, and sends `presentationCommitted`. Host atomically updates `presented_context_commit_id` and marks all predecessors between old presented and new current `revoking`; recovery drains them to `released`.
+`WorkspacePresentationCoordinator` prepares hidden children and hands them to a commit resolver. The resolver classifies the first reply as `definitelyNotCommitted`, `committed`, or `transportAmbiguous`. Only `definitelyNotCommitted` aborts the staged children. For `transportAmbiguous`, a `PendingContextCommitRecovery` takes ownership of the staged presentation and repeatedly reconnects and calls status with the same peer, WindowID, and ContextCommitID until Host returns `notCommitted` or a committed status; `notCommitted` aborts exactly once, while every committed status continues child recovery. A transport error is never converted into proof of non-commit. If the App exits during ambiguity, Host expiry clears a truly uncommitted token, while startup reconstructs any durable current navigation before presentation.
+
+After a committed status, the coordinator completes missing children for the returned recovery epoch, waits for `committedReady`, commits all child visibility in one MainActor turn, and updates `ActiveContextController`. At that point selection has succeeded. `PresentationAcknowledgementDriver` retries the idempotent `presentationCommitted`; reply loss never aborts or changes the success result. Host navigation durably retains `current != presented`, so App startup reconstructs the pending acknowledgement by restoring the current hidden presentation and then enqueuing the same ack. Host atomically updates `presented_context_commit_id` and marks all predecessors between old presented and new current `revoking`; recovery drains them to `released`.
 
 ```swift
 @MainActor
+enum ContextCommitAttemptOutcome {
+    case definitelyNotCommitted(HostControlBusinessError)
+    case committed(ContextCommitStatus)
+    case transportAmbiguous
+}
+
+@MainActor
+struct ResolvedDurableContextCommit {
+    let status: ContextCommitStatus
+    let staged: StagedWorkspacePresentation
+}
+
+@MainActor
+protocol ContextCommitResolving: AnyObject {
+    func resolveDefinitively(_ staged: StagedWorkspacePresentation) async throws
+        -> ResolvedDurableContextCommit
+}
+
+@MainActor
 func select(_ contextID: WorkspaceContextID) async throws -> ActiveContext {
     let staged = try await prepareHiddenPresentation(contextID)
-    do {
-        let active = try await finishDurableCommitAndChildren(staged)
-        staged.commitVisibility()
-        try await host.presentationCommitted(.init(
-            contextCommitID: staged.commitID,
-            windowID: windowID
-        ))
-        return active
-    } catch {
-        staged.abort()
-        throw error
+    let resolved = try await commitResolver.resolveDefinitively(staged)
+    let durable = resolved.status
+    let staged = resolved.staged
+    // From this line onward the Host journal owns the generation and children.
+    // No post-linearization path can call staged.abort().
+    let committed = try await recoverChildrenUntilReady(
+        durable,
+        contextCommitID: staged.commitID,
+        windowID: windowID
+    )
+    staged.commitVisibility {
+        activeContexts.recordPresented(
+            committed.activeContext,
+            commitID: staged.commitID
+        )
     }
+    acknowledgements.enqueue(.init(
+        contextCommitID: staged.commitID,
+        windowID: windowID,
+        generation: committed.activeContext.generation,
+        handoffEpoch: committed.handoffEpoch
+    ))
+    return committed.activeContext
 }
 ```
 
@@ -1837,12 +2333,23 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter TerminalAttachmentControllerTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter HostDataPlaneTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter FileTreeProviderTests
+Tests/ProcessIntegrationTests/probe-json.zsh
 ```
 
 Then:
 
 ```bash
 git add -- Sources/CockpitClientCore/ActiveContextController.swift \
+  Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitHostCore/WorkspaceService.swift \
+  Sources/CockpitHostCore/TerminalSupervisorControlling.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitTerminalClient/TerminalAttachmentController.swift \
   Sources/CockpitTerminalCore/TerminalSupervisor.swift \
   Sources/CockpitTerminalCore/TerminalSessionRepository.swift \
@@ -1851,16 +2358,24 @@ git add -- Sources/CockpitClientCore/ActiveContextController.swift \
   Sources/CockpitLocalTransport/TerminalSupervisorXPCProtocol.swift \
   Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift \
   Applications/CockpitApp/WorkspacePresentationCoordinator.swift \
+  Applications/CockpitApp/PresentationAcknowledgementDriver.swift \
+  Applications/CockpitHost/main.swift \
+  Applications/CockpitTerminalSupervisor/main.swift \
+  Applications/CockpitProbe/main.swift \
   Applications/CockpitApp/WorkspaceViewModel.swift Applications/CockpitApp/ContentHostController.swift \
   Applications/CockpitApp/FileTreeViewController.swift \
   Applications/CockpitApp/Monaco/MonacoEditorViewController.swift \
   Applications/CockpitApp/Terminal/TerminalTabViewController.swift \
   Applications/CockpitApp/WorkspaceSplitViewController.swift \
   Tests/CockpitClientCoreTests/ActiveContextControllerTests.swift \
+  Tests/CockpitWorkspaceTests/FileTreeProviderTests.swift \
   Tests/CockpitTerminalClientTests/TerminalAttachmentControllerTests.swift \
   Tests/CockpitTerminalCoreTests/TerminalSupervisorTwoPhaseTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
+  Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift \
   Tests/CockpitAppTests/WorkspaceViewModelTests.swift \
-  Tests/CockpitAppTests/WorkspaceHierarchyTests.swift
+  Tests/CockpitAppTests/WorkspaceHierarchyTests.swift \
+  Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: stage active context presentation"
 ```
 
@@ -1870,20 +2385,32 @@ git commit -m "feat: stage active context presentation"
 
 **Files:**
 - Modify: `Sources/CockpitTypes/WorkspaceOperationModels.swift`
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
+- Create: `Sources/CockpitHostCore/WorktreeDeletionManifestBuilding.swift`
 - Create: `Sources/CockpitWorkspace/WorktreeDeletionManifestBuilder.swift`
 - Replace: `Sources/CockpitHostCore/ConversationDeletionOperation.swift`
 - Replace: `Sources/CockpitHostCore/ConversationDeletionCoordinator.swift`
 - Create: `Sources/CockpitHostCore/WorktreeDeletionCoordinator.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
 - Modify: `Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift`
 - Modify: `Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift`
 - Modify: `Sources/CockpitWorkspace/GitRepositoryCoordinator.swift`
 - Replace: `Applications/CockpitApp/ConversationDeletionController.swift`
 - Modify: `Applications/CockpitProbe/main.swift`
+- Modify: `Applications/CockpitHost/main.swift`
 - Test: `Tests/CockpitWorkspaceTests/WorktreeDeletionManifestBuilderTests.swift`
 - Test: `Tests/CockpitHostCoreTests/ConversationDeletionCoordinatorTests.swift`
 - Test: `Tests/CockpitHostCoreTests/WorktreeDeletionCoordinatorTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
 - Test: `Tests/CockpitAppTests/ConversationDeletionControllerTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
 - Produces: `WorktreeDeletionManifest` and canonical SHA-256 digest.
@@ -1892,23 +2419,25 @@ git commit -m "feat: stage active context presentation"
 
 - [ ] **Step 1: Write failing manifest completeness/mutation tests**
 
-Build a worktree with tracked, untracked, ignored directory contents, symlink, ACL, xattr, and resource fork. Assert changing only content, ACL, xattr, resource fork, flags, or directory entries changes the digest. Assert socket/FIFO/device returns `unsupportedWorktreeEntry` and symlinks are never followed.
+Build a worktree with tracked, untracked, ignored directory contents, symlink, ACL, xattr, and resource fork. Assert changing only content, birth time, modification time, change time, ACL, xattr, resource fork, flags, or directory entries changes the digest. Assert socket/FIFO/device returns `unsupportedWorktreeEntry`, symlinks are never followed, and the canonical digest covers only the payload rather than its own digest field.
 
 ```swift
 @Test func xattrOnlyChangeInvalidatesDeletionManifest() async throws {
-    let first = try await builder.build(root: fixture.root)
+    let first = try await builder.build(fixture.manifestRequest)
     try fixture.setXattr(name: "user.phase2", value: Data("beta".utf8))
-    let second = try await builder.build(root: fixture.root)
+    let second = try await builder.build(fixture.manifestRequest)
     #expect(first.digest != second.digest)
 }
 ```
 
 - [ ] **Step 2: Write failing decision/replay/crash tests**
 
-Cover clean/dirty/locked worktrees, manifest change after confirmation, append-only reconfirm DecisionID, records-only continuation, force-terminal decision, Git removed but phase not committed, single-sided Git/path existence, and reply loss. Assert no branch deletion and no `rm -rf` invocation.
+Cover clean/dirty/locked worktrees, manifest change after confirmation, append-only reconfirm DecisionID/digest/revision, records-only continuation, force-terminal decision, Git removed but phase not committed, single-sided Git/path existence, and reply loss. Persistence tests require begin claims plus lifecycle owner atomicity; validation observation plus phase CAS atomicity; metadata purge deletes domain rows and live claims while retaining the operation tombstone/result in the same transaction; and identical request replay returns the same stored result. Assert no branch deletion and no `rm -rf` invocation.
+
+Inject a `WorktreeDeletionValidationBarrier` dependency between the durable validation-epoch CAS and the final manifest scan. Production uses a no-op implementation. Unit tests use an actor barrier; the namespaced process fixture composes an exact FIFO-backed barrier only when its complete fixture environment is present. This creates the post-begin mutation boundary without a product command, sleep, or timing race.
 
 ```swift
-@Test func changedManifestRejectsOldConfirmationAndPreservesWorktree() async throws {
+@Test func preBeginManifestChangeReturnsFreshImpactWithoutMutation() async throws {
     let prepared = try await coordinator.prepare(fixture.deleteWorktreeRequest)
     try fixture.writeUntracked("after-confirmation.txt")
     let result = try await coordinator.begin(.init(
@@ -1916,11 +2445,33 @@ Cover clean/dirty/locked worktrees, manifest change after confirmation, append-o
         preparationID: prepared.preparationID,
         decisions: [.confirmManifest(prepared.manifest.digest)]
     ))
-    #expect(result.phase == .awaitingDecision)
-    #expect(result.observation?.manifestDigest != prepared.manifest.digest)
+    #expect(result == .freshImpact(fixture.latestImpact))
+    #expect(try await fixture.operations.operation(id: fixture.operationID) == nil)
+    #expect(try await fixture.operations.liveClaims(operationID: fixture.operationID).isEmpty)
+    #expect(fixture.terminatedSessionIDs.isEmpty)
     #expect(fixture.worktreeExists)
     #expect(fixture.git.branchExists(fixture.branchName))
     #expect(fixture.processes.invocations(named: "rm").isEmpty)
+}
+
+@Test func manifestChangeAfterBeginPausesAtValidatingManifest() async throws {
+    let prepared = try await coordinator.prepare(fixture.deleteWorktreeRequest)
+    fixture.onValidationEpochStarted = {
+        try fixture.writeUntracked("after-begin.txt")
+    }
+    let result = try await coordinator.begin(.init(
+        operationID: fixture.operationID,
+        preparationID: prepared.preparationID,
+        decisions: [.confirmManifest(prepared.manifest.digest)]
+    ))
+    guard case let .progress(.awaitingDecision(operationID, sequence)) = result else {
+        Issue.record("Expected awaiting-decision progress")
+        return
+    }
+    #expect(operationID == fixture.operationID)
+    #expect(try await fixture.operations.require(operationID).phase == .validatingManifest)
+    #expect(try await fixture.operations.observation(operationID: operationID, sequence: sequence)?.manifestDigest != prepared.manifest.digest)
+    #expect(fixture.worktreeExists)
 }
 ```
 
@@ -1935,16 +2486,20 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter ConversationDeletionCoordinatorTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter WorktreeDeletionCoordinatorTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceOperationStoreTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceRepositoryTests
 ```
 
 Expected: the Phase 1 coordinator has no Worktree manifest or decision journal.
 
 - [ ] **Step 4: Implement canonical no-follow manifest traversal**
 
-Start from an authenticated worktree root FD. Traverse with directory descriptors; open regular files no-follow; fstat before and after content/ACL/xattr reads; use `readlinkat` for symlinks; include Git common/worktree/workspace identities, incarnation, HEAD/ref, index digest, porcelain categories, and every required metadata field. Sort byte paths/xattr names/directory entries before canonical encoding and SHA-256. Concurrent observation changes abort without producing authorization.
+Start from an authenticated worktree root FD. Traverse with directory descriptors; open regular files no-follow; fstat before and after content/ACL/xattr reads; use `readlinkat` for symlinks; include Git common/worktree/workspace identities, incarnation, HEAD/ref, index digest, porcelain categories, birth/modify/change times at nanosecond precision, and every required metadata field. Sort byte paths/xattr names/directory entries before canonical encoding. SHA-256 covers only canonical `WorktreeDeletionManifestPayload` bytes, never the outer digest field. Concurrent observation changes abort without producing authorization. Tests mutate birth/mtime/ctime independently and compare exact canonical fixture bytes.
 
 ```swift
-public struct WorktreeDeletionManifest: Hashable, Codable, Sendable {
+public struct WorktreeDeletionManifestPayload: Hashable, Codable, Sendable {
     public let version: UInt16
     public let repositoryIdentity: GitRepositoryIdentity
     public let worktreeRootIdentity: FileSystemIdentity
@@ -1954,6 +2509,10 @@ public struct WorktreeDeletionManifest: Hashable, Codable, Sendable {
     public let indexDigest: String
     public let statusEntries: [WorktreeStatusEntry]
     public let filesystemEntries: [WorktreeManifestEntry]
+}
+
+public struct WorktreeDeletionManifest: Hashable, Codable, Sendable {
+    public let payload: WorktreeDeletionManifestPayload
     public let digest: String
 }
 
@@ -1976,6 +2535,9 @@ public struct WorktreeManifestEntry: Hashable, Codable, Sendable {
     public let flags: UInt32
     public let linkCount: UInt64
     public let size: UInt64
+    public let birthTimeNanoseconds: Int64
+    public let modificationTimeNanoseconds: Int64
+    public let changeTimeNanoseconds: Int64
     public let contentOrLinkDigest: String?
     public let aclDigest: String
     public let xattrDigest: String
@@ -1986,39 +2548,93 @@ public enum WorktreeNodeType: String, Codable, Sendable {
     case regularFile, directory, symbolicLink
 }
 
-public protocol WorktreeDeletionManifestBuilding: Sendable {
-    func build(
-        worktreeRoot: AuthenticatedDirectory,
-        workspaceRoot: AuthenticatedDirectory,
-        repository: GitRepositoryIdentity,
-        incarnation: UUID
-    ) async throws -> WorktreeDeletionManifest
+public struct WorktreeDeletionManifestRequest: Hashable, Sendable {
+    public let environmentID: EnvironmentID
+    public let expectedIncarnation: UUID
+    public let expectedRepositoryIdentity: GitRepositoryIdentity
+    public let expectedWorktreeRootIdentity: FileSystemIdentity
+    public let expectedWorkspaceRootIdentity: FileSystemIdentity
 }
+
+public protocol WorktreeDeletionManifestBuilding: Sendable {
+    func build(_ request: WorktreeDeletionManifestRequest) async throws
+        -> WorktreeDeletionManifest
+}
+
+// The request and protocol live in CockpitHostCore. The CockpitWorkspace
+// implementation resolves authenticated roots internally and implements that
+// protocol; HostCore never imports CockpitWorkspace.
 ```
 
 - [ ] **Step 5: Implement begin, decisions, and physical deletion phases**
 
-Preparation returns dirty Documents, terminal impact, status classification, and manifest digest without mutation. Begin claims Conversation/Environment, freezes admission, validates preparation/revisions/incarnation/manifest, and records user mode. Conversation-only purges Cockpit metadata and preserves physical worktree. Physical mode executes document decisions, normal/force terminal decisions, quiesces Environment, appends validation epoch, rebuilds manifest, requests reconfirm/records-only on change, rejects locked worktree, then invokes `git worktree remove --force` only after explicit dirty confirmation.
+Preparation returns dirty Documents, terminal impact, status classification, and manifest digest without mutation. Begin first freezes admission and fresh-validates preparation/revisions/incarnation/manifest. Any pre-begin difference releases the reservation and returns a fresh impact with no operation, claim, lifecycle change, or terminal side effect. Only an exact match enters one workspace transaction that inserts the operation at `prepared`, claims Conversation/Environment, marks Conversation deleting with that owner, and records user mode. On replay, `.prepared` verifies those already durable claims and lifecycle ownership, then CASes to `resolvingDocuments`; it never claims a second time. Conversation-only advances durably from quiescing to metadata purge and preserves the physical worktree. Physical mode follows the exact monotonic graph `prepared -> resolvingDocuments -> terminatingSessions -> quiescingEnvironment -> validatingManifest -> removalAuthorized -> removingWorktree -> worktreeRemoved -> purgingMetadata -> completed`. Awaiting user input is `WorkspaceOperationProgress.awaitingDecision` while the durable phase remains `validatingManifest`; it is not a phase. The flow executes document decisions, normal/force terminal decisions, quiesces Environment, appends validation epoch, rebuilds manifest, requests reconfirm/records-only on change, rejects locked worktree, then CASes `removalAuthorized -> removingWorktree` before invoking `git worktree remove --force` after explicit dirty confirmation.
 
 ```swift
 public protocol ConversationDeletionCoordinating: Sendable {
     func prepare(_ request: ConversationDeletionPreparationRequest) async throws
         -> ConversationDeletionPreparation
     func begin(_ request: ConversationDeletionBeginRequest) async throws
-        -> WorkspaceOperationProgress
+        -> ConversationDeletionBeginOutcome
     func submitDecision(_ request: WorkspaceDecisionSubmission) async throws
         -> WorkspaceOperationProgress
     func resume(operationID: WorkspaceOperationID) async throws
         -> WorkspaceOperationProgress
 }
 
+public enum ConversationDeletionMode: String, Codable, Sendable {
+    case conversationOnly, conversationAndWorktree
+}
+
+public struct WorkspaceDocumentRevision: Hashable, Codable, Sendable {
+    public let documentID: DocumentID
+    public let revision: UInt64
+}
+
+public struct ConversationDeletionPreparationRequest: Hashable, Codable, Sendable {
+    public let conversationID: ConversationID
+    public let mode: ConversationDeletionMode
+}
+
+public struct ConversationDeletionPreparation: Hashable, Codable, Sendable {
+    public let preparationID: UUID
+    public let conversationID: ConversationID
+    public let environmentID: EnvironmentID
+    public let incarnation: UUID
+    public let documentRevisions: [WorkspaceDocumentRevision]
+    public let terminalSessionIDs: [TerminalSessionID]
+    public let manifest: WorktreeDeletionManifest?
+}
+
+public struct ConversationDeletionBeginRequest: Hashable, Codable, Sendable {
+    public let operationID: WorkspaceOperationID
+    public let preparationID: UUID
+    public let mode: ConversationDeletionMode
+    public let decisions: [WorkspaceOperationDecision]
+}
+
+public struct WorkspaceDecisionSubmission: Hashable, Codable, Sendable {
+    public let operationID: WorkspaceOperationID
+    public let decision: WorkspaceOperationDecision
+}
+
+public enum ConversationDeletionBeginOutcome: Hashable, Codable, Sendable {
+    case freshImpact(ConversationDeletionPreparation)
+    case progress(WorkspaceOperationProgress)
+}
+
 switch operation.phase {
-case .targetsClaimed: return try await resolveDocuments(operation)
-case .resolvingDocuments: return try await gateAndTerminateSessions(operation)
-case .quiescingEnvironment: return try await validateDeletionManifest(operation)
-case .removalAuthorized: return try await removeRegisteredWorktree(operation)
-case .worktreeRemoved, .purgingMetadata: return try await purgeCockpitMetadata(operation)
-default: return try await operationStore.progress(id: operation.id)
+case .prepared: return try await verifyClaimsAndAdvanceToResolvingDocuments(operation)
+case .resolvingDocuments: return try await resolveDocuments(operation)
+case .terminatingSessions: return try await terminateSessions(operation)
+case .quiescingEnvironment: return try await quiesceEnvironment(operation)
+case .validatingManifest: return try await validateDeletionManifest(operation)
+case .removalAuthorized: return try await authorizeExactGitRemoval(operation)
+case .removingWorktree: return try await removeOrRecoverRegisteredWorktree(operation)
+case .worktreeRemoved: return try await advanceToMetadataPurge(operation)
+case .purgingMetadata: return try await purgeCockpitMetadata(operation)
+case .completed, .failed, .needsAttention: return try await operationStore.progress(id: operation.id)
+default: throw WorkspaceOperationFailure.identityChanged
 }
 ```
 
@@ -2040,7 +2656,7 @@ func recoveryAction(
 ) -> WorktreeRemovalRecoveryAction {
     switch (registration, pathIdentity) {
     case let (.some(current), .some(identity))
-        where current.rootIdentity == identity && identity == authorized.worktreeRootIdentity:
+        where current.rootIdentity == identity && identity == authorized.payload.worktreeRootIdentity:
         return .retryRemoval
     case (nil, nil):
         return .advanceRemoved
@@ -2071,25 +2687,38 @@ xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug \
   -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
   -skipPackageUpdates -skipPackagePluginValidation \
   -only-testing:CockpitAppTests/ConversationDeletionControllerTests test
+Tests/ProcessIntegrationTests/probe-json.zsh
 ```
 
 - [ ] **Step 8: Commit Conversation/worktree deletion**
 
 ```bash
 git add -- Sources/CockpitTypes/WorkspaceOperationModels.swift \
+  Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
+  Sources/CockpitHostCore/WorktreeDeletionManifestBuilding.swift \
   Sources/CockpitWorkspace/WorktreeDeletionManifestBuilder.swift \
   Sources/CockpitWorkspace/GitRepositoryCoordinator.swift \
   Sources/CockpitHostCore/ConversationDeletionOperation.swift \
   Sources/CockpitHostCore/ConversationDeletionCoordinator.swift \
   Sources/CockpitHostCore/WorktreeDeletionCoordinator.swift \
   Sources/CockpitHostCore/WorkspaceService.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitPersistence/SQLiteWorkspaceOperationStore.swift \
   Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift \
   Applications/CockpitApp/ConversationDeletionController.swift Applications/CockpitProbe/main.swift \
+  Applications/CockpitHost/main.swift \
   Tests/CockpitWorkspaceTests/WorktreeDeletionManifestBuilderTests.swift \
   Tests/CockpitHostCoreTests/ConversationDeletionCoordinatorTests.swift \
   Tests/CockpitHostCoreTests/WorktreeDeletionCoordinatorTests.swift \
-  Tests/CockpitAppTests/ConversationDeletionControllerTests.swift
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
+  Tests/CockpitAppTests/ConversationDeletionControllerTests.swift \
+  Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: add recoverable worktree deletion"
 ```
 
@@ -2098,6 +2727,12 @@ git commit -m "feat: add recoverable worktree deletion"
 ### Task 12: Implement Project records-only removal across workspace and terminal stores
 
 **Files:**
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
 - Create: `Sources/CockpitHostCore/ProjectRemovalCoordinator.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
@@ -2114,11 +2749,19 @@ git commit -m "feat: add recoverable worktree deletion"
 - Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift`
 - Create: `Applications/CockpitApp/ProjectRemovalController.swift`
 - Modify: `Applications/CockpitApp/ProjectCommandController.swift`
+- Modify: `Applications/CockpitHost/main.swift`
+- Modify: `Applications/CockpitTerminalSupervisor/main.swift`
+- Modify: `Applications/CockpitProbe/main.swift`
 - Test: `Tests/CockpitHostCoreTests/ProjectRemovalCoordinatorTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/DocumentRegistryTests.swift`
 - Test: `Tests/CockpitTerminalCoreTests/ContextTerminationTests.swift`
 - Test: `Tests/CockpitPersistenceTests/SQLiteTerminalSessionRepositoryTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift`
 - Test: `Tests/CockpitAppTests/ProjectCommandControllerTests.swift`
+- Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
 - Produces: `prepareProjectRemoval`, `beginProjectRemoval`, and `resumeProjectRemoval`.
@@ -2137,13 +2780,14 @@ public struct ProjectRemovalContextImpact: Hashable, Codable, Sendable {
     public let contextID: WorkspaceContextID
     public let environmentID: EnvironmentID
     public let documentRevisions: [WorkspaceDocumentRevision]
+    public let documentViewers: [WorkspaceDocumentViewer]
     public let terminalSessionIDs: [TerminalSessionID]
     public let terminalImpactRevision: UInt64
 }
 
-public struct WorkspaceDocumentRevision: Hashable, Codable, Sendable {
+public struct WorkspaceDocumentViewer: Hashable, Codable, Sendable {
     public let documentID: DocumentID
-    public let revision: UInt64
+    public let connectionID: ConnectionID
 }
 
 public enum WorkspaceDocumentDecision: String, Codable, Sendable {
@@ -2164,19 +2808,67 @@ public struct ProjectRemovalBeginRequest: Hashable, Codable, Sendable {
     public let documentDecisions: [WorkspaceDocumentDecisionRecord]
 }
 
+public enum ProjectRemovalBeginOutcome: Hashable, Codable, Sendable {
+    case freshImpact(ProjectRemovalPreparation)
+    case progress(WorkspaceOperationProgress)
+}
+
 public enum TerminalContextGateState: String, Codable, Sendable {
     case prepared, deleting, purged
+}
+
+public struct ProjectRemovalContextChild: Hashable, Codable, Sendable {
+    public let contextID: WorkspaceContextID
+    public let childOperationID: WorkspaceOperationID
+}
+
+public enum ProjectRemovalError: Error, Hashable, Codable, Sendable {
+    case incompleteTerminalGateRollback
+}
+
+public protocol ProjectRemovalAdmissionReservation: Sendable {
+    func release() async
+}
+
+public protocol DocumentRemovalReservation: Sendable {
+    func release() async
+}
+
+public protocol TerminalRemovalReservation: Sendable {
+    func release() async
+}
+
+public struct PrepareContextDeletionRequest: Hashable, Codable, Sendable {
+    public let operationID: WorkspaceOperationID
+    public let childOperationID: WorkspaceOperationID
+    public let contextID: WorkspaceContextID
+}
+
+public struct PromoteContextDeletionRequest: Hashable, Codable, Sendable {
+    public let operationID: WorkspaceOperationID
+    public let childOperationID: WorkspaceOperationID
+    public let contextID: WorkspaceContextID
+}
+
+public struct AbortContextDeletionRequest: Hashable, Codable, Sendable {
+    public let operationID: WorkspaceOperationID
+    public let childOperationID: WorkspaceOperationID
+    public let contextID: WorkspaceContextID
 }
 ```
 
 - [ ] **Step 1: Write failing fresh-impact and cross-store tests**
 
-Prepare impact, then inject a new Conversation, Document edit/viewer, and Terminal session before begin; assert reservation/drain returns a fresh impact and no durable mutation. Test terminal prepared gates before workspace commit, workspace failure rollback, crash before promotion, crash after one child promotion, and restart reconciliation before admission opens.
+Prepare impact, then inject a new Conversation, Document edit/viewer, and Terminal session before begin; assert reservation/drain compares the exact sorted viewer `(DocumentID, ConnectionID)` set, returns a fresh impact, and performs no durable mutation. Test failure after the Nth terminal prepare, terminal prepared gates before workspace commit, workspace failure rollback, abort failure, crash before promotion, crash after one child promotion, and restart reconciliation before admission opens. Persistence tests assert one transaction owns Project plus all descendant claims/lifecycle owners/context rows, every terminal promotion ack is exact-CAS journaled, final purge deletes domain/live-claim rows while retaining the operation tombstone/result atomically, and reply replay is identical. Every partial-prefix case must either prove all prepared gates absent before releasing reservations or persist a fail-closed recovery record that startup reconciles before terminal admission.
 
 ```swift
 @Test func projectRemovalPromotesAllTerminalGatesBeforeTermination() async throws {
-    let progress = try await coordinator.begin(fixture.confirmedRequest)
-    #expect(progress.phase == .resolvingDocuments)
+    let outcome = try await coordinator.begin(fixture.confirmedRequest)
+    guard case let .progress(.running(record)) = outcome else {
+        Issue.record("Expected running Project-removal progress")
+        return
+    }
+    #expect(record.phase == .resolvingDocuments)
     #expect(try await terminalStore.gates(projectID: fixture.projectID).allSatisfy {
         $0.state == .deleting
     })
@@ -2195,6 +2887,10 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter DocumentRegistryTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter ContextTerminationTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceOperationStoreTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceRepositoryTests
 ```
 
 Expected: no Project removal coordinator or terminal prepared-gate protocol exists.
@@ -2206,17 +2902,17 @@ Project admission freezes Conversation/Settings/Environment/operation creation. 
 ```swift
 public protocol ProjectRemovalAdmissionReserving: Sendable {
     func reserve(projectID: ProjectID, operationID: WorkspaceOperationID) async throws
-        -> ProjectRemovalAdmissionReservation
+        -> any ProjectRemovalAdmissionReservation
 }
 
 public protocol DocumentRegistryRemovalReserving: Sendable {
     func reserveAndDrain(contextIDs: [WorkspaceContextID]) async throws
-        -> DocumentRemovalReservation
+        -> any DocumentRemovalReservation
 }
 
 public protocol TerminalRemovalReserving: Sendable {
     func reserveAndDrain(contextIDs: [WorkspaceContextID]) async throws
-        -> TerminalRemovalReservation
+        -> any TerminalRemovalReservation
 }
 
 let projectReservation = try await admission.reserve(projectID: request.projectID, operationID: request.operationID)
@@ -2224,6 +2920,8 @@ let documentReservation = try await documents.reserveAndDrain(contextIDs: prepar
 let terminalReservation = try await terminals.reserveAndDrain(contextIDs: preparation.contexts.map(\.contextID))
 try await validateFreshImpact(request, holding: (projectReservation, documentReservation, terminalReservation))
 ```
+
+`beginProjectRemoval` returns `ProjectRemovalBeginOutcome.freshImpact` and releases all three reservations when the exact membership, Document revision/viewer set, Terminal revision/session set, or preparation ID differs. It returns `.progress` only after the cross-store begin protocol owns all gates and claims.
 
 - [ ] **Step 4: Implement prepared terminal gates and workspace begin**
 
@@ -2234,16 +2932,47 @@ public protocol ContextTerminalDeletionControlling: Sendable {
     func prepareContextDeletion(_ request: PrepareContextDeletionRequest) async throws
     func promoteContextDeletion(_ request: PromoteContextDeletionRequest) async throws
     func abortPreparedContextDeletion(_ request: AbortContextDeletionRequest) async throws
+    func markPreparedGateRollbackRequired(
+        operationID: WorkspaceOperationID,
+        childIDs: [WorkspaceOperationID],
+        errorDigests: [String]
+    ) async throws
 }
 
-for child in deterministicContextChildren {
-    try await terminal.prepareContextDeletion(child.prepareRequest(operationID: request.operationID))
-}
+var preparedChildren: [ProjectRemovalContextChild] = []
 do {
+    for child in deterministicContextChildren {
+        try await terminal.prepareContextDeletion(child.prepareRequest(operationID: request.operationID))
+        preparedChildren.append(child)
+    }
     try await workspaceOperations.beginProjectRemoval(request, contexts: deterministicContextChildren)
 } catch {
-    for child in deterministicContextChildren {
-        try await terminal.abortPreparedContextDeletion(child.abortRequest(operationID: request.operationID))
+    var abortFailureDigests: [String] = []
+    for child in preparedChildren.reversed() {
+        do {
+            try await terminal.abortPreparedContextDeletion(child.abortRequest(operationID: request.operationID))
+        } catch {
+            abortFailureDigests.append(canonicalErrorDigest(error))
+        }
+    }
+    do {
+        try await reconcileTerminalGatesFromAuthoritativeWorkspaceState(
+            operationID: request.operationID,
+            expectedPreparedChildren: preparedChildren
+        )
+        abortFailureDigests.removeAll()
+    } catch {
+        abortFailureDigests.append(canonicalErrorDigest(error))
+    }
+    guard abortFailureDigests.isEmpty else {
+        try await terminal.markPreparedGateRollbackRequired(
+            operationID: request.operationID,
+            childIDs: preparedChildren.map(\.childOperationID),
+            errorDigests: abortFailureDigests
+        )
+        // The durable terminal prepared gates remain fail-closed; startup
+        // reconciliation removes them only after proving no workspace owner exists.
+        throw ProjectRemovalError.incompleteTerminalGateRollback
     }
     throw error
 }
@@ -2320,12 +3049,19 @@ xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug \
   -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
   -skipPackageUpdates -skipPackagePluginValidation \
   -only-testing:CockpitAppTests/ProjectCommandControllerTests test
+Tests/ProcessIntegrationTests/probe-json.zsh
 ```
 
 Then:
 
 ```bash
 git add -- Sources/CockpitHostCore/ProjectRemovalCoordinator.swift \
+  Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
   Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift \
   Sources/CockpitHostCore/WorkspaceService.swift \
   Sources/CockpitHostCore/ContextTerminalDeletionControlling.swift \
@@ -2341,11 +3077,19 @@ git add -- Sources/CockpitHostCore/ProjectRemovalCoordinator.swift \
   Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift \
   Applications/CockpitApp/ProjectRemovalController.swift \
   Applications/CockpitApp/ProjectCommandController.swift \
+  Applications/CockpitHost/main.swift \
+  Applications/CockpitTerminalSupervisor/main.swift \
+  Applications/CockpitProbe/main.swift \
   Tests/CockpitHostCoreTests/ProjectRemovalCoordinatorTests.swift \
   Tests/CockpitWorkspaceTests/DocumentRegistryTests.swift \
   Tests/CockpitTerminalCoreTests/ContextTerminationTests.swift \
   Tests/CockpitPersistenceTests/SQLiteTerminalSessionRepositoryTests.swift \
-  Tests/CockpitAppTests/ProjectCommandControllerTests.swift
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceOperationStoreTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
+  Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift \
+  Tests/CockpitAppTests/ProjectCommandControllerTests.swift \
+  Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: remove cockpit projects transactionally"
 ```
 
@@ -2354,8 +3098,25 @@ git commit -m "feat: remove cockpit projects transactionally"
 ### Task 13: Refresh external Git state and revoke unavailable incarnations
 
 **Files:**
+- Modify: `Sources/CockpitProtocol/Proto/cockpit.proto`
+- Modify: `Sources/CockpitProtocol/HostControlMessages.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceCommandRouter.swift`
+- Modify: `Sources/CockpitHostCore/TerminalSupervisorControlling.swift`
+- Modify: `Sources/CockpitClientCore/CockpitTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCClient.swift`
+- Modify: `Sources/CockpitLocalTransport/HostXPCExport.swift`
+- Modify: `Sources/CockpitLocalTransport/TerminalSupervisorControlTransport.swift`
+- Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCProtocol.swift`
+- Modify: `Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift`
 - Create: `Sources/CockpitHostCore/EnvironmentAvailabilityCoordinator.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift`
+- Modify: `Sources/CockpitHostCore/ContextCommitCoordinator.swift`
+- Modify: `Sources/CockpitHostCore/ContextCommitRepository.swift`
+- Modify: `Sources/CockpitHostCore/WorkspaceRepository.swift`
 - Modify: `Sources/CockpitHostCore/WorkspaceService.swift`
+- Modify: `Sources/CockpitPersistence/WorkspaceMigrations.swift`
+- Modify: `Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift`
+- Modify: `Sources/CockpitPersistence/SQLiteContextCommitStore.swift`
 - Modify: `Sources/CockpitWorkspace/GitRepositoryCoordinator.swift`
 - Modify: `Sources/CockpitWorkspace/FileSystemEventSource.swift`
 - Modify: `Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift`
@@ -2364,11 +3125,21 @@ git commit -m "feat: remove cockpit projects transactionally"
 - Modify: `Sources/CockpitTerminalCore/TerminalSupervisor.swift`
 - Modify: `Applications/CockpitApp/WorkspaceViewModel.swift`
 - Modify: `Applications/CockpitApp/WorkspaceSidebarController.swift`
+- Modify: `Applications/CockpitHost/main.swift`
+- Modify: `Applications/CockpitTerminalSupervisor/main.swift`
+- Modify: `Applications/CockpitProbe/main.swift`
 - Test: `Tests/CockpitHostCoreTests/EnvironmentAvailabilityCoordinatorTests.swift`
+- Test: `Tests/CockpitHostCoreTests/ContextCommitCoordinatorTests.swift`
+- Test: `Tests/CockpitPersistenceTests/WorkspaceMigrationTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift`
+- Test: `Tests/CockpitPersistenceTests/SQLiteContextCommitStoreTests.swift`
 - Test: `Tests/CockpitWorkspaceTests/FileTreeReconcilerTests.swift`
 - Test: `Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/HostXPCTests.swift`
+- Test: `Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift`
 - Test: `Tests/CockpitTerminalCoreTests/TerminalSupervisorTwoPhaseTests.swift`
 - Test: `Tests/CockpitAppTests/WorkspaceViewModelTests.swift`
+- Test: `Tests/ProcessIntegrationTests/probe-json.zsh`
 
 **Interfaces:**
 - Produces: `EnvironmentAvailabilityCoordinator.refresh(environmentID:reason:)`.
@@ -2390,7 +3161,7 @@ public protocol EnvironmentAvailabilityCoordinating: Sendable {
 
 - [ ] **Step 1: Write failing switch/detach/replacement/revocation tests**
 
-Run external `git switch`, enter Detached HEAD, replace the worktree directory with another object, change common directory identity, and remove Project/Worktree paths. Assert branch/OID refresh for valid identity and unavailable state for identity mismatch. Assert old data-plane connections close, viewers are removed, terminal attachments detach, in-flight operations drain, kernel unregisters, and old tickets never reattach.
+Run external `git switch`, enter Detached HEAD, replace the Project root, mapped Project subdirectory, worktree directory, and common directory independently, and remove Project/Worktree paths. Add Direct Environment cases that validate only Project/workspace identity and never require a Git observation. Assert branch/OID refresh for valid Worktree identity, unavailable state for every identity mismatch, and unavailable-to-valid restoration persists a new incarnation before authority issuance. Assert old data-plane connections close, viewers are removed, terminal attachments detach before entered operations drain, kernel unregisters, and old tickets never reattach. Inject failure after each revocation step and assert the durable admission gate remains closed and startup resumes from the exact journal step. Include `durablePendingChildren` and `childrenActive` Context commits: status becomes `committedUnavailable` with the same ContextCommitID/ProjectID, and every child for the revoked incarnation is revoked.
 
 ```swift
 @Test func unavailableTransitionRevokesEveryOldIncarnationChild() async throws {
@@ -2413,59 +3184,164 @@ swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter HostDataPlaneTests
 swift test --disable-automatic-resolution --skip-update --no-parallel \
   --filter TerminalSupervisorTwoPhaseTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter ContextCommitCoordinatorTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter WorkspaceMigrationTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteWorkspaceRepositoryTests
+swift test --disable-automatic-resolution --skip-update --no-parallel \
+  --filter SQLiteContextCommitStoreTests
 ```
 
 Expected: the current workspace refresh has no Environment incarnation revocation coordinator.
 
 - [ ] **Step 3: Implement coalesced refresh with identity-first classification**
 
-Trigger refresh at snapshot load, before Context prepare, after Git operations, and from coalesced filesystem events on `.git`/HEAD/worktree roots. Under repository lock compare worktree root identity, common-directory identity, registration, branch/detached state, and HEAD OID. Valid same-identity changes update metadata and snapshot revision; identity/path absence transitions availability and increments incarnation only on successful restoration.
+Trigger refresh at snapshot load, before Context prepare, after Git operations, and from coalesced filesystem events on Project/workspace roots plus `.git`/HEAD/worktree roots for Worktree environments. Branch explicitly on persisted `EnvironmentKind`: Direct compares only its frozen Project/workspace identities and never enters Git classification; Worktree compares previous availability, Project root, worktree root, mapped workspace/Project subdirectory, common-directory identity, registration, branch/detached state, and HEAD OID under the repository lock. Valid same-identity changes update metadata and snapshot revision. An unavailable record becomes restored only after the complete kind-specific identity chain validates; that transition creates and persists one fresh incarnation after every older revocation journal is `completed` and before new admission opens.
 
 ```swift
 enum EnvironmentRefreshClassification: Equatable {
     case metadataChanged(head: GitHead, branch: GitLocalBranch?)
     case unchanged
     case unavailable(EnvironmentUnavailableReason)
-    case restored(newIncarnation: UUID, head: GitHead, branch: GitLocalBranch?)
+    case restored(newIncarnation: UUID, head: GitHead?, branch: GitLocalBranch?)
+}
+
+enum ResolvedEnvironmentObservation: Sendable {
+    case direct(ResolvedDirectEnvironmentObservation)
+    case worktree(ResolvedGitEnvironmentObservation)
+}
+
+struct ResolvedGitEnvironmentObservation: Sendable {
+    let projectRootIdentity: FileSystemIdentity
+    let worktreeRootIdentity: FileSystemIdentity
+    let workspaceRootIdentity: FileSystemIdentity
+    let repositoryIdentity: GitRepositoryIdentity
+    let head: GitHead
+    let branch: GitLocalBranch?
+}
+
+struct ResolvedDirectEnvironmentObservation: Sendable {
+    let projectRootIdentity: FileSystemIdentity
+    let workspaceRootIdentity: FileSystemIdentity
 }
 
 func classify(
     persisted: EnvironmentSnapshot,
-    observed: GitWorktreeSnapshot?
+    observed: ResolvedEnvironmentObservation?
 ) -> EnvironmentRefreshClassification {
     guard let observed else { return .unavailable(.pathMissing) }
-    guard observed.worktreeRootIdentity == persisted.worktreeRootIdentity else {
-        return .unavailable(.worktreeIdentityChanged)
+    switch (persisted.kind, observed) {
+    case let (.direct, .direct(current)):
+        guard current.projectRootIdentity == persisted.projectRootIdentity else {
+            return .unavailable(.projectPathMissing)
+        }
+        guard current.workspaceRootIdentity == persisted.workspaceRootIdentity else {
+            return .unavailable(.capabilityIdentityChanged)
+        }
+        return persisted.availability.isAvailable
+            ? .unchanged
+            : .restored(newIncarnation: UUID(), head: nil, branch: nil)
+    case let (.worktree, .worktree(current)):
+        guard current.projectRootIdentity == persisted.projectRootIdentity else {
+            return .unavailable(.projectPathMissing)
+        }
+        guard current.worktreeRootIdentity == persisted.worktreeRootIdentity else {
+            return .unavailable(.worktreeIdentityChanged)
+        }
+        guard current.workspaceRootIdentity == persisted.workspaceRootIdentity else {
+            return .unavailable(.capabilityIdentityChanged)
+        }
+        guard current.repositoryIdentity == persisted.repositoryIdentity else {
+            return .unavailable(.commonDirectoryIdentityChanged)
+        }
+        if !persisted.availability.isAvailable {
+            return .restored(newIncarnation: UUID(), head: current.head, branch: current.branch)
+        }
+        return current.head == persisted.head && current.branch == persisted.branch
+            ? .unchanged
+            : .metadataChanged(head: current.head, branch: current.branch)
+    case (.direct, .worktree), (.worktree, .direct):
+        return .unavailable(.capabilityIdentityChanged)
     }
-    guard observed.repositoryIdentity == persisted.repositoryIdentity else {
-        return .unavailable(.commonDirectoryIdentityChanged)
-    }
-    return observed.head == persisted.head && observed.branch == persisted.branch
-        ? .unchanged
-        : .metadataChanged(head: observed.head, branch: observed.branch)
 }
 ```
 
-- [ ] **Step 4: Implement ordered active revocation**
+- [ ] **Step 4: Implement durable ordered active revocation**
 
-Under admission gate atomically mark old incarnation revoked and freeze new admission; revoke prepared tokens/tickets/child promotion; close all data-plane UDS children and subscriptions; remove Document viewers; revoke Supervisor registration and detach active terminal attachments; wait entered file/document operations; quiesce/unregister kernel; release root access lease. Only a fresh resolved incarnation can issue new authorization.
+Before any in-memory cleanup, one workspace-database transaction CASes the exact available incarnation to unavailable and inserts `environment_revocations(state: pending, step: contextChildren)`. Existing `context_commits.phase` and `context_commit_children.promotion_phase` remain inside their confirmed enums; `committedUnavailable` is a status derived from the Environment availability plus pending/completed revocation journal, not a stored phase. `SQLiteWorkspaceRepository.beginDurableRevocation` and `SQLiteContextCommitStore` share the same injected SQLite connection/transaction handle to validate every affected ContextCommitID/child identity and freeze ticket issuance; no coordinator composes two commits. All status/admission paths query this durable state, return `committedUnavailable` with the preserved ContextCommitID/navigation/generation/owning ProjectID, and reject old-child issuance after Host restart. `beginRevocation` recreates an in-memory reservation from the journal but the journal—not object lifetime—keeps admission closed.
+
+Each cleanup step is idempotent and keyed by `(EnvironmentID, incarnation)`: revoke prepared tokens/tickets and context children; close data-plane UDS children/subscriptions; remove Document viewers; revoke Supervisor registration and detach terminal attachments; drain already-entered file/document operations; quiesce/unregister Kernel; release the root access lease. After a step succeeds, exact CAS advances the durable `step`; failure stores the typed error without clearing `pending`. Host startup, before Workspace/Data-plane/Document/Terminal admission opens, scans every pending row and resumes it to `completed`. A restored identity cannot persist or issue a new incarnation until all older rows for that Environment are completed. Context status on a converted commit returns `committedUnavailable` from the durable commit row, and no old child ticket can be reissued.
 
 ```swift
+public enum EnvironmentRevocationStep: String, Codable, Sendable {
+    case contextChildren, dataPlane, documentViewers, terminalAttachments
+    case drainingEnteredOperations, kernel, rootAccess, completed
+
+    var successor: Self {
+        switch self {
+        case .contextChildren: .dataPlane
+        case .dataPlane: .documentViewers
+        case .documentViewers: .terminalAttachments
+        case .terminalAttachments: .drainingEnteredOperations
+        case .drainingEnteredOperations: .kernel
+        case .kernel: .rootAccess
+        case .rootAccess: .completed
+        case .completed: .completed
+        }
+    }
+}
+
+public struct EnvironmentRevocationRecord: Hashable, Codable, Sendable {
+    public let environmentID: EnvironmentID
+    public let incarnation: UUID
+    public let step: EnvironmentRevocationStep
+    public let lastErrorDigest: String?
+}
+
+public protocol EnvironmentRevocationReservation: Sendable {
+    func finishAfterDurableCompletion() async
+}
+
 func revoke(_ environment: EnvironmentSnapshot) async throws {
-    let reservation = try await admission.revokeAndDrain(
+    let record = try await repository.beginDurableRevocation(
         environmentID: environment.environmentID,
         incarnation: environment.incarnation
     )
-    try await contextCommits.revokePrepared(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    await dataPlane.close(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    await documents.removeViewers(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    try await terminal.revokeRegistration(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    try await terminal.detachAll(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    try await kernels.quiesceAndUnregister(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    await roots.release(environmentID: environment.environmentID, incarnation: environment.incarnation)
-    await reservation.finish()
+    let reservation = try await admission.restoreReservation(for: record)
+    try await resumeRevocation(record, reservation: reservation)
+}
+
+func resumeRevocation(
+    _ initial: EnvironmentRevocationRecord,
+    reservation: any EnvironmentRevocationReservation
+) async throws {
+    var record = initial
+    while record.step != .completed {
+        do {
+            try await performExactRevocationStep(record, reservation: reservation)
+            record = try await repository.advanceRevocation(
+                environmentID: record.environmentID,
+                incarnation: record.incarnation,
+                from: record.step,
+                to: record.step.successor
+            )
+        } catch {
+            try await repository.recordRevocationFailure(
+                environmentID: record.environmentID,
+                incarnation: record.incarnation,
+                expectedStep: record.step,
+                error: error
+            )
+            throw error
+        }
+    }
+    await reservation.finishAfterDurableCompletion()
 }
 ```
+
+`Applications/CockpitHost/main.swift` awaits `recoverAllPendingRevocations()` before constructing or exposing any admission-serving endpoint. Migration/repository tests crash after each step, reopen both stores, prove the gate is still durable, finish the exact row once, and reject restoration while an older row is pending.
 
 - [ ] **Step 5: Surface exact unavailable state without relink**
 
@@ -2502,13 +3378,31 @@ xcodebuild -workspace Cockpit.xcworkspace -scheme Cockpit -configuration Debug \
   -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
   -skipPackageUpdates -skipPackagePluginValidation \
   -only-testing:CockpitAppTests/WorkspaceViewModelTests test
+Tests/ProcessIntegrationTests/probe-json.zsh
 ```
 
 Then:
 
 ```bash
 git add -- Sources/CockpitHostCore/EnvironmentAvailabilityCoordinator.swift \
+  Sources/CockpitHostCore/WorkspaceAdmissionCoordinator.swift \
+  Sources/CockpitHostCore/ContextCommitCoordinator.swift \
+  Sources/CockpitHostCore/ContextCommitRepository.swift \
+  Sources/CockpitHostCore/WorkspaceRepository.swift \
+  Sources/CockpitProtocol/Proto/cockpit.proto \
+  Sources/CockpitProtocol/HostControlMessages.swift \
+  Sources/CockpitHostCore/WorkspaceCommandRouter.swift \
+  Sources/CockpitHostCore/TerminalSupervisorControlling.swift \
+  Sources/CockpitClientCore/CockpitTransport.swift \
+  Sources/CockpitLocalTransport/HostXPCClient.swift \
+  Sources/CockpitLocalTransport/HostXPCExport.swift \
+  Sources/CockpitLocalTransport/TerminalSupervisorControlTransport.swift \
+  Sources/CockpitLocalTransport/TerminalSupervisorXPCProtocol.swift \
+  Sources/CockpitLocalTransport/TerminalSupervisorXPCExport.swift \
   Sources/CockpitHostCore/WorkspaceService.swift \
+  Sources/CockpitPersistence/WorkspaceMigrations.swift \
+  Sources/CockpitPersistence/SQLiteWorkspaceRepository.swift \
+  Sources/CockpitPersistence/SQLiteContextCommitStore.swift \
   Sources/CockpitWorkspace/GitRepositoryCoordinator.swift \
   Sources/CockpitWorkspace/FileSystemEventSource.swift \
   Sources/CockpitWorkspace/WorkspaceKernelRegistry.swift \
@@ -2517,11 +3411,21 @@ git add -- Sources/CockpitHostCore/EnvironmentAvailabilityCoordinator.swift \
   Sources/CockpitTerminalCore/TerminalSupervisor.swift \
   Applications/CockpitApp/WorkspaceViewModel.swift \
   Applications/CockpitApp/WorkspaceSidebarController.swift \
+  Applications/CockpitHost/main.swift \
+  Applications/CockpitTerminalSupervisor/main.swift \
+  Applications/CockpitProbe/main.swift \
   Tests/CockpitHostCoreTests/EnvironmentAvailabilityCoordinatorTests.swift \
+  Tests/CockpitHostCoreTests/ContextCommitCoordinatorTests.swift \
+  Tests/CockpitPersistenceTests/WorkspaceMigrationTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteWorkspaceRepositoryTests.swift \
+  Tests/CockpitPersistenceTests/SQLiteContextCommitStoreTests.swift \
   Tests/CockpitWorkspaceTests/FileTreeReconcilerTests.swift \
   Tests/CockpitLocalTransportTests/HostDataPlaneTests.swift \
+  Tests/CockpitLocalTransportTests/HostXPCTests.swift \
+  Tests/CockpitLocalTransportTests/TerminalSupervisorXPCTests.swift \
   Tests/CockpitTerminalCoreTests/TerminalSupervisorTwoPhaseTests.swift \
-  Tests/CockpitAppTests/WorkspaceViewModelTests.swift
+  Tests/CockpitAppTests/WorkspaceViewModelTests.swift \
+  Tests/ProcessIntegrationTests/probe-json.zsh
 git commit -m "feat: reconcile external worktree state"
 ```
 
@@ -2539,6 +3443,8 @@ git commit -m "feat: reconcile external worktree state"
 - Modify: `Applications/CockpitApp/ProjectRemovalController.swift`
 - Modify: `Applications/CockpitProbe/main.swift`
 - Create: `Tools/reset-cockpit-development-data.zsh`
+- Create: `Tools/CockpitDevelopmentDataReset.swift`
+- Create: `Tests/ToolingTests/reset-cockpit-development-data.zsh`
 - Create: `Tests/ProcessIntegrationTests/phase2-worktree-environments.zsh`
 - Create: `Tests/ProcessIntegrationTests/phase2-context-promotion.zsh`
 - Create: `Tests/ProcessIntegrationTests/phase2-deletion-recovery.zsh`
@@ -2561,16 +3467,16 @@ Assert multiple Project rows, Direct/branch/Detached subtitles, occupied branch 
 
 ```swift
 @MainActor
-@Test func sidebarExposesOnlyConfirmedPhase2Actions() throws {
+func testSidebarExposesOnlyConfirmedPhase2Actions() throws {
     let rows = try fixture.makeSidebarRows()
-    #expect(rows.projects.count == 2)
-    #expect(rows.conversations.map(\.subtitle).contains("Detached at a1b2c3d"))
-    #expect(rows.occupiedBranch?.isEnabled == false)
-    #expect(rows.occupiedBranch?.disabledReason == fixture.occupiedWorktreePath)
-    #expect(rows.allActions.contains(.projectSettings))
-    #expect(!rows.allActions.contains(.deleteWorktree))
-    #expect(!rows.allActions.contains(.relink))
-    #expect(fixture.windowRegistry.windowIDs == [fixture.mainWindowID])
+    XCTAssertEqual(rows.projects.count, 2)
+    XCTAssertTrue(rows.conversations.map(\.subtitle).contains("Detached at a1b2c3d"))
+    XCTAssertEqual(rows.occupiedBranch?.isEnabled, false)
+    XCTAssertEqual(rows.occupiedBranch?.disabledReason, fixture.occupiedWorktreePath)
+    XCTAssertTrue(rows.allActions.contains(.projectSettings))
+    XCTAssertFalse(rows.allActions.contains(.deleteWorktree))
+    XCTAssertFalse(rows.allActions.contains(.relink))
+    XCTAssertEqual(fixture.windowRegistry.windowIDs, [fixture.mainWindowID])
 }
 ```
 
@@ -2611,9 +3517,20 @@ func apply(_ snapshot: WorkspaceSnapshot) {
 }
 ```
 
-- [ ] **Step 4: Add an exact development-data reset**
+- [ ] **Step 4: Write the development-reset RED tests**
 
-The script stops only Cockpit Host/Supervisor launch labels, authenticates Cockpit storage roots, removes workspace/terminal SQLite files, document recovery, client state/preferences, and Cockpit runtime data, then restarts services. It rejects symlinks and paths outside Cockpit-owned roots. It never invokes Git and never traverses a Project/worktree path.
+Create `Tests/ToolingTests/reset-cockpit-development-data.zsh` first. It owns all fixture processes and paths and verifies: absent Cockpit roots are a successful no-op; exact regular user-owned Cockpit roots are removed; symlink, foreign-owner, or changed-identity roots fail closed; a live terminal is terminated through authenticated Supervisor/Keeper control before any database deletion; and Project, Git common directory, worktree, branch, and files remain byte-identical. Run it before creating the implementation:
+
+```bash
+/bin/zsh -n Tests/ToolingTests/reset-cockpit-development-data.zsh
+Tests/ToolingTests/reset-cockpit-development-data.zsh
+```
+
+Expected: RED because the reset implementation and fd-relative helper do not exist.
+
+- [ ] **Step 5: Add an exact development-data reset**
+
+The script first asks the current Supervisor for all terminal sessions, terminates each through the authenticated Keeper/session control path, and verifies each exact Keeper/CLI process identity has disappeared. Any unverified or unterminated session aborts reset before deletion. It then stops only exact Cockpit Host/Supervisor launch labels. `CockpitDevelopmentDataReset.swift` opens the fixed user Library parents, authenticates numeric UID and canonical Cockpit child names with `openat(O_DIRECTORY|O_NOFOLLOW)` plus `fstat`, revalidates every identity during traversal, and removes only a compiled allowlist with fd-relative `unlinkat`; it never accepts an arbitrary path. Missing Cockpit roots are a successful no-op. The script removes workspace/terminal SQLite files, document recovery, client state/preferences, and Cockpit runtime data, then restarts services. It never invokes Git and never opens or traverses a Project/worktree path.
 
 ```zsh
 #!/bin/zsh
@@ -2621,41 +3538,48 @@ set -euo pipefail
 
 readonly support_root="$HOME/Library/Application Support/dev.cockpit.Cockpit"
 readonly cache_root="$HOME/Library/Caches/dev.cockpit.Cockpit"
-[[ -d "$support_root" && ! -L "$support_root" ]]
-[[ -d "$cache_root" && ! -L "$cache_root" ]]
-[[ "$(/usr/bin/stat -f '%Su' "$support_root")" == "$USER" ]]
-[[ "$(/usr/bin/stat -f '%Su' "$cache_root")" == "$USER" ]]
-
-reset_cockpit_sqlite_files "$support_root"
-reset_cockpit_recovery_and_client_state "$support_root" "$cache_root"
+terminate_all_authenticated_cockpit_terminal_sessions_or_fail
+stop_exact_cockpit_services
+/usr/bin/swiftc Tools/CockpitDevelopmentDataReset.swift -o "$reset_binary"
+"$reset_binary" --support-parent "$HOME/Library/Application Support" \
+  --cache-parent "$HOME/Library/Caches" --uid "$(/usr/bin/id -u)"
 restart_exact_cockpit_services
 ```
 
-- [ ] **Step 5: Extend Probe JSON contracts for all Phase 2 commands**
+Define `terminate_all_authenticated_cockpit_terminal_sessions_or_fail`, `stop_exact_cockpit_services`, `restart_exact_cockpit_services`, temporary-file creation, and exact cleanup in this script before the first invocation. No helper name remains implicit.
+
+- [ ] **Step 6: Extend Probe JSON contracts for all Phase 2 commands**
 
 Require stable operation/decision/commit IDs in commands and outputs. Add strict JSON tests for multi-Project snapshot, settings, branch preparation, operation replay/progress, context status/recovery, manifest decisions, Project removal, unavailable state, and all typed business errors. Unknown fields/cases remain failures.
 
 ```swift
 enum Phase2ProbeCommand: String, CaseIterable {
     case workspaceList = "workspace list"
+    case projectAdd = "project add"
     case projectSettingsShow = "project settings show"
     case projectSettingsUpdate = "project settings update"
     case conversationPrepareCreate = "conversation prepare-create"
+    case conversationCreate = "conversation create"
+    case operationInspect = "operation inspect"
     case operationResume = "operation resume"
+    case operationBeginDelete = "operation begin-delete"
     case contextPrepare = "context prepare"
     case contextCommit = "context commit"
     case contextStatus = "context status"
     case contextCompleteRecovery = "context complete-recovery"
+    case contextPresentationCommitted = "context presentation-committed"
+    case appVisibleContext = "app visible-context"
     case conversationPrepareDelete = "conversation prepare-delete"
     case operationSubmitDecision = "operation submit-decision"
     case projectPrepareRemove = "project prepare-remove"
+    case projectBeginRemove = "project begin-remove"
     case environmentRefresh = "environment refresh"
 }
 
 #expect(Set(Phase2ProbeCommand.allCases.map(\.rawValue)) == fixture.expectedPhase2Commands)
 ```
 
-- [ ] **Step 6: Write the multi-Project/Worktree process scenario**
+- [ ] **Step 7: Write the multi-Project/Worktree process scenario**
 
 Create two real Git Projects and multiple Direct/New Branch/Existing Branch Conversations. Assert exact source OID/ref, attached Existing Branch, distinct roots/DocumentIDs/terminal sessions/client state, settings change affects only a future worktree, crash recovery reuses the same operation/Conversation/Environment IDs, and no namespace/process/root/keychain/preferences residue remains.
 
@@ -2670,7 +3594,7 @@ assert_distinct_roots_documents_terminals "$project_a" "$project_b" "$new_branch
 assert_namespace_residue_empty
 ```
 
-- [ ] **Step 7: Write the context promotion/recovery process scenario**
+- [ ] **Step 8: Write the context promotion/recovery process scenario**
 
 Exercise prepare failure with old UI unchanged, prepared data-plane read, Host crash after durable commit, child recovery epoch/proofs, App restart, A/B/C supersession, external `git switch`, Detached HEAD, directory replacement, unavailable revocation, restoration with new incarnation, and rejection of every old ticket/authorization.
 
@@ -2686,15 +3610,26 @@ assert_superseded "$commit_b_id" "$commit_c_id"
 assert_old_authorizations_rejected "$old_incarnation"
 ```
 
-- [ ] **Step 8: Write the deletion/recovery process scenario**
+- [ ] **Step 9: Write the deletion/recovery process scenario**
 
 Exercise Conversation-only, Conversation+clean worktree, dirty manifest reconfirm, records-only fallback, locked worktree, xattr/resource-fork change, Git removed/reply lost recovery, Project removal across Project Context and all Conversations, Supervisor/Host crashes at prepared/promote/terminate/purge boundaries, preserved branches/files, and permanent operation replay.
 
 ```zsh
 prepared="$(probe conversation prepare-delete --conversation-id "$conversation_id" --mode conversation-and-worktree)"
 change_only_xattr "$worktree_root"
-progress="$(probe operation begin-delete --operation-id "$delete_id" --preparation-id "$(json "$prepared" result.preparationID)")"
-[[ "$(json "$progress" result.phase)" == "awaitingDecision" ]]
+fresh="$(probe operation begin-delete --operation-id "$delete_id" --preparation-id "$(json "$prepared" result.preparationID)")"
+[[ "$(json "$fresh" result.outcome)" == "freshImpact" ]]
+assert_operation_absent "$delete_id"
+assert_no_claim_or_session_side_effect "$delete_id"
+
+prepared_after_change="$(probe conversation prepare-delete --conversation-id "$conversation_id" --mode conversation-and-worktree)"
+begin_delete_with_namespaced_validation_barrier "$delete_id" "$(json "$prepared_after_change" result.preparationID)"
+wait_for_validation_epoch_barrier "$delete_id"
+change_only_xattr_again "$worktree_root"
+release_validation_epoch_barrier "$delete_id"
+progress="$(wait_for_begin_delete_result "$delete_id")"
+[[ "$(json "$progress" result.progressKind)" == "awaitingDecision" ]]
+[[ "$(json "$progress" result.durablePhase)" == "validatingManifest" ]]
 probe operation submit-decision --operation-id "$delete_id" --decision-id "$reconfirm_id" --records-only
 crash_exact_supervisor_at terminatingSessions
 completed="$(probe operation resume --operation-id "$delete_id")"
@@ -2703,43 +3638,45 @@ assert_branch_and_project_files_preserved
 assert_operation_replay_identical "$delete_id" "$completed"
 ```
 
-- [ ] **Step 9: Assemble the unified gate**
+- [ ] **Step 10: Assemble the unified gate**
 
 `Tools/verify-phase2.zsh` runs sequentially:
 
 ```text
-1. canonical toolchain and clean dependency/lock/Ghostty scope checks
-2. complete Tools/verify-phase1.zsh
-3. fresh Swift build and full no-parallel Swift tests
-4. fresh XcodeGen/App build and App tests
-5. Probe JSON 1.1/1.2 strict contract
-6. phase2-worktree-environments.zsh
-7. phase2-context-promotion.zsh
-8. phase2-deletion-recovery.zsh
-9. App bundle layout and Cockpit-owned reset safety
-10. exact process/launch-label/tmp/cache/preferences/keychain residue audit
-11. git diff --check
+1. require and validate COCKPIT_PHASE2_BASE; canonical toolchain; BASE..HEAD plus worktree authorized-scope/dependency/lock/Ghostty checks, including untracked files
+2. reset-cockpit-development-data.zsh safety and live-terminal termination gate before any App/process launch built from the Phase 2 tree
+3. complete Tools/verify-phase1.zsh
+4. fresh Swift build and full no-parallel Swift tests
+5. fresh XcodeGen/App build and App tests
+6. Probe JSON 1.1/1.2 strict contract
+7. phase2-worktree-environments.zsh
+8. phase2-context-promotion.zsh
+9. phase2-deletion-recovery.zsh
+10. App bundle layout
+11. exact process/launch-label/tmp/cache/preferences/keychain residue audit
+12. BASE..HEAD plus worktree diff check, including every untracked authorized text file
 ```
 
-It uses `set -euo pipefail`, stops at the first failure, authenticates every PID/label/path before cleanup, and prints `Phase 2 unified gate: PASS` only after node 11 succeeds.
+At the start of Phase 2 implementation and before Task 1 writes any byte, execute `export COCKPIT_PHASE2_BASE="$(git rev-parse HEAD)"`, record that exact SHA in the ignored implementation report, and retain it unchanged for every later gate. `verify-phase2.zsh` rejects a missing/non-ancestor base. It compares both committed `COCKPIT_PHASE2_BASE..HEAD` and current worktree/index/untracked paths against the authorized Phase 2 file set; dependency/lock/`.gitmodules`/Ghostty/Patches checks use the same combined range. For each untracked authorized text file it runs `git diff --no-index --check /dev/null <file>` and accepts only status 1 with empty stderr. It uses `set -euo pipefail`, stops at the first failure, authenticates every PID/label/path before cleanup, and prints `Phase 2 unified gate: PASS` only after node 12 succeeds.
 
-- [ ] **Step 10: Run focused process scenarios GREEN**
+- [ ] **Step 11: Run reset and focused process scenarios GREEN**
 
 Run:
 
 ```bash
+Tests/ToolingTests/reset-cockpit-development-data.zsh
 Tests/ProcessIntegrationTests/probe-json.zsh
 Tests/ProcessIntegrationTests/phase2-worktree-environments.zsh
 Tests/ProcessIntegrationTests/phase2-context-promotion.zsh
 Tests/ProcessIntegrationTests/phase2-deletion-recovery.zsh
 ```
 
-- [ ] **Step 11: Run the one authoritative full gate**
+- [ ] **Step 12: Run the one authoritative full gate**
 
 Run:
 
 ```bash
-Tools/verify-phase2.zsh
+COCKPIT_PHASE2_BASE="${COCKPIT_PHASE2_BASE:?}" Tools/verify-phase2.zsh
 ```
 
 Expected: exit 0 and final exact line:
@@ -2748,14 +3685,14 @@ Expected: exit 0 and final exact line:
 Phase 2 unified gate: PASS
 ```
 
-- [ ] **Step 12: Perform final scope/residue verification and commit**
+- [ ] **Step 13: Perform final scope/residue verification and commit**
 
 Run:
 
 ```bash
 git diff --check
 git status --short
-git diff -- Package.swift Package.resolved .gitmodules ThirdParty/ghostty Patches/ghostty
+git diff "$COCKPIT_PHASE2_BASE" -- Package.swift Package.resolved .gitmodules ThirdParty/ghostty Patches/ghostty
 ```
 
 Expected: diff check has no output; dependency/Ghostty command has no output; status contains only authorized Phase 2 implementation/test/plan paths before commit; all Phase 2 labels, PIDs, tmp roots, cache roots, preferences, and keychain fixtures are absent.
@@ -2770,18 +3707,36 @@ git add -- Applications/CockpitApp/WorkspaceSidebarController.swift \
   Applications/CockpitApp/ProjectSettingsController.swift \
   Applications/CockpitApp/ConversationDeletionController.swift \
   Applications/CockpitApp/ProjectRemovalController.swift Applications/CockpitProbe/main.swift \
-  Tools/reset-cockpit-development-data.zsh Tools/verify-phase2.zsh \
+  Tools/reset-cockpit-development-data.zsh Tools/CockpitDevelopmentDataReset.swift Tools/verify-phase2.zsh \
   Tests/CockpitAppTests/WorkspaceHierarchyTests.swift \
   Tests/CockpitAppTests/WorkspaceViewModelTests.swift \
   Tests/CockpitAppTests/ConversationCommandControllerTests.swift \
   Tests/CockpitAppTests/ConversationDeletionControllerTests.swift \
   Tests/CockpitAppTests/ProjectCommandControllerTests.swift \
   Tests/ProcessIntegrationTests/probe-json.zsh \
+  Tests/ToolingTests/reset-cockpit-development-data.zsh \
   Tests/ProcessIntegrationTests/phase2-worktree-environments.zsh \
   Tests/ProcessIntegrationTests/phase2-context-promotion.zsh \
   Tests/ProcessIntegrationTests/phase2-deletion-recovery.zsh
 git commit -m "test: verify phase 2 worktree environments"
 ```
+
+Before the RED run for each new script and again before staging, execute:
+
+```bash
+chmod 755 Tools/reset-cockpit-development-data.zsh Tools/verify-phase2.zsh \
+  Tests/ToolingTests/reset-cockpit-development-data.zsh \
+  Tests/ProcessIntegrationTests/phase2-worktree-environments.zsh \
+  Tests/ProcessIntegrationTests/phase2-context-promotion.zsh \
+  Tests/ProcessIntegrationTests/phase2-deletion-recovery.zsh
+git ls-files --stage -- Tools/reset-cockpit-development-data.zsh Tools/verify-phase2.zsh \
+  Tests/ToolingTests/reset-cockpit-development-data.zsh \
+  Tests/ProcessIntegrationTests/phase2-worktree-environments.zsh \
+  Tests/ProcessIntegrationTests/phase2-context-promotion.zsh \
+  Tests/ProcessIntegrationTests/phase2-deletion-recovery.zsh
+```
+
+Expected after staging: each executable path reports mode `100755`.
 
 ---
 
